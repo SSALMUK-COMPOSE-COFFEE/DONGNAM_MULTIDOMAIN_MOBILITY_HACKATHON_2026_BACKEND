@@ -62,7 +62,8 @@ def _sea_quote(model: CostModel, plan: Plan, lot_id: str) -> SeaQuote:
     loads = _container_pallets(plan)
     assigned = next((a for a in plan.assignments if a.lot_id == lot_id), None)
     if assigned is not None and assigned.mode == "sea":
-        cost = lot_plan_cost(model, lot, assigned, loads)
+        routed = next((c.route for c in plan.lot_collections if c.lot_id == lot_id), None)
+        cost = lot_plan_cost(model, lot, assigned, loads, routed)
         return SeaQuote(
             feasible=True,
             in_plan=True,

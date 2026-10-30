@@ -11,6 +11,8 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://api.openai.com/v1"
     llm_model_name: str = ""
     cors_origins: list[str] = ["*"]
+    explain_use_llm: bool = False
+    offline_mode: bool = False
 
 
 @lru_cache

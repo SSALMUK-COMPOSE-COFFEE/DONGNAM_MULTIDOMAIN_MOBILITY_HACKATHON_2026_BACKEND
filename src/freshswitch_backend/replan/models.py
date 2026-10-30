@@ -4,6 +4,8 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, Field
 
 from freshswitch_backend.domain.models import Lot, Plan, Scenario
+from freshswitch_backend.explain.models import Explanation
+from freshswitch_backend.planning.service import VoyagePickup
 
 
 class CancelEvent(BaseModel):
@@ -93,6 +95,7 @@ class Alternative(BaseModel):
     total_cost: int
     cost_delta: int
     plan: Plan
+    routes: list[VoyagePickup] = Field(default_factory=list)
     diff: PlanDiff
     solve_ms: int
 
@@ -106,5 +109,5 @@ class ReplanResult(BaseModel):
     recommended_id: AlternativeId | None
     diff: PlanDiff | None
     solve_ms: int
-    explanation: str | None = None
+    explanation: Explanation | None = None
     scenario_after: Scenario | None = Field(default=None, exclude=True)

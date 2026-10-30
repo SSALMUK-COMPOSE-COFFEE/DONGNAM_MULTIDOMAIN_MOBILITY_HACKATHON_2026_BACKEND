@@ -1,7 +1,8 @@
 from datetime import timedelta
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from freshswitch_backend.api.vessels import (
@@ -23,6 +24,7 @@ from freshswitch_backend.planning.store import (
     store,
 )
 from freshswitch_backend.replan import DelayEvent, Event, ReplanResult, replan
+from freshswitch_backend.replan.explanation import explain_replan, llm_enabled
 from freshswitch_backend.replan.models import AlternativeId
 
 router = APIRouter(prefix="/plans", tags=["plans"])
@@ -82,13 +84,21 @@ def read_plan(plan_id: str) -> PlanSession:
 
 
 @router.post("/{plan_id}/events")
-def post_event(plan_id: str, body: EventRequest) -> ReplanResponse:
+async def post_event(
+    plan_id: str,
+    body: EventRequest,
+    llm: Annotated[bool | None, Query()] = None,
+) -> ReplanResponse:
     session = _session(plan_id)
-    result = replan(
+    result = await run_in_threadpool(
+        replan,
         session.scenario,
         session.plan,
         body.event,
         air_locked=session.air_locked_lot_ids,
+    )
+    result.explanation = await explain_replan(
+        session.scenario, session.plan, result, use_llm=llm_enabled(llm)
     )
     pending = store.add_pending(session, result)
     return ReplanResponse(
@@ -122,6 +132,7 @@ async def schedule_check(
     plan_id: str,
     factory: Annotated[VesselClientFactory, Depends(vessel_client_factory)],
     body: ScheduleCheckRequest | None = None,
+    demo: Annotated[bool, Query()] = False,
 ) -> ScheduleCheckResponse:
     session = _session(plan_id)
     body = body or ScheduleCheckRequest()
@@ -132,20 +143,17 @@ async def schedule_check(
     else:
         start = min(v.etd for v in voyages).date() - timedelta(days=1)
         end = max(v.etd for v in voyages).date() + timedelta(days=3)
-        movements = await fetch_busan_movements(factory, start, end, "O")
+        movements = await fetch_busan_movements(factory, start, end, "O", demo=demo)
         source = "해수부"
     changes = detect_schedule_changes(
         [PlannedVoyage(voyage_id=v.id, vessel_name=v.vessel_name, etd=v.etd) for v in voyages],
         movements,
         threshold_hours=body.threshold_hours,
     )
-    by_id = {v.id: v for v in voyages}
     events = [
         DelayEvent(
             voyage_id=change.voyage_id,
             new_etd=change.observed_etd,
-            new_cy_cutoff=by_id[change.voyage_id].cy_cutoff
-            + (change.observed_etd - change.planned_etd),
             source="해수부",
         )
         for change in changes

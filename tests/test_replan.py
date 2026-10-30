@@ -5,6 +5,7 @@ import pytest
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import Lot, Plan, Scenario
 from freshswitch_backend.optimize import AIR, solve_plan
+from freshswitch_backend.planning.service import build_plan
 from freshswitch_backend.replan import (
     AddLotEvent,
     AirSwitchEvent,
@@ -28,7 +29,7 @@ def scenario() -> Scenario:
 
 @pytest.fixture(scope="module")
 def plan(scenario: Scenario) -> Plan:
-    return solve_plan(scenario)
+    return build_plan(scenario).plan
 
 
 @pytest.fixture(scope="module")
@@ -94,7 +95,7 @@ def test_replan_is_fast_and_keeps_untouched_container(reduce_result: ReplanResul
 
 
 def test_fixed_decisions_survive_even_if_suboptimal(scenario: Scenario) -> None:
-    current = solve_plan(scenario, fixed={"lot-sangju-gr-1": "CA-03"})
+    current = build_plan(scenario, fixed={"lot-sangju-gr-1": "CA-03"}).plan
     assert locations(current)["lot-pohang-gr-1"] == "CA-03"
     result = replan(scenario, current, ReduceEvent(lot_id="lot-sancheong-sb-1", new_pallets=3))
     for alt in result.alternatives:
@@ -136,17 +137,69 @@ def test_air_locked_lot_is_not_pulled_back(scenario: Scenario, plan: Plan) -> No
     assert _fill(pull, "CA-01") == 15
 
 
-def test_small_delay_lets_late_lot_board_without_pull(scenario: Scenario, plan: Plan) -> None:
+def test_delay_keeps_cy_cutoff_and_charges_terminal_dwell(scenario: Scenario, plan: Plan) -> None:
     event = DelayEvent(
         voyage_id="V-2611A", new_etd=datetime.fromisoformat("2026-11-19T18:00+09:00")
+    )
+    result = replan(scenario, plan, event)
+    voyage = next(v for v in result.scenario_after.voyages if v.id == "V-2611A")
+    assert voyage.cy_cutoff == datetime.fromisoformat("2026-11-17T18:00+09:00")
+    assert voyage.original_etd == datetime.fromisoformat("2026-11-18T18:00+09:00")
+    pull = _alt(result, "pull_forward")
+    late = next(a for a in pull.plan.assignments if a.lot_id == "lot-miryang-sb-2")
+    assert (late.container_id, late.pull_forward_days) == ("CA-01", 1)
+    as_is = _alt(result, "sail_as_is")
+    assert as_is.feasible
+    ca01 = next(c for c in as_is.plan.containers if c.container_id == "CA-01")
+    assert ca01.terminal_extra_days == 1.0
+    assert ca01.terminal_plug_cost == 50_000
+    jinju_before = next(c for c in plan.shipper_costs if c.shipper_id == "sh-jinju").plan
+    jinju_after = next(c for c in as_is.plan.shipper_costs if c.shipper_id == "sh-jinju").plan
+    plug_share = 50_000 * 8 / 17
+    assert jinju_after.storage - jinju_before.storage == pytest.approx(8 * 3000 + plug_share, abs=1)
+    assert jinju_after.loss_risk > jinju_before.loss_risk
+
+
+def test_delay_with_new_cutoff_lets_late_lot_board_without_pull(
+    scenario: Scenario, plan: Plan
+) -> None:
+    event = DelayEvent(
+        voyage_id="V-2611A",
+        new_etd=datetime.fromisoformat("2026-11-19T18:00+09:00"),
+        new_cy_cutoff=datetime.fromisoformat("2026-11-18T18:00+09:00"),
     )
     result = replan(scenario, plan, event)
     pull = _alt(result, "pull_forward")
     late = next(a for a in pull.plan.assignments if a.lot_id == "lot-miryang-sb-2")
     assert (late.container_id, late.pull_forward_days) == ("CA-01", 0)
-    assert _alt(result, "sail_as_is").feasible
     voyage = next(v for v in result.scenario_after.voyages if v.id == "V-2611A")
     assert voyage.cy_cutoff == datetime.fromisoformat("2026-11-18T18:00+09:00")
+
+
+def test_earlier_departure_moves_cutoff_with_it(scenario: Scenario) -> None:
+    event = DelayEvent(
+        voyage_id="V-2611A", new_etd=datetime.fromisoformat("2026-11-18T12:00+09:00")
+    )
+    voyage = next(v for v in apply_event(scenario, event).voyages if v.id == "V-2611A")
+    assert voyage.cy_cutoff == datetime.fromisoformat("2026-11-17T12:00+09:00")
+
+
+def test_every_alternative_carries_its_own_routes(reduce_result: ReplanResult) -> None:
+    for alt in reduce_result.alternatives:
+        sea = {a.lot_id for a in alt.plan.assignments if a.mode == "sea"}
+        routed = {lid for vp in alt.routes for lid in vp.lot_ids}
+        assert routed == sea
+        assert alt.plan.collection_basis == "route"
+        for vp in alt.routes:
+            for route in vp.pickup.routes:
+                allocated = sum(
+                    c.route
+                    for c in alt.plan.lot_collections
+                    if c.voyage_id == vp.voyage_id and c.truck_id == route.truck_id
+                )
+                assert allocated == round(route.cost)
+    pull = _alt(reduce_result, "pull_forward")
+    assert "lot-miryang-sb-2" in {lid for vp in pull.routes for lid in vp.lot_ids}
 
 
 def test_long_delay_breaks_sell_by_for_strawberries(scenario: Scenario, plan: Plan) -> None:

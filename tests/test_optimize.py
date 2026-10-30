@@ -57,9 +57,10 @@ def test_default_plan_sends_late_miryang_lot_by_air(default_plan: Plan) -> None:
 
 def test_default_plan_costs_add_up(default_plan: Plan) -> None:
     for cost in default_plan.shipper_costs:
-        parts = cost.plan.model_dump()
-        total = parts.pop("total")
-        assert sum(parts.values()) == total
+        parts = cost.plan.model_dump(
+            include={"freight", "handling", "collection", "storage", "loss_risk"}
+        )
+        assert sum(parts.values()) == cost.plan.total
     ca01 = _container(default_plan, "CA-01")
     jinju = next(c for c in default_plan.shipper_costs if c.shipper_id == "sh-jinju")
     share = jinju.plan.freight + jinju.plan.handling

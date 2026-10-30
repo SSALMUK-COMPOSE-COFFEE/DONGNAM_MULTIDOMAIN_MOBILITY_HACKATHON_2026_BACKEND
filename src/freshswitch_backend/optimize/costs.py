@@ -60,6 +60,19 @@ class CostModel:
     def container_fixed_cost(self) -> float:
         return self.container_freight + self.container_handling
 
+    @staticmethod
+    def terminal_extra_days(voyage: Voyage) -> float:
+        if voyage.original_etd is None:
+            return 0.0
+        return max(0.0, (voyage.etd - voyage.original_etd).total_seconds() / 86400)
+
+    def container_plug_cost(self, container: Container) -> float:
+        per_day = self.params.terminal_reefer_plug_per_container_day.value
+        return per_day * self.terminal_extra_days(self.voyage_of(container))
+
+    def container_total_fixed_cost(self, container: Container) -> float:
+        return self.container_fixed_cost + self.container_plug_cost(container)
+
     def product(self, lot: Lot) -> Product:
         return self.products[lot.product_id]
 

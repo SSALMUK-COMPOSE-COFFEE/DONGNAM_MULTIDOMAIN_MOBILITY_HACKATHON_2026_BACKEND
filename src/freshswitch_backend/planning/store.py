@@ -6,7 +6,8 @@ from datetime import UTC, datetime
 from pydantic import BaseModel
 
 from freshswitch_backend.domain.models import Plan, Scenario
-from freshswitch_backend.planning.service import VoyagePickup, build_plan, with_routes
+from freshswitch_backend.explain.models import Explanation
+from freshswitch_backend.planning.service import VoyagePickup, build_plan
 from freshswitch_backend.replan import AirSwitchEvent, CancelEvent, Event, ReplanResult
 from freshswitch_backend.replan.models import AlternativeId
 
@@ -28,7 +29,7 @@ class HistoryEntry(BaseModel):
     cost_after: int
     cost_delta: int
     solve_ms: int
-    explanation: str | None = None
+    explanation: Explanation | None = None
 
 
 class PlanSession(BaseModel):
@@ -89,6 +90,17 @@ class SessionStore:
         with self._lock:
             return self._sessions.get(plan_id)
 
+    def count(self) -> int:
+        with self._lock:
+            return len(self._sessions)
+
+    def clear(self) -> int:
+        with self._lock:
+            cleared = len(self._sessions)
+            self._sessions.clear()
+            self._pending.clear()
+            return cleared
+
     def add_pending(self, session: PlanSession, result: ReplanResult) -> PendingReplan:
         pending = PendingReplan(
             replan_id=str(uuid.uuid4()), base_version=session.version, result=result
@@ -132,7 +144,6 @@ class SessionStore:
                 locked.add(event.lot_id)
             if isinstance(event, CancelEvent):
                 locked.discard(event.lot_id)
-            built = with_routes(scenario, alternative.plan)
             entry = HistoryEntry(
                 seq=len(session.history) + 1,
                 replan_id=pending.replan_id,
@@ -150,8 +161,8 @@ class SessionStore:
                     "version": session.version + 1,
                     "updated_at": entry.applied_at,
                     "scenario": scenario,
-                    "plan": built.plan,
-                    "routes": built.routes,
+                    "plan": alternative.plan,
+                    "routes": alternative.routes,
                     "air_locked_lot_ids": sorted(locked),
                     "history": [*session.history, entry],
                 }

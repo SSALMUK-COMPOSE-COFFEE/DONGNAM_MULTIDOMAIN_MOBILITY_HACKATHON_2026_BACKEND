@@ -2,9 +2,10 @@ import time
 from collections.abc import Callable, Iterable
 
 from freshswitch_backend.domain.models import Plan, Scenario
-from freshswitch_backend.optimize import AIR, solve_plan
+from freshswitch_backend.optimize import AIR
 from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.optimize.feasibility import sea_option
+from freshswitch_backend.planning.service import PlanWithRoutes, solve_with_routes
 from freshswitch_backend.replan.models import (
     AddLotEvent,
     AirSwitchEvent,
@@ -62,10 +63,18 @@ def apply_event(scenario: Scenario, event: Event) -> Scenario:
             voyage = next((v for v in scenario.voyages if v.id == voyage_id), None)
             if voyage is None:
                 raise ReplanError(f"항차를 찾을 수 없음: {voyage_id}")
-            cutoff = new_cutoff or voyage.cy_cutoff + (new_etd - voyage.etd)
+            cutoff = new_cutoff or voyage.cy_cutoff
+            if new_cutoff is None and new_etd < voyage.etd:
+                cutoff = voyage.cy_cutoff + (new_etd - voyage.etd)
             if cutoff > new_etd:
                 raise ReplanError("선적 마감이 출항 시각보다 늦을 수 없음")
-            changed = voyage.model_copy(update={"etd": new_etd, "cy_cutoff": cutoff})
+            changed = voyage.model_copy(
+                update={
+                    "etd": new_etd,
+                    "cy_cutoff": cutoff,
+                    "original_etd": voyage.original_etd or voyage.etd,
+                }
+            )
             return scenario.model_copy(
                 update={"voyages": [changed if v.id == voyage_id else v for v in scenario.voyages]}
             )
@@ -183,10 +192,10 @@ def _score(plan: Plan) -> int:
     return plan.total_shared_cost
 
 
-def _timed(fn: Callable[[], Plan]) -> tuple[Plan, int]:
+def _timed(fn: Callable[[], PlanWithRoutes]) -> tuple[PlanWithRoutes, int]:
     started = time.perf_counter()
-    plan = fn()
-    return plan, round((time.perf_counter() - started) * 1000)
+    built = fn()
+    return built, round((time.perf_counter() - started) * 1000)
 
 
 def diff_plans(scenario: Scenario, before: Plan, after: Plan) -> PlanDiff:
@@ -341,11 +350,12 @@ def _next_voyage_reasons(ctx: _Context, plan: Plan, moved: set[str], horizon) ->
 def _alternative(
     ctx: _Context,
     alt_id: AlternativeId,
-    plan: Plan,
+    built: PlanWithRoutes,
     elapsed: int,
     label: str,
     reasons: list[str],
 ) -> Alternative:
+    plan = built.plan
     if plan.status not in SOLVED:
         reasons = [f"해 없음({plan.status})", *reasons]
     lost = [lid for lid in ctx.new_unassigned(plan) if not any(lid in r for r in reasons)]
@@ -360,6 +370,7 @@ def _alternative(
         total_cost=_score(plan),
         cost_delta=_score(plan) - _score(ctx.current),
         plan=plan,
+        routes=built.routes,
         diff=diff,
         solve_ms=elapsed,
     )
@@ -381,27 +392,29 @@ def replan(
     scope = "container"
     free = ctx.free_lots(scope)
 
-    def solve_pull(free_lots: set[str]) -> Plan:
-        return solve_plan(
+    def solve_pull(free_lots: set[str]) -> PlanWithRoutes:
+        return solve_with_routes(
             after,
             fixed=ctx.fixed_for(free_lots),
             max_pull_forward_days=MAX_PULL_FORWARD_DAYS,
             time_limit_s=per_solve,
         )
 
-    pull_plan, pull_ms = _timed(lambda: solve_pull(free))
+    pull_built, pull_ms = _timed(lambda: solve_pull(free))
+    pull_plan = pull_built.plan
     if ctx.new_unassigned(pull_plan) or pull_plan.status not in SOLVED:
         wider = ctx.free_lots("voyage")
         if wider != free:
             scope, free = "voyage", wider
-            pull_plan, extra = _timed(lambda: solve_pull(free))
+            pull_built, extra = _timed(lambda: solve_pull(free))
+            pull_plan = pull_built.plan
             pull_ms += extra
     fixed = ctx.fixed_for(free)
     alternatives = [
         _alternative(
             ctx,
             "pull_forward",
-            pull_plan,
+            pull_built,
             pull_ms,
             LABELS["pull_forward"] if _pulled(ctx, pull_plan) else "재배정",
             [],
@@ -415,8 +428,8 @@ def replan(
         forbidden = [(lid, cid) for lid in moved for cid in blocked]
         forbidden += [(lid, AIR) for lid in moved]
         next_fixed = {k: v for k, v in fixed.items() if k not in moved}
-        next_plan, next_ms = _timed(
-            lambda: solve_plan(
+        next_built, next_ms = _timed(
+            lambda: solve_with_routes(
                 after,
                 fixed=next_fixed,
                 forbidden=forbidden,
@@ -428,10 +441,10 @@ def replan(
             _alternative(
                 ctx,
                 "next_voyage",
-                next_plan,
+                next_built,
                 next_ms,
                 LABELS["next_voyage"],
-                _next_voyage_reasons(ctx, next_plan, moved, horizon),
+                _next_voyage_reasons(ctx, next_built.plan, moved, horizon),
             )
         )
 
@@ -444,8 +457,8 @@ def replan(
     if isinstance(event, AddLotEvent):
         used = {c.container_id for c in current_plan.containers if c.used}
         as_is_forbidden = [(event.lot.id, cid) for cid in used]
-    as_is_plan, as_is_ms = _timed(
-        lambda: solve_plan(
+    as_is_built, as_is_ms = _timed(
+        lambda: solve_with_routes(
             after,
             fixed=as_is_fixed,
             forbidden=as_is_forbidden,
@@ -467,7 +480,7 @@ def replan(
         _alternative(
             ctx,
             "sail_as_is",
-            as_is_plan,
+            as_is_built,
             as_is_ms,
             LABELS["sail_as_is"],
             as_is_reasons,

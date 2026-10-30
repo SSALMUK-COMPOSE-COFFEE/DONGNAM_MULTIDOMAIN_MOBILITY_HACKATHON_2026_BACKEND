@@ -26,6 +26,7 @@ def solve_plan(
     *,
     fixed: Mapping[str, str] | None = None,
     forbidden: Iterable[tuple[str, str]] | None = None,
+    forbidden_reasons: Mapping[tuple[str, str], str] | None = None,
     exclude_lot_ids: Iterable[str] | None = None,
     allow_air: bool = True,
     require_savings: bool = True,
@@ -37,6 +38,7 @@ def solve_plan(
     started = time.perf_counter()
     fixed = dict(fixed or {})
     forbidden_set = set(forbidden or ())
+    forbidden_reasons = dict(forbidden_reasons or {})
     excluded = set(exclude_lot_ids or ())
     model = CostModel(scenario)
     lots = [lot for lot in scenario.lots if lot.id not in excluded]
@@ -54,7 +56,8 @@ def solve_plan(
         options[lot.id] = {}
         for container in containers:
             if (lot.id, container.id) in forbidden_set:
-                rejections[lot.id].append(f"{container.id}: 배정 금지")
+                why = forbidden_reasons.get((lot.id, container.id), "배정 금지")
+                rejections[lot.id].append(f"{container.id}: {why}")
                 continue
             option, reason = sea_option(model, lot, container, max_pull_forward_days)
             if option is None and target == container.id:
@@ -66,7 +69,7 @@ def solve_plan(
                 options[lot.id][container.id] = option
         reason = None if allow_air else "항공 미허용"
         if reason is None and (lot.id, AIR) in forbidden_set:
-            reason = "항공 배정 금지"
+            reason = forbidden_reasons.get((lot.id, AIR), "항공 배정 금지")
         if reason is None:
             reason = air_rejection(model, lot)
         air_ok[lot.id] = reason is None or target == AIR
@@ -80,11 +83,11 @@ def solve_plan(
     z: dict[str, cp_model.IntVar] = {}
     objective: list = []
     tie_break: list = []
-    fixed_cost = round(model.container_fixed_cost)
+    fixed_cost = {c.id: round(model.container_total_fixed_cost(c)) for c in containers}
 
-    for c_idx, container in enumerate(containers):
+    for container in containers:
         z[container.id] = cp.new_bool_var(f"z[{container.id}]")
-        objective.append(fixed_cost * z[container.id])
+        objective.append(fixed_cost[container.id] * z[container.id])
 
     variable_cost: dict[tuple[str, str], int] = {}
     air_cost: dict[str, int] = {}
@@ -146,7 +149,7 @@ def solve_plan(
                 if margin <= 0:
                     cp.add(var == 0)
                 else:
-                    cp.add(lot.pallets * fixed_cost <= margin * load).only_enforce_if(var)
+                    cp.add(lot.pallets * fixed_cost[cid] <= margin * load).only_enforce_if(var)
 
     cp.minimize(COST_SCALE * sum(objective) + sum(tie_break))
     solver = cp_model.CpSolver()
@@ -251,6 +254,31 @@ def _build_plan(
         total_shared_cost=sum(s.shared_cost for s in settlements),
         total_savings=sum(s.savings for s in settlements),
         total_fee=sum(s.fee for s in settlements),
+        total_collection_estimate=sum(c.plan.collection for c in costs),
+    )
+
+
+def resettle_plan(
+    scenario: Scenario, plan: Plan, route_collection: Mapping[str, int], **updates
+) -> Plan:
+    model = CostModel(scenario)
+    lot_by_id = {lot.id: lot for lot in scenario.lots}
+    costs, settlements = shipper_costs_and_settlements(
+        model, lot_by_id, plan.assignments, route_collection
+    )
+    return plan.model_copy(
+        update={
+            "shipper_costs": costs,
+            "settlements": settlements,
+            "total_baseline_cost": sum(s.baseline_cost for s in settlements),
+            "total_shared_cost": sum(s.shared_cost for s in settlements),
+            "total_savings": sum(s.savings for s in settlements),
+            "total_fee": sum(s.fee for s in settlements),
+            "collection_basis": "route",
+            "total_collection_estimate": sum(c.plan.collection_estimate or 0 for c in costs),
+            "total_collection_route": sum(c.plan.collection for c in costs),
+            **updates,
+        }
     )
 
 

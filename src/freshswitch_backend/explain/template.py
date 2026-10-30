@@ -1,5 +1,6 @@
 from freshswitch_backend.explain.formatting import (
-    format_delta_krw,
+    change_verb,
+    format_amount_krw,
     format_fill,
     format_krw,
 )
@@ -24,15 +25,22 @@ def _shipper_message(ctx: ExplainContext, shipper: ShipperImpact) -> str:
     if shipper.delta_krw == 0:
         parts.append(f"부담 비용은 {format_krw(shipper.cost_after_krw)}으로 변동 없습니다.")
     else:
-        direction = "늘어납니다" if shipper.delta_krw > 0 else "줄어듭니다"
         parts.append(
             f"부담 비용이 {format_krw(shipper.cost_before_krw)}에서 "
-            f"{format_krw(shipper.cost_after_krw)}으로 {format_delta_krw(shipper.delta_krw)} "
-            f"{direction}."
+            f"{format_krw(shipper.cost_after_krw)}으로 {format_amount_krw(shipper.delta_krw)} "
+            f"{change_verb(shipper.delta_krw)}."
         )
     if shipper.moved:
         parts.append(f"화물은 {shipper.moved}(으)로 옮겨집니다.")
+    if shipper.pull_forward_days:
+        parts.append(f"출하를 {shipper.pull_forward_days}일 앞당겨 주셔야 합니다.")
     return " ".join(parts)
+
+
+def _cost_sentence(delta: int) -> str:
+    if delta == 0:
+        return "총 비용은 변동 없습니다."
+    return f"총 비용은 {format_amount_krw(delta)} {change_verb(delta)}."
 
 
 def _operator_summary(ctx: ExplainContext) -> str:
@@ -44,10 +52,11 @@ def _operator_summary(ctx: ExplainContext) -> str:
             for fill in recommended.container_fill
         )
         line = (
-            f"추천안은 '{recommended.label}'이며 총 비용 변화는 "
-            f"{format_delta_krw(recommended.total_cost_delta_krw)}입니다."
+            f"추천안은 '{recommended.label}'이며 {_cost_sentence(recommended.total_cost_delta_krw)}"
         )
         parts.append(line + (f" 적재: {fills}." if fills else ""))
+    else:
+        parts.append("실행 가능한 대안이 없습니다.")
     infeasible = [alt for alt in ctx.alternatives if not alt.feasible]
     for alt in infeasible:
         reason = alt.reason or "사유 미기재"

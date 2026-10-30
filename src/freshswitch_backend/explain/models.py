@@ -26,12 +26,13 @@ class ShipperImpact(BaseModel):
     cost_after_krw: int
     delta_krw: int
     moved: str | None = None
+    pull_forward_days: int = 0
 
 
 class ExplainContext(BaseModel):
     event_type: str
     event_summary: str
-    recommended_alternative_id: str
+    recommended_alternative_id: str | None
     alternatives: list[AlternativeInput]
     shippers: list[ShipperImpact]
 

@@ -270,6 +270,11 @@
       "unit": "원/km",
       "source": "가정"
     },
+    "reefer_truck_fixed_per_route_krw": {
+      "value": 0,
+      "unit": "원/대",
+      "source": "가정: 트럭 대당 고정비 미반영(0). 값을 넣으면 VRPTW 차량 고정비와 집하비 배분에 함께 들어간다"
+    },
     "truck_capacity_pallets": {
       "value": 16,
       "unit": "파렛트",
@@ -289,6 +294,11 @@
       "value": 3000,
       "unit": "원/파렛트·일",
       "source": "가정"
+    },
+    "terminal_reefer_plug_per_container_day": {
+      "value": 50000,
+      "unit": "원/컨테이너·일",
+      "source": "가정: 부산항 터미널 리퍼 전원·모니터링료 공개 자료 없음. 선박 지연으로 늘어난 터미널 대기일에만 매긴다"
     },
     "air_storage_days": {
       "value": 1.5,

@@ -61,6 +61,7 @@ class Voyage(Sourced):
     etd: datetime
     cy_cutoff: datetime
     transit_days: float
+    original_etd: datetime | None = None
 
 
 class Container(Sourced):
@@ -111,10 +112,12 @@ class CostParams(BaseModel):
     sea_ancillary_per_container_krw: Quantity = _q(4_500_000, "원/컨테이너")
     air_freight_per_kg_krw: Quantity = _q(2151, "원/kg")
     reefer_truck_cost_per_km_krw: Quantity = _q(2000, "원/km")
+    reefer_truck_fixed_per_route_krw: Quantity = _q(0, "원/대")
     truck_capacity_pallets: Quantity = _q(16, "파렛트")
     road_distance_factor: Quantity = _q(1.3, "배")
     air_trucking_km: Quantity = _q(350, "km")
     storage_per_pallet_day_krw: Quantity = _q(3000, "원/파렛트·일")
+    terminal_reefer_plug_per_container_day: Quantity = _q(50_000, "원/컨테이너·일")
     air_storage_days: Quantity = _q(1.5, "일")
     air_transit_days: Quantity = _q(0.5, "일")
     unassigned_penalty_per_pallet_krw: Quantity = _q(10_000_000, "원/파렛트")
@@ -179,6 +182,8 @@ class ContainerLoad(BaseModel):
     product_ids: list[str]
     shipper_ids: list[str]
     container_cost: int
+    terminal_extra_days: float = 0.0
+    terminal_plug_cost: int = 0
 
 
 class CostBreakdown(BaseModel):
@@ -188,6 +193,8 @@ class CostBreakdown(BaseModel):
     storage: int = 0
     loss_risk: int = 0
     total: int = 0
+    collection_estimate: int | None = None
+    collection_route: int | None = None
 
 
 class ShipperCost(BaseModel):
@@ -208,6 +215,29 @@ class Settlement(BaseModel):
     shipper_gain: int
 
 
+CollectionBasis = Literal["estimate", "route"]
+
+
+class LotCollection(BaseModel):
+    lot_id: str
+    shipper_id: str
+    voyage_id: str
+    truck_id: str | None
+    stop_id: str
+    pallets: int
+    estimate: int
+    route: int
+
+
+class CollectionReassignment(BaseModel):
+    lot_id: str
+    shipper_id: str
+    voyage_id: str
+    stop_id: str
+    reason: str
+    location_after: str
+
+
 class Plan(BaseModel):
     scenario_id: str
     status: str
@@ -222,3 +252,8 @@ class Plan(BaseModel):
     total_shared_cost: int
     total_savings: int
     total_fee: int
+    collection_basis: CollectionBasis = "estimate"
+    total_collection_estimate: int = 0
+    total_collection_route: int | None = None
+    lot_collections: list[LotCollection] = Field(default_factory=list)
+    collection_reassigned: list[CollectionReassignment] = Field(default_factory=list)

@@ -2,8 +2,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from freshswitch_backend.data.loader import get_scenario
-from freshswitch_backend.optimize import solve_plan
 from freshswitch_backend.planning.compare import AirSeaComparison, compare_air_sea
+from freshswitch_backend.planning.service import build_plan
 from freshswitch_backend.planning.store import store
 
 router = APIRouter(prefix="/compare", tags=["compare"])
@@ -26,7 +26,7 @@ def air_vs_sea(body: AirSeaRequest) -> AirSeaComparison:
         scenario = get_scenario(body.scenario_id)
         if scenario is None:
             raise HTTPException(status_code=404, detail="시나리오를 찾을 수 없습니다")
-        plan = solve_plan(scenario)
+        plan = build_plan(scenario).plan
     try:
         return compare_air_sea(scenario, plan, body.lot_id)
     except KeyError as exc:

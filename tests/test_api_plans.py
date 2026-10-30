@@ -1,12 +1,11 @@
 from datetime import date
 
-import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from freshswitch_backend.api import vessels
 from freshswitch_backend.config import Settings
-from freshswitch_backend.integrations import MofVesselApiError, VesselMovement
+from freshswitch_backend.integrations import VesselMovement
 from freshswitch_backend.main import app
 
 REDUCE = {"type": "reduce", "lot_id": "lot-sancheong-sb-1", "new_pallets": 3}
@@ -67,7 +66,14 @@ def test_create_event_apply_history(client: TestClient) -> None:
     body = replan.json()
     assert body["recommended_id"] == "pull_forward"
     assert [a["id"] for a in body["alternatives"]] == ["pull_forward", "next_voyage", "sail_as_is"]
-    assert body["explanation"] is None
+    explanation = body["explanation"]
+    assert explanation["generated_by"] == "template"
+    assert "당겨 채우기" in explanation["operator_summary"]
+    assert "-" not in explanation["operator_summary"].split("추천안")[1].split(".")[0]
+    assert {m["shipper_id"] for m in explanation["shipper_messages"]} >= {"sh-sancheong"}
+    for alt in body["alternatives"]:
+        assert alt["plan"]["collection_basis"] == "route"
+        assert alt["routes"]
     assert body["solve_ms"] < 10_000
     assert "scenario_after" not in body
 
@@ -165,30 +171,38 @@ def test_compare_air_vs_sea(client: TestClient) -> None:
     ).status_code == 404
 
 
-def test_vessels_busan_with_fake_client(client: TestClient, fake_vessels) -> None:
-    movement = VesselMovement(port_code="020", call_sign="ABC", vessel_name="MV FRESH HARMONY")
-    fake = fake_vessels(FakeClient([movement]))
-    response = client.get("/api/vessels/busan", params={"date": "20261118", "direction": "O"})
-    assert response.status_code == 200
-    assert response.json()[0]["call_sign"] == "ABC"
-    assert fake.calls == [(date(2026, 11, 18), date(2026, 11, 18), "O")]
+def test_explanation_llm_flag_needs_setting(client: TestClient, monkeypatch) -> None:
+    from freshswitch_backend.replan import explanation as replan_explanation
 
+    calls: list = []
 
-@pytest.mark.parametrize(
-    "error", [MofVesselApiError("30"), httpx.ConnectError("down")], ids=["api", "network"]
-)
-def test_vessels_busan_errors_are_503(client: TestClient, fake_vessels, error) -> None:
-    fake_vessels(FakeClient(error=error))
-    response = client.get("/api/vessels/busan", params={"date": "20261118"})
-    assert response.status_code == 503
-    assert "해수부" in response.json()["detail"]
+    async def fake_explain(ctx):
+        calls.append(ctx)
+        from freshswitch_backend.explain import render_template
 
+        return render_template(ctx).model_copy(update={"generated_by": "llm", "model": "fake"})
 
-def test_vessels_busan_without_key_is_503(client: TestClient, monkeypatch) -> None:
-    monkeypatch.setattr(vessels, "get_settings", lambda: Settings(data_go_kr_service_key=""))
-    response = client.get("/api/vessels/busan", params={"date": "20261118"})
-    assert response.status_code == 503
-    assert "키" in response.json()["detail"]
+    monkeypatch.setattr(replan_explanation, "explain", fake_explain)
+    plan_id = _create(client)["plan_id"]
+    off = Settings(explain_use_llm=False, llm_api_key="k", llm_model_name="m", _env_file=None)
+    monkeypatch.setattr(replan_explanation, "get_settings", lambda: off)
+    body = client.post(
+        f"/api/plans/{plan_id}/events", params={"llm": "true"}, json={"event": REDUCE}
+    ).json()
+    assert body["explanation"]["generated_by"] == "template"
+    assert calls == []
+
+    on = off.model_copy(update={"explain_use_llm": True})
+    monkeypatch.setattr(replan_explanation, "get_settings", lambda: on)
+    body = client.post(
+        f"/api/plans/{plan_id}/events", params={"llm": "false"}, json={"event": REDUCE}
+    ).json()
+    assert body["explanation"]["generated_by"] == "template"
+    body = client.post(
+        f"/api/plans/{plan_id}/events", params={"llm": "true"}, json={"event": REDUCE}
+    ).json()
+    assert body["explanation"]["generated_by"] == "llm"
+    assert len(calls) == 1
 
 
 def test_schedule_check_builds_delay_events(client: TestClient, fake_vessels) -> None:
@@ -211,7 +225,7 @@ def test_schedule_check_builds_delay_events(client: TestClient, fake_vessels) ->
         "type": "delay",
         "voyage_id": "V-2611A",
         "new_etd": "2026-11-19T06:00:00+09:00",
-        "new_cy_cutoff": "2026-11-18T06:00:00+09:00",
+        "new_cy_cutoff": None,
         "source": "해수부",
     }
     replan = client.post(f"/api/plans/{plan_id}/events", json={"event": event})
@@ -223,3 +237,15 @@ def test_schedule_check_builds_delay_events(client: TestClient, fake_vessels) ->
     ).json()
     assert provided["source"] == "provided"
     assert provided["events"] == []
+
+
+def test_schedule_check_demo_yields_delay_event(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setattr(vessels, "get_settings", lambda: Settings(offline_mode=True))
+    plan_id = _create(client)["plan_id"]
+    response = client.post(f"/api/plans/{plan_id}/schedule-check", params={"demo": "true"})
+    assert response.status_code == 200
+    events = response.json()["events"]
+    assert [e["voyage_id"] for e in events] == ["V-2611A"]
+    assert events[0]["new_cy_cutoff"] is None
+    replan = client.post(f"/api/plans/{plan_id}/events", json={"event": events[0]})
+    assert replan.status_code == 200

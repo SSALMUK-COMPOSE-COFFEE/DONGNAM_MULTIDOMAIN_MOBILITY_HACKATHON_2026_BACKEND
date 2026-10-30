@@ -1,0 +1,48 @@
+{
+ "derived_from": "mof/20261030-O.json 9HA5004 (CMA CGM TARPON, 신항 풀컨테이너선) 레코드를 복제해 선명·호출부호·일시·선석·목적항(홍콩)만 시나리오 가상 선박으로 바꿈",
+ "description": "시연용 가상 선박 출항 실적. MV FRESH HARMONY(V-2611A)는 예정 2026-11-18 18:00보다 12시간 늦은 11-19 06:00 출항, MV COLD BRIDGE(V-2611B)는 30분 차이로 정상",
+ "movements": [
+  {
+   "port_code": "020",
+   "port_name": "부산",
+   "call_sign": "D5FH1",
+   "vessel_name": "MV FRESH HARMONY",
+   "entry_year": "2026",
+   "entry_count": "041",
+   "nationality": "몰타",
+   "vessel_kind": "풀컨테이너선",
+   "purpose": "양적하",
+   "previous_port": "DUTCH HARBOR",
+   "next_port": "HONG KONG",
+   "destination_port": "HONG KONG",
+   "arrival_berth": "신항 2부두 1선석",
+   "departure_berth": "신항 2부두 1선석",
+   "arrival_at": "2026-11-18T06:00:00+09:00",
+   "departure_at": "2026-11-19T06:00:00+09:00",
+   "planned_departure_at": "2026-11-18T18:00:00+09:00",
+   "gross_tonnage": 54309.0,
+   "destination_eta": "2026-11-22T06:00:00+09:00"
+  },
+  {
+   "port_code": "020",
+   "port_name": "부산",
+   "call_sign": "D5CB2",
+   "vessel_name": "MV COLD BRIDGE",
+   "entry_year": "2026",
+   "entry_count": "038",
+   "nationality": "몰타",
+   "vessel_kind": "풀컨테이너선",
+   "purpose": "양적하",
+   "previous_port": "DUTCH HARBOR",
+   "next_port": "HONG KONG",
+   "destination_port": "HONG KONG",
+   "arrival_berth": "신항 2부두 1선석",
+   "departure_berth": "신항 2부두 1선석",
+   "arrival_at": "2026-11-21T07:00:00+09:00",
+   "departure_at": "2026-11-21T18:30:00+09:00",
+   "planned_departure_at": "2026-11-21T18:00:00+09:00",
+   "gross_tonnage": 54309.0,
+   "destination_eta": "2026-11-24T18:30:00+09:00"
+  }
+ ]
+}

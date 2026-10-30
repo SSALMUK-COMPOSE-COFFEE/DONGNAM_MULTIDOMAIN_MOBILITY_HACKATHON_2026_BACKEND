@@ -15,6 +15,8 @@ from freshswitch_backend.explain import (
     format_krw,
     render_template,
 )
+from freshswitch_backend.explain.formatting import format_amount_krw
+from freshswitch_backend.explain.prompt import build_payload
 
 
 def make_context() -> ExplainContext:
@@ -105,6 +107,19 @@ def test_formatting() -> None:
     assert format_delta_krw(-20_000) == "-2만 원"
     assert format_delta_krw(3_500) == "+3,500원"
     assert format_delta_krw(0) == "변동 없음"
+    assert format_amount_krw(-23_000) == "2.3만 원"
+    assert format_amount_krw(3_500) == "3,500원"
+    assert format_amount_krw(-1_991_430) == "199.1만 원"
+
+
+def test_payload_uses_unsigned_change_and_direction() -> None:
+    payload = build_payload(make_context())
+    sancheong, jinju = payload["shippers"]
+    assert (sancheong["change"], sancheong["direction"]) == ("2.3만 원", "감소")
+    assert (jinju["change"], jinju["direction"]) == ("3,500원", "증가")
+    alt = payload["alternatives"][0]
+    assert (alt["total_cost_change"], alt["total_cost_direction"]) == ("2.3만 원", "감소")
+    assert "+" not in json.dumps(payload, ensure_ascii=False)
 
 
 def test_llm_success() -> None:
@@ -173,10 +188,13 @@ def test_template_mentions_each_shipper_and_delta() -> None:
     result = render_template(make_context())
     by_id = {m.shipper_id: m.message for m in result.shipper_messages}
     assert "산청 딸기농가" in by_id["s-sancheong"]
-    assert "-2.3만 원" in by_id["s-sancheong"]
+    assert "389,000원으로 2.3만 원 줄어듭니다." in by_id["s-sancheong"]
+    assert "-2.3" not in by_id["s-sancheong"]
     assert "412,000원" in by_id["s-sancheong"]
     assert "진주 파프리카" in by_id["s-jinju"]
-    assert "+3,500원" in by_id["s-jinju"]
+    assert "253,500원으로 3,500원 늘어납니다." in by_id["s-jinju"]
+    assert "+3,500" not in by_id["s-jinju"]
+    assert "총 비용은 2.3만 원 줄어듭니다." in result.operator_summary
     assert "CA-01" in by_id["s-jinju"]
     assert "대기 화물 당겨 싣기" in result.operator_summary
     assert "신선도 한계 초과" in result.operator_summary
