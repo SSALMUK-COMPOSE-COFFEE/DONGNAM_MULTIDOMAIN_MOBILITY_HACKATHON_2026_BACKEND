@@ -8,7 +8,9 @@ from freshswitch_backend.analysis.common import (
     container_fill,
     locations,
     proposal_event_applies,
+    route_costed,
     solve,
+    solve_routed,
 )
 from freshswitch_backend.analysis.models import (
     BenchmarkResult,
@@ -20,7 +22,10 @@ from freshswitch_backend.domain.models import Container, Lot, Plan, Scenario
 from freshswitch_backend.optimize import AIR
 from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.optimize.feasibility import air_rejection, products_compatible, sea_option
+from freshswitch_backend.planning.service import CUTOFF_REASON
 from freshswitch_backend.replan import replan
+
+Part = tuple[Scenario, Plan, list[str]]
 
 METHODS = {
     "optimizer": (
@@ -157,6 +162,11 @@ def solo_plans(scenario: Scenario) -> list[tuple[Scenario, Plan]]:
     return result
 
 
+def routed_part(scenario: Scenario, plan: Plan) -> Part:
+    costed, dropped = route_costed(scenario, plan)
+    return scenario, costed, dropped
+
+
 def violations(scenario: Scenario, plan: Plan) -> list[str]:
     model = CostModel(scenario)
     lots = {lot.id: lot for lot in scenario.lots}
@@ -189,17 +199,18 @@ def violations(scenario: Scenario, plan: Plan) -> list[str]:
     return found
 
 
-def _result(method: str, parts: list[tuple[Scenario, Plan]], elapsed_ms: int) -> MethodResult:
+def _result(method: str, parts: list[Part], elapsed_ms: int) -> MethodResult:
     label, description = METHODS[method]
-    used = [c for _, plan in parts for c in plan.containers if c.used]
+    used = [c for _, plan, _ in parts for c in plan.containers if c.used]
     capacity = sum(c.capacity_pallets for c in used)
     pallets = sum(c.pallets for c in used)
-    assignments = [a for _, plan in parts for a in plan.assignments]
-    unassigned = [u for _, plan in parts for u in plan.unassigned]
-    settlements = [s for _, plan in parts for s in plan.settlements]
-    found = [v for scenario, plan in parts for v in violations(scenario, plan)]
+    assignments = [a for _, plan, _ in parts for a in plan.assignments]
+    unassigned = [u for _, plan, _ in parts for u in plan.unassigned]
+    settlements = [s for _, plan, _ in parts for s in plan.settlements]
+    found = [v for scenario, plan, _ in parts for v in violations(scenario, plan)]
+    found += [f"{lid}: {CUTOFF_REASON}" for _, _, dropped in parts for lid in dropped]
     where: dict[str, str] = {}
-    for _, plan in parts:
+    for _, plan, _ in parts:
         where.update(locations(plan))
     return MethodResult(
         method=method,
@@ -211,10 +222,12 @@ def _result(method: str, parts: list[tuple[Scenario, Plan]], elapsed_ms: int) ->
         air_pallets=sum(a.pallets for a in assignments if a.mode == "air"),
         unassigned_lots=len(unassigned),
         unassigned_pallets=sum(u.pallets for u in unassigned),
-        total_baseline_cost=sum(p.total_baseline_cost for _, p in parts),
-        total_shipper_cost=sum(p.total_shared_cost for _, p in parts),
-        total_savings=sum(p.total_savings for _, p in parts),
-        total_fee=sum(p.total_fee for _, p in parts),
+        total_baseline_cost=sum(p.total_baseline_cost for _, p, _ in parts),
+        total_shipper_cost=sum(p.total_shared_cost for _, p, _ in parts),
+        total_savings=sum(p.total_savings for _, p, _ in parts),
+        total_fee=sum(p.total_fee for _, p, _ in parts),
+        total_collection_estimate=sum(p.total_collection_estimate or 0 for _, p, _ in parts),
+        total_collection_route=sum(p.total_collection_route or 0 for _, p, _ in parts),
         shippers_with_loss=sum(1 for s in settlements if s.savings < 0),
         constraint_violations=len(found),
         violation_details=found,
@@ -230,14 +243,14 @@ def _timed(fn):
 
 
 def compare_methods(scenario: Scenario) -> list[MethodResult]:
-    optimizer, opt_ms = _timed(lambda: solve(scenario))
-    fcfs, fcfs_ms = _timed(lambda: fcfs_plan(scenario))
-    greedy, greedy_ms = _timed(lambda: greedy_plan(scenario))
-    solo, solo_ms = _timed(lambda: solo_plans(scenario))
+    optimizer, opt_ms = _timed(lambda: [(scenario, solve_routed(scenario), [])])
+    fcfs, fcfs_ms = _timed(lambda: [routed_part(scenario, fcfs_plan(scenario))])
+    greedy, greedy_ms = _timed(lambda: [routed_part(scenario, greedy_plan(scenario))])
+    solo, solo_ms = _timed(lambda: [routed_part(sub, plan) for sub, plan in solo_plans(scenario)])
     return [
-        _result("optimizer", [(scenario, optimizer)], opt_ms),
-        _result("fcfs", [(scenario, fcfs)], fcfs_ms),
-        _result("greedy", [(scenario, greedy)], greedy_ms),
+        _result("optimizer", optimizer, opt_ms),
+        _result("fcfs", fcfs, fcfs_ms),
+        _result("greedy", greedy, greedy_ms),
         _result("solo", solo, solo_ms),
     ]
 

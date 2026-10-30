@@ -96,6 +96,9 @@ class SensitivityResult(BaseModel):
     tornado: list[TornadoBar]
     thresholds: list[Threshold]
     replan: ReplanSensitivity | None
+    collection_basis: Literal["estimate"] = "estimate"
+    route_base_total_savings: int
+    route_base_total_fee: int
     solve_count: int
     solve_ms: int
 
@@ -114,6 +117,9 @@ class MethodResult(BaseModel):
     total_shipper_cost: int
     total_savings: int
     total_fee: int
+    collection_basis: Literal["route"] = "route"
+    total_collection_estimate: int = 0
+    total_collection_route: int = 0
     shippers_with_loss: int
     constraint_violations: int
     violation_details: list[str]
@@ -174,6 +180,9 @@ class VoyageEconomics(BaseModel):
     forwarder_share: int
     ops_cost: int
     platform_net: int
+    variable_cost: int = 0
+    contribution_margin: int = 0
+    fixed_cost_allocation: int = 0
     usage_fee_rule_revenue: int
     breakeven_containers: float | None
     containers: list[ContainerEconomics]
@@ -207,10 +216,86 @@ class Assumption(BaseModel):
     source: str
 
 
+class BasisLine(BaseModel):
+    product_id: str
+    pallets: int
+    savings_per_pallet: int
+
+
+class BasisComparison(BaseModel):
+    basis: Literal["freight_difference", "total_cost"]
+    label: str
+    source: str
+    lines: list[BasisLine]
+    fee_rate: float
+    season_revenue_performance: int
+    season_revenue_proposal_rule: int
+    breakeven_pallets: int | None
+
+
 class BusinessResult(BaseModel):
     scenario_id: str
     assumptions: list[Assumption]
     voyages: list[VoyageEconomics]
     total_fee_revenue: int
     total_platform_net: int
+    total_contribution_margin: int = 0
+    total_fixed_cost_allocation: int = 0
     season: SeasonProjection | None
+    basis: list[BasisComparison] = []
+
+
+class AirRegime(BaseModel):
+    key: Literal["normal", "surcharge"]
+    label: str
+    air_freight_per_kg_krw: float
+    source: str
+    savings_per_pallet: dict[str, int]
+    grape_solo_savings_per_pallet: int | None
+
+
+class FixedLevel(BaseModel):
+    key: Literal["full", "mvp_cash"]
+    label: str
+    annual_cost: int
+    source: str
+
+
+class MatrixRow(BaseModel):
+    fee_rate: float
+    base_fee_per_pallet: int
+    forwarder_share: float
+    fixed_level: Literal["full", "mvp_cash"]
+    air_regime: Literal["normal", "surcharge"]
+    pallets: int
+    revenue: int
+    forwarder_cost: int
+    variable_cost: int
+    contribution: int
+    fixed_cost: int
+    net: int
+    breakeven_pallets: int | None
+    breaks_even: bool
+    needs: list[str]
+
+
+class MatrixHighlight(BaseModel):
+    summary: str
+    needs: list[str]
+    row: MatrixRow
+
+
+class BusinessMatrix(BaseModel):
+    scenario_id: str
+    base_fee_mode: Literal["deducted", "additive"]
+    grape_rule: Literal["usage_fee", "performance", "solo_baseline"]
+    variable_cost_per_pallet: int
+    season_pallets: dict[str, int]
+    baseline: dict[str, float | int | str]
+    air_regimes: list[AirRegime]
+    fixed_levels: list[FixedLevel]
+    rules: list[str]
+    rows: list[MatrixRow]
+    highlights: list[MatrixHighlight]
+    break_even_rows: int
+    solve_ms: int

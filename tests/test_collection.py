@@ -46,7 +46,7 @@ def test_route_allocation_sums_to_each_route_cost(built: PlanWithRoutes) -> None
         allocated = sum(
             c.route
             for c in plan.lot_collections
-            if c.voyage_id == voyage_id and c.truck_id == route.truck_id
+            if c.voyage_id == voyage_id and c.truck_id == route.truck_id and c.trip == route.trip
         )
         assert allocated == round(route.cost)
     total_route = sum(round(r.cost) for _, r in pairs)
@@ -117,3 +117,21 @@ def test_truck_fixed_cost_is_part_of_allocated_route_cost(
     assert with_fixed.plan.total_collection_route == built.plan.total_collection_route + (
         100_000 * len(routes)
     )
+
+
+def test_routes_never_mix_so2_and_plain_cargo(scenario: Scenario, built: PlanWithRoutes) -> None:
+    so2 = {p.id for p in scenario.products if p.so2_treated}
+    product_of = {lot.id: lot.product_id for lot in scenario.lots}
+    for vp in built.routes:
+        for route in vp.pickup.routes:
+            kinds = {product_of[lid] in so2 for v in route.stops for lid in v.lot_ids}
+            assert len(kinds) == 1
+
+
+def test_truck_shortage_falls_back_to_reassignment(scenario: Scenario) -> None:
+    trucks = [t for t in scenario.trucks if t.id == "RT-01"]
+    built = build_plan(scenario.model_copy(update={"trucks": trucks}))
+    assert all(not vp.dropped_lot_ids for vp in built.routes)
+    assert built.plan.collection_reassigned
+    for entry in built.plan.collection_reassigned:
+        assert entry.reason.startswith(CUTOFF_REASON)

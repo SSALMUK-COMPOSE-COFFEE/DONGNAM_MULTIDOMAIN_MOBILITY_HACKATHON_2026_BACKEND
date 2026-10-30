@@ -25,14 +25,24 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def _assumptions(req: PickupRequest) -> list[str]:
-    return [
+    lines = [
         f"가정: 도로거리 = 직선(haversine) 거리 × {req.road_factor}",
         f"가정: 평균 주행속도 {req.speed_kmh:g} km/h",
         f"가정: 산지 상차 작업 {req.service_minutes}분/정차",
         f"가정: km당 운행비 {req.cost_per_km:,.0f}원",
         "가정: 트럭은 항만에서 출발해 산지를 돌고 CY cut-off 전에 항만으로 돌아온다",
+        (
+            f"가정: 트럭 한 대가 cut-off 전까지 최대 {req.max_trips_per_truck}회 왕복한다 "
+            f"(항만 하역 {req.service_minutes}분 뒤 재출발)"
+        ),
         "가정: 한 정차지 물량은 트럭 한 대에 싣는다 (분할 집하 없음)",
     ]
+    if req.incompatible_groups:
+        lines.append(
+            "규칙: 컨테이너 혼적 규칙(SO2 처리 여부·온도·CA 조건)이 맞지 않는 품목은 "
+            "같은 트럭 운행에 싣지 않는다"
+        )
+    return lines
 
 
 def _floor_min(dt: datetime) -> datetime:
@@ -90,7 +100,10 @@ def solve_pickup(request: PickupRequest, time_limit_s: float = 5.0) -> PickupPla
         active = sorted(windows)
         nodes = [0] + active
         m = len(nodes)
-        manager = pywrapcp.RoutingIndexManager(m, len(req.trucks), 0)
+        n_trucks = len(req.trucks)
+        trips = req.max_trips_per_truck
+        vehicles = n_trucks * trips
+        manager = pywrapcp.RoutingIndexManager(m, vehicles, 0)
         routing = pywrapcp.RoutingModel(manager)
 
         def dist_cb(i: int, j: int) -> int:
@@ -107,12 +120,23 @@ def solve_pickup(request: PickupRequest, time_limit_s: float = 5.0) -> PickupPla
 
         dist_idx = routing.RegisterTransitCallback(dist_cb)
         routing.SetArcCostEvaluatorOfAllVehicles(dist_idx)
-        if req.truck_fixed_cost > 0 and req.cost_per_km > 0:
-            routing.SetFixedCostOfAllVehicles(round(req.truck_fixed_cost / req.cost_per_km * 1000))
+        fixed = (
+            round(req.truck_fixed_cost / req.cost_per_km * 1000)
+            if req.truck_fixed_cost > 0 and req.cost_per_km > 0
+            else 0
+        )
+        for v in range(vehicles):
+            extra = v // n_trucks
+            if fixed or extra:
+                routing.SetFixedCostOfVehicle(fixed + extra, v)
 
         demand_idx = routing.RegisterUnaryTransitCallback(demand_cb)
         routing.AddDimensionWithVehicleCapacity(
-            demand_idx, 0, [t.capacity_pallets for t in req.trucks], True, "Load"
+            demand_idx,
+            0,
+            [req.trucks[v % n_trucks].capacity_pallets for v in range(vehicles)],
+            True,
+            "Load",
         )
 
         time_idx = routing.RegisterTransitCallback(time_cb)
@@ -123,9 +147,34 @@ def solve_pickup(request: PickupRequest, time_limit_s: float = 5.0) -> PickupPla
             index = manager.NodeToIndex(pos)
             time_dim.CumulVar(index).SetRange(*windows[node])
             routing.AddDisjunction([index], DROP_PENALTY)
-        for v in range(len(req.trucks)):
+        for v in range(vehicles):
             time_dim.CumulVar(routing.Start(v)).SetRange(start_min, horizon)
             time_dim.CumulVar(routing.End(v)).SetRange(start_min, horizon)
+        for v in range(n_trucks, vehicles):
+            routing.solver().Add(
+                time_dim.CumulVar(routing.End(v - n_trucks)) + req.service_minutes
+                <= time_dim.CumulVar(routing.Start(v))
+            )
+
+        groups = sorted({req.stops[node - 1].cargo_group for node in active} - {None})
+        type_of = {g: i for i, g in enumerate(groups)}
+        conflicts = {
+            (type_of[a], type_of[b])
+            for a, b in req.incompatible_groups
+            if a in type_of and b in type_of and a != b
+        }
+        if conflicts:
+            for pos, node in enumerate(nodes[1:], start=1):
+                group = req.stops[node - 1].cargo_group
+                if group in type_of:
+                    routing.SetVisitType(
+                        manager.NodeToIndex(pos),
+                        type_of[group],
+                        pywrapcp.RoutingModel.TYPE_ADDED_TO_VEHICLE,
+                    )
+            for a, b in sorted(conflicts):
+                routing.AddHardTypeIncompatibility(a, b)
+                routing.AddHardTypeIncompatibility(b, a)
 
         params = pywrapcp.DefaultRoutingSearchParameters()
         params.first_solution_strategy = (
@@ -146,28 +195,32 @@ def solve_pickup(request: PickupRequest, time_limit_s: float = 5.0) -> PickupPla
                 index = manager.NodeToIndex(pos)
                 if solution.Value(routing.NextVar(index)) == index:
                     dropped.append(req.stops[node - 1].id)
-            for v, truck in enumerate(req.trucks):
-                seq: list[int] = []
-                index = solution.Value(routing.NextVar(routing.Start(v)))
-                while not routing.IsEnd(index):
-                    seq.append(nodes[manager.IndexToNode(index)])
-                    index = solution.Value(routing.NextVar(index))
-                if seq:
-                    routes.append(
-                        _build_route(
-                            req,
-                            truck.id,
-                            truck.capacity_pallets,
-                            seq,
-                            windows,
-                            km,
-                            travel,
-                            service,
-                            start_min,
-                            deadline,
-                            to_dt,
-                        )
+            for t, truck in enumerate(req.trucks):
+                seqs: list[list[int]] = []
+                for k in range(trips):
+                    v = k * n_trucks + t
+                    seq: list[int] = []
+                    index = solution.Value(routing.NextVar(routing.Start(v)))
+                    while not routing.IsEnd(index):
+                        seq.append(nodes[manager.IndexToNode(index)])
+                        index = solution.Value(routing.NextVar(index))
+                    if seq:
+                        seqs.append(seq)
+                routes.extend(
+                    _build_truck_routes(
+                        req,
+                        truck.id,
+                        truck.capacity_pallets,
+                        seqs,
+                        windows,
+                        km,
+                        travel,
+                        service,
+                        start_min,
+                        deadline,
+                        to_dt,
                     )
+                )
     elif windows:
         status = "NO_TRUCKS"
         dropped.extend(req.stops[node - 1].id for node in windows)
@@ -190,11 +243,43 @@ def solve_pickup(request: PickupRequest, time_limit_s: float = 5.0) -> PickupPla
     )
 
 
-def _build_route(
+def _schedule(
+    seq: list[int],
+    windows: dict[int, tuple[int, int]],
+    travel: list[list[int]],
+    service: list[int],
+    free_at: int,
+) -> list[int]:
+    times: list[int] = []
+    prev, t = 0, free_at
+    for node in seq:
+        t = max(windows[node][0], t + service[prev] + travel[prev][node])
+        times.append(t)
+        prev = node
+    return times
+
+
+def _latest(
+    seq: list[int],
+    windows: dict[int, tuple[int, int]],
+    travel: list[list[int]],
+    service: list[int],
+    back_by: int,
+) -> list[int]:
+    latest = [0] * len(seq)
+    nxt_time, nxt = back_by, 0
+    for k in range(len(seq) - 1, -1, -1):
+        node = seq[k]
+        latest[k] = min(windows[node][1], nxt_time - travel[node][nxt] - service[node])
+        nxt_time, nxt = latest[k], node
+    return latest
+
+
+def _build_truck_routes(
     req: PickupRequest,
     truck_id: str,
     capacity: int,
-    seq: list[int],
+    seqs: list[list[int]],
     windows: dict[int, tuple[int, int]],
     km: list[list[float]],
     travel: list[list[int]],
@@ -202,57 +287,64 @@ def _build_route(
     start_min: int,
     deadline: int,
     to_dt,
-) -> TruckRoute:
-    earliest: list[int] = []
-    prev, t = 0, start_min
-    for node in seq:
-        t = max(windows[node][0], t + service[prev] + travel[prev][node])
-        earliest.append(t)
-        prev = node
-    port_eta = earliest[-1] + service[seq[-1]] + travel[seq[-1]][0]
+) -> list[TruckRoute]:
+    turnaround = req.service_minutes
+    earliest: list[list[int]] = []
+    free_at = start_min
+    for seq in seqs:
+        times = _schedule(seq, windows, travel, service, free_at)
+        earliest.append(times)
+        free_at = times[-1] + service[seq[-1]] + travel[seq[-1]][0] + turnaround
+    latest: list[list[int]] = [[] for _ in seqs]
+    back_by: list[int] = [deadline] * len(seqs)
+    bound = deadline
+    for i in range(len(seqs) - 1, -1, -1):
+        back_by[i] = bound
+        latest[i] = _latest(seqs[i], windows, travel, service, bound)
+        bound = latest[i][0] - travel[0][seqs[i][0]] - turnaround
 
-    latest = [0] * len(seq)
-    nxt_time, nxt = deadline, 0
-    for k in range(len(seq) - 1, -1, -1):
-        node = seq[k]
-        latest[k] = min(windows[node][1], nxt_time - travel[node][nxt] - service[node])
-        nxt_time, nxt = latest[k], node
-
-    first = seq[0]
-    earliest_departure = earliest[0] - travel[0][first]
-    latest_departure = latest[0] - travel[0][first]
-
-    visits: list[StopVisit] = []
-    load, prev, route_km = 0, 0, 0.0
-    for k, node in enumerate(seq):
-        stop: PickupStop = req.stops[node - 1]
-        load += stop.pallets
-        route_km += km[prev][node]
-        visits.append(
-            StopVisit(
-                stop_id=stop.id,
-                packhouse_id=stop.packhouse_id,
-                lot_ids=stop.lot_ids,
-                sequence=k + 1,
-                pallets=stop.pallets,
-                load_after=load,
-                km_from_prev=round(km[prev][node], 1),
-                ready_at=stop.ready_at,
-                eta=to_dt(earliest[k]),
-                latest_arrival=to_dt(latest[k]),
+    routes: list[TruckRoute] = []
+    for i, seq in enumerate(seqs):
+        first = seq[0]
+        port_eta = earliest[i][-1] + service[seq[-1]] + travel[seq[-1]][0]
+        visits: list[StopVisit] = []
+        load, prev, route_km = 0, 0, 0.0
+        for k, node in enumerate(seq):
+            stop: PickupStop = req.stops[node - 1]
+            load += stop.pallets
+            route_km += km[prev][node]
+            visits.append(
+                StopVisit(
+                    stop_id=stop.id,
+                    packhouse_id=stop.packhouse_id,
+                    lot_ids=stop.lot_ids,
+                    sequence=k + 1,
+                    pallets=stop.pallets,
+                    load_after=load,
+                    km_from_prev=round(km[prev][node], 1),
+                    ready_at=stop.ready_at,
+                    eta=to_dt(earliest[i][k]),
+                    latest_arrival=to_dt(latest[i][k]),
+                    cargo_group=stop.cargo_group,
+                )
+            )
+            prev = node
+        route_km += km[prev][0]
+        groups = {req.stops[node - 1].cargo_group for node in seq} - {None}
+        routes.append(
+            TruckRoute(
+                truck_id=truck_id,
+                trip=i + 1,
+                cargo_group=groups.pop() if len(groups) == 1 else None,
+                capacity_pallets=capacity,
+                load_pallets=load,
+                stops=visits,
+                km=round(route_km, 1),
+                cost=round(route_km * req.cost_per_km + req.truck_fixed_cost),
+                earliest_departure=to_dt(earliest[i][0] - travel[0][first]),
+                latest_departure=to_dt(latest[i][0] - travel[0][first]),
+                port_eta=to_dt(port_eta),
+                slack_minutes=back_by[i] - port_eta,
             )
         )
-        prev = node
-    route_km += km[prev][0]
-    return TruckRoute(
-        truck_id=truck_id,
-        capacity_pallets=capacity,
-        load_pallets=load,
-        stops=visits,
-        km=round(route_km, 1),
-        cost=round(route_km * req.cost_per_km + req.truck_fixed_cost),
-        earliest_departure=to_dt(earliest_departure),
-        latest_departure=to_dt(latest_departure),
-        port_eta=to_dt(port_eta),
-        slack_minutes=deadline - port_eta,
-    )
+    return routes

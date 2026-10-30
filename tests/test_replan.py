@@ -195,7 +195,9 @@ def test_every_alternative_carries_its_own_routes(reduce_result: ReplanResult) -
                 allocated = sum(
                     c.route
                     for c in alt.plan.lot_collections
-                    if c.voyage_id == vp.voyage_id and c.truck_id == route.truck_id
+                    if c.voyage_id == vp.voyage_id
+                    and c.truck_id == route.truck_id
+                    and c.trip == route.trip
                 )
                 assert allocated == round(route.cost)
     pull = _alt(reduce_result, "pull_forward")

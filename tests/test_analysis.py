@@ -4,6 +4,7 @@ from freshswitch_backend.analysis import (
     benchmark,
     bisect_factor,
     business,
+    business_matrix,
     fcfs_plan,
     greedy_plan,
     sensitivity,
@@ -12,6 +13,7 @@ from freshswitch_backend.analysis.benchmark import violations
 from freshswitch_backend.analysis.params import SPEC_BY_KEY, anchor_value, scaled
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.optimize import solve_plan
+from freshswitch_backend.planning.service import build_plan
 
 
 @pytest.fixture(scope="module")
@@ -62,6 +64,10 @@ def test_sensitivity_matches_base_plan(scenario, sens):
     assert sens.base_total_savings == base.total_savings
     assert sens.base_total_fee == base.total_fee
     assert {p.param.key for p in sens.params} == set(SPEC_BY_KEY)
+    routed = build_plan(scenario).plan
+    assert sens.collection_basis == "estimate"
+    assert sens.route_base_total_savings == routed.total_savings
+    assert sens.route_base_total_fee == routed.total_fee
 
 
 def test_tornado_sorted_and_air_freight_dominates(sens):
@@ -115,6 +121,16 @@ def test_manual_baselines_not_better_than_optimizer(bench):
         assert best.total_shipper_cost <= other.total_shipper_cost
         assert best.total_savings >= other.total_savings
         assert other.constraint_violations == 0
+        assert other.collection_basis == "route"
+
+
+def test_benchmark_optimizer_matches_plan_api(bench, client):
+    optimizer = next(m for m in bench.methods if m.method == "optimizer")
+    plan = client.post("/api/plans", json={"scenario_id": "default"}).json()["plan"]
+    assert optimizer.total_shipper_cost == plan["total_shared_cost"]
+    assert optimizer.total_savings == plan["total_savings"]
+    assert optimizer.total_fee == plan["total_fee"]
+    assert optimizer.total_collection_route == plan["total_collection_route"]
 
 
 def test_fcfs_rule_ignores_cost(scenario):
@@ -141,7 +157,7 @@ def test_replan_benchmark_recommended_beats_manual(bench):
 
 def test_business_per_voyage(scenario):
     result = business(scenario, forwarder_share=0.4, ops_cost_per_voyage=2_000_000)
-    plan = solve_plan(scenario)
+    plan = build_plan(scenario).plan
     assert result.total_fee_revenue == pytest.approx(plan.total_fee, abs=2)
     voyage = result.voyages[0]
     assert voyage.forwarder_share == round(voyage.fee_revenue * 0.4)
@@ -154,6 +170,61 @@ def test_business_per_voyage(scenario):
     assert result.season.revenue > 0
 
 
+def test_business_separates_contribution_from_fixed_cost(scenario):
+    result = business(scenario, forwarder_share=0.4, variable_cost_per_pallet=1_000)
+    for voyage in result.voyages:
+        assert voyage.variable_cost == 1_000 * voyage.pallets
+        assert voyage.contribution_margin == (
+            voyage.fee_revenue - voyage.forwarder_share - voyage.variable_cost
+        )
+        assert voyage.fixed_cost_allocation == voyage.ops_cost
+        assert voyage.platform_net == voyage.contribution_margin - voyage.fixed_cost_allocation
+    assert result.total_contribution_margin == sum(v.contribution_margin for v in result.voyages)
+    basis = {b.basis: b for b in result.basis}
+    freight, total = basis["freight_difference"], basis["total_cost"]
+    assert all(line.savings_per_pallet == 664_000 for line in freight.lines)
+    assert freight.season_revenue_performance > total.season_revenue_performance
+    assert freight.breakeven_pallets < total.breakeven_pallets
+
+
+def test_business_matrix_rows_and_highlights(scenario):
+    matrix = business_matrix(scenario)
+    assert matrix is not None
+    assert len(matrix.rows) == 96
+    assert matrix == business_matrix(scenario).model_copy(update={"solve_ms": matrix.solve_ms})
+    regimes = {r.key: r for r in matrix.air_regimes}
+    assert regimes["surcharge"].air_freight_per_kg_krw > regimes["normal"].air_freight_per_kg_krw
+    base = next(
+        r
+        for r in matrix.rows
+        if r.fee_rate == 0.25
+        and r.base_fee_per_pallet == 0
+        and r.forwarder_share == 0.4
+        and r.fixed_level == "full"
+        and r.air_regime == "normal"
+    )
+    assert base.needs == []
+    season = business(scenario).season
+    assert season is not None
+    assert base.revenue == pytest.approx(season.revenue, abs=1_000)
+    for row in matrix.rows:
+        assert row.contribution == row.revenue - row.forwarder_cost - row.variable_cost
+        assert row.net == row.contribution - row.fixed_cost
+        assert row.breaks_even == (row.net >= 0)
+    assert matrix.break_even_rows == sum(r.breaks_even for r in matrix.rows)
+    assert matrix.highlights
+    assert all(h.row.breaks_even for h in matrix.highlights if h.row.fixed_level == "mvp_cash")
+
+
+def test_business_matrix_base_fee_modes(scenario):
+    deducted = business_matrix(scenario, "deducted", "performance")
+    additive = business_matrix(scenario, "additive", "performance")
+    for d, a in zip(deducted.rows, additive.rows, strict=True):
+        assert a.revenue >= d.revenue
+        if d.base_fee_per_pallet == 0:
+            assert a.revenue == d.revenue
+
+
 def test_endpoints(client):
     sens = client.post("/api/analysis/sensitivity", json={"scenario_id": "default"})
     assert sens.status_code == 200
@@ -164,6 +235,13 @@ def test_endpoints(client):
     biz = client.get("/api/analysis/business", params={"scenario_id": "default"})
     assert biz.status_code == 200
     assert biz.json()["voyages"]
+    matrix = client.get(
+        "/api/analysis/business/matrix",
+        params={"scenario_id": "default", "grape_rule": "solo_baseline"},
+    )
+    assert matrix.status_code == 200
+    assert len(matrix.json()["rows"]) == 96
+    assert matrix.json()["solve_ms"] < 3_000
 
 
 def test_endpoints_not_found(client):

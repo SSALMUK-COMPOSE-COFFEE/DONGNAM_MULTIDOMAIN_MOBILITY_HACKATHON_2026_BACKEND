@@ -68,6 +68,7 @@ class ShipperDelta(BaseModel):
     share_per_pallet_before: int
     share_per_pallet_after: int
     share_per_pallet_delta_pct: float | None
+    cancellation_adjustment: int = 0
 
 
 class ContainerFill(BaseModel):
@@ -80,10 +81,38 @@ class ContainerFill(BaseModel):
     utilization_after: float
 
 
+class CancellationTransfer(BaseModel):
+    shipper_id: str
+    pallets: int
+    share_increase: int
+    amount: int
+
+
+class CancellationCharge(BaseModel):
+    payer_shipper_id: str
+    lot_id: str
+    container_id: str
+    voyage_id: str
+    cancelled_pallets: int
+    refilled_pallets: int
+    dead_pallets: int
+    container_pallets_before: int
+    container_pallets_after: int
+    container_cost: int
+    share_per_pallet_before: int
+    share_per_pallet_after: int
+    fee_rate: float
+    fee: int
+    transfers: list[CancellationTransfer]
+    rule: str
+    source: str
+
+
 class PlanDiff(BaseModel):
     moved_lots: list[LotMove]
     shippers: list[ShipperDelta]
     containers: list[ContainerFill]
+    cancellation: CancellationCharge | None = None
 
 
 class Alternative(BaseModel):

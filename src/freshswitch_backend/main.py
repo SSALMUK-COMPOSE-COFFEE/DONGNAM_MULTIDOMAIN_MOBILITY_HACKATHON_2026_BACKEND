@@ -2,7 +2,17 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from freshswitch_backend.api import analysis, compare, demo, health, plans, scenarios, vessels
+from freshswitch_backend.api import (
+    analysis,
+    compare,
+    demo,
+    health,
+    intake,
+    plans,
+    scenarios,
+    settlement,
+    vessels,
+)
 from freshswitch_backend.config import get_settings
 from freshswitch_backend.replan import ReplanError
 
@@ -33,6 +43,8 @@ def create_app() -> FastAPI:
     api.include_router(compare.router)
     api.include_router(demo.router)
     api.include_router(analysis.router)
+    api.include_router(intake.router)
+    api.include_router(settlement.router)
     app.include_router(api)
     app.add_exception_handler(ReplanError, _replan_error)
     return app

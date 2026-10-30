@@ -7,7 +7,7 @@ from freshswitch_backend.routing.models import (
     StopVisit,
     TruckRoute,
 )
-from freshswitch_backend.routing.scenario import build_pickup_request
+from freshswitch_backend.routing.scenario import build_pickup_request, cargo_groups
 from freshswitch_backend.routing.solver import haversine_km, solve_pickup
 
 __all__ = [
@@ -19,6 +19,7 @@ __all__ = [
     "StopVisit",
     "TruckRoute",
     "build_pickup_request",
+    "cargo_groups",
     "haversine_km",
     "solve_pickup",
 ]

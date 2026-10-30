@@ -1,5 +1,6 @@
 from freshswitch_backend.domain.models import Plan, Scenario
 from freshswitch_backend.optimize import AIR, solve_plan
+from freshswitch_backend.planning.service import build_plan, with_routes
 from freshswitch_backend.replan import ReduceEvent
 
 SOLVE_LIMIT_S = 2.0
@@ -11,6 +12,16 @@ PROPOSAL_EVENT = ReduceEvent(lot_id="lot-sancheong-sb-1", new_pallets=3)
 def solve(scenario: Scenario, **options) -> Plan:
     options.setdefault("time_limit_s", SOLVE_LIMIT_S)
     return solve_plan(scenario, **options)
+
+
+def solve_routed(scenario: Scenario) -> Plan:
+    return build_plan(scenario).plan
+
+
+def route_costed(scenario: Scenario, plan: Plan) -> tuple[Plan, list[str]]:
+    built = with_routes(scenario, plan)
+    dropped = [lid for vp in built.routes for lid in vp.dropped_lot_ids]
+    return built.plan, dropped
 
 
 def routes(plan: Plan) -> dict[str, str]:

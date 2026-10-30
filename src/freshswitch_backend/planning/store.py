@@ -1,11 +1,23 @@
 import threading
 import uuid
 from collections import OrderedDict
+from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from freshswitch_backend.domain.models import Plan, Scenario
+from freshswitch_backend.execution.models import (
+    TERMINAL_STATUSES,
+    ConfirmRequest,
+    ExecutionOrder,
+    OrderLogEntry,
+    OrderStatus,
+    RequestResultBody,
+)
+from freshswitch_backend.execution.orders import build_order
+from freshswitch_backend.execution.quality import ArrivalInspection
 from freshswitch_backend.explain.models import Explanation
 from freshswitch_backend.planning.service import VoyagePickup, build_plan
 from freshswitch_backend.replan import AirSwitchEvent, CancelEvent, Event, ReplanResult
@@ -13,9 +25,21 @@ from freshswitch_backend.replan.models import AlternativeId
 
 MAX_SESSIONS = 200
 MAX_PENDING = 20
+MAX_ORDERS = 50
+MAX_IDEMPOTENCY_KEYS = 100
+
+SessionStatus = Literal["committed", "pending_confirmation"]
 
 
 class SessionConflict(Exception):
+    pass
+
+
+class OrderInputError(ValueError):
+    pass
+
+
+class IdempotencyMismatch(ValueError):
     pass
 
 
@@ -30,6 +54,8 @@ class HistoryEntry(BaseModel):
     cost_delta: int
     solve_ms: int
     explanation: Explanation | None = None
+    kind: Literal["apply", "rollback"] = "apply"
+    order_id: str | None = None
 
 
 class PlanSession(BaseModel):
@@ -43,6 +69,10 @@ class PlanSession(BaseModel):
     routes: list[VoyagePickup]
     air_locked_lot_ids: list[str]
     history: list[HistoryEntry]
+    status: SessionStatus = "committed"
+    committed_version: int = 1
+    active_order_id: str | None = None
+    arrival_inspections: list[ArrivalInspection] = Field(default_factory=list)
 
 
 class PendingReplan(BaseModel):
@@ -51,21 +81,43 @@ class PendingReplan(BaseModel):
     result: ReplanResult
 
 
+class _Snapshot(BaseModel):
+    version: int
+    scenario: Scenario
+    plan: Plan
+    routes: list[VoyagePickup]
+    air_locked_lot_ids: list[str]
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _snapshot(session: PlanSession) -> _Snapshot:
+    return _Snapshot(
+        version=session.version,
+        scenario=session.scenario,
+        plan=session.plan,
+        routes=session.routes,
+        air_locked_lot_ids=session.air_locked_lot_ids,
+    )
 
 
 class SessionStore:
     def __init__(self, max_sessions: int = MAX_SESSIONS) -> None:
         self._sessions: OrderedDict[str, PlanSession] = OrderedDict()
         self._pending: dict[str, OrderedDict[str, PendingReplan]] = {}
+        self._orders: dict[str, OrderedDict[str, ExecutionOrder]] = {}
+        self._committed: dict[str, _Snapshot] = {}
+        self._idempotency: dict[str, OrderedDict[str, tuple[str, str, Any]]] = {}
         self._lock = threading.RLock()
         self._max = max_sessions
+        self.clock: Callable[[], datetime] = _now
 
     def create(self, scenario: Scenario) -> PlanSession:
         working = scenario.model_copy(deep=True)
         built = build_plan(working)
-        now = _now()
+        now = self.clock()
         session = PlanSession(
             plan_id=str(uuid.uuid4()),
             scenario_id=scenario.id,
@@ -81,10 +133,19 @@ class SessionStore:
         with self._lock:
             self._sessions[session.plan_id] = session
             self._pending[session.plan_id] = OrderedDict()
+            self._orders[session.plan_id] = OrderedDict()
+            self._committed[session.plan_id] = _snapshot(session)
+            self._idempotency[session.plan_id] = OrderedDict()
             while len(self._sessions) > self._max:
                 old, _ = self._sessions.popitem(last=False)
-                self._pending.pop(old, None)
+                self._drop(old)
         return session
+
+    def _drop(self, plan_id: str) -> None:
+        self._pending.pop(plan_id, None)
+        self._orders.pop(plan_id, None)
+        self._committed.pop(plan_id, None)
+        self._idempotency.pop(plan_id, None)
 
     def get(self, plan_id: str) -> PlanSession | None:
         with self._lock:
@@ -99,7 +160,32 @@ class SessionStore:
             cleared = len(self._sessions)
             self._sessions.clear()
             self._pending.clear()
+            self._orders.clear()
+            self._committed.clear()
+            self._idempotency.clear()
             return cleared
+
+    def idempotent(self, plan_id: str, key: str, kind: str, fingerprint: str) -> Any | None:
+        with self._lock:
+            stored = (self._idempotency.get(plan_id) or {}).get(key)
+            if stored is None:
+                return None
+            stored_kind, stored_fingerprint, value = stored
+            if stored_kind != kind or stored_fingerprint != fingerprint:
+                raise IdempotencyMismatch(
+                    "같은 idempotency_key로 다른 요청이 이미 처리됐습니다. 새 키를 쓰세요"
+                )
+            return value
+
+    def remember(self, plan_id: str, key: str, kind: str, fingerprint: str, value: Any) -> Any:
+        with self._lock:
+            keys = self._idempotency.setdefault(plan_id, OrderedDict())
+            if key in keys:
+                return self.idempotent(plan_id, key, kind, fingerprint)
+            keys[key] = (kind, fingerprint, value)
+            while len(keys) > MAX_IDEMPOTENCY_KEYS:
+                keys.popitem(last=False)
+            return value
 
     def add_pending(self, session: PlanSession, result: ReplanResult) -> PendingReplan:
         pending = PendingReplan(
@@ -114,6 +200,8 @@ class SessionStore:
 
     def apply(self, plan_id: str, alternative_id: str, replan_id: str | None = None) -> PlanSession:
         with self._lock:
+            session = self._sessions[plan_id]
+            self._expire_due(plan_id)
             session = self._sessions[plan_id]
             queue = self._pending.get(plan_id) or OrderedDict()
             if replan_id is None:
@@ -144,31 +232,307 @@ class SessionStore:
                 locked.add(event.lot_id)
             if isinstance(event, CancelEvent):
                 locked.discard(event.lot_id)
+            now = self.clock()
+            orders = self._orders.setdefault(plan_id, OrderedDict())
+            for previous in orders.values():
+                if previous.status in ("proposed", "shipper_confirmed"):
+                    self._transition(
+                        previous,
+                        "expired",
+                        now,
+                        "system",
+                        "새 대안 적용으로 대체됨",
+                    )
+                    previous.expired_reason = "superseded"
+            order = build_order(
+                plan_id=plan_id,
+                replan_id=pending.replan_id,
+                base_version=session.version,
+                target_version=session.version + 1,
+                rollback_version=self._committed[plan_id].version,
+                scenario_before=session.scenario,
+                plan_before=session.plan,
+                routes_before=session.routes,
+                scenario_after=scenario,
+                alternative=alternative,
+                event=event,
+                now=now,
+            )
             entry = HistoryEntry(
                 seq=len(session.history) + 1,
                 replan_id=pending.replan_id,
                 event=event,
                 alternative_id=alternative.id,
-                applied_at=_now(),
+                applied_at=now,
                 cost_before=session.plan.total_shared_cost,
                 cost_after=alternative.total_cost,
                 cost_delta=alternative.cost_delta,
                 solve_ms=pending.result.solve_ms,
                 explanation=pending.result.explanation,
+                order_id=order.order_id,
             )
             updated = session.model_copy(
                 update={
                     "version": session.version + 1,
-                    "updated_at": entry.applied_at,
+                    "updated_at": now,
                     "scenario": scenario,
                     "plan": alternative.plan,
                     "routes": alternative.routes,
                     "air_locked_lot_ids": sorted(locked),
                     "history": [*session.history, entry],
+                    "status": "pending_confirmation",
+                    "active_order_id": order.order_id,
                 }
             )
             self._sessions[plan_id] = updated
+            orders[order.order_id] = order
+            while len(orders) > MAX_ORDERS:
+                orders.popitem(last=False)
             return updated
+
+    def orders(self, plan_id: str) -> list[ExecutionOrder]:
+        with self._lock:
+            self._expire_due(plan_id)
+            return list((self._orders.get(plan_id) or {}).values())
+
+    def order(self, plan_id: str, order_id: str) -> ExecutionOrder:
+        with self._lock:
+            self._expire_due(plan_id)
+            return self._orders[plan_id][order_id]
+
+    def _transition(
+        self,
+        order: ExecutionOrder,
+        status: OrderStatus,
+        now: datetime,
+        actor: str,
+        action: str,
+        shipper_id: str | None = None,
+        note: str | None = None,
+    ) -> None:
+        order.status = status
+        order.updated_at = now
+        order.log.append(
+            OrderLogEntry(
+                at=now,
+                actor=actor,
+                action=action,
+                status_after=status,
+                shipper_id=shipper_id,
+                note=note,
+            )
+        )
+
+    def _expire_due(self, plan_id: str) -> None:
+        now = self.clock()
+        for order in (self._orders.get(plan_id) or {}).values():
+            if order.status == "proposed" and now > order.deadlines.shipper:
+                deadline = order.deadlines.shipper
+            elif order.status == "shipper_confirmed" and now > order.deadlines.forwarder:
+                deadline = order.deadlines.forwarder
+            else:
+                continue
+            self._transition(order, "expired", now, "system", "확인 기한 초과로 만료")
+            order.expired_reason = f"deadline {deadline.isoformat()}"
+            self._rollback(plan_id, order, now)
+
+    def _rollback(self, plan_id: str, order: ExecutionOrder, now: datetime) -> None:
+        session = self._sessions.get(plan_id)
+        if session is None or session.version != order.target_version:
+            return
+        snapshot = self._committed[plan_id]
+        version = session.version + 1
+        entry = HistoryEntry(
+            seq=len(session.history) + 1,
+            replan_id=order.replan_id,
+            event=order.event,
+            alternative_id=order.alternative_id,
+            applied_at=now,
+            cost_before=session.plan.total_shared_cost,
+            cost_after=snapshot.plan.total_shared_cost,
+            cost_delta=snapshot.plan.total_shared_cost - session.plan.total_shared_cost,
+            solve_ms=0,
+            kind="rollback",
+            order_id=order.order_id,
+        )
+        self._sessions[plan_id] = session.model_copy(
+            update={
+                "version": version,
+                "updated_at": now,
+                "scenario": snapshot.scenario,
+                "plan": snapshot.plan,
+                "routes": snapshot.routes,
+                "air_locked_lot_ids": snapshot.air_locked_lot_ids,
+                "history": [*session.history, entry],
+                "status": "committed",
+                "committed_version": version,
+                "active_order_id": None,
+            }
+        )
+        self._committed[plan_id] = snapshot.model_copy(update={"version": version})
+        order.rolled_back_to_version = snapshot.version
+
+    def _commit(self, plan_id: str, order: ExecutionOrder, now: datetime) -> None:
+        session = self._sessions.get(plan_id)
+        if session is None or session.version != order.target_version:
+            return
+        updated = session.model_copy(
+            update={
+                "updated_at": now,
+                "status": "committed",
+                "committed_version": session.version,
+            }
+        )
+        self._sessions[plan_id] = updated
+        self._committed[plan_id] = _snapshot(updated)
+
+    def confirm(self, plan_id: str, order_id: str, body: ConfirmRequest) -> ExecutionOrder:
+        with self._lock:
+            self._expire_due(plan_id)
+            order = self._orders[plan_id][order_id]
+            now = self.clock()
+            if body.actor == "shipper":
+                return self._confirm_shipper(plan_id, order, body, now)
+            return self._confirm_forwarder(plan_id, order, body, now)
+
+    def _confirm_shipper(
+        self, plan_id: str, order: ExecutionOrder, body: ConfirmRequest, now: datetime
+    ) -> ExecutionOrder:
+        if not body.shipper_id:
+            raise OrderInputError("화주 확인에는 shipper_id가 필요합니다")
+        item = next(
+            (c for c in order.shipper_confirmations if c.shipper_id == body.shipper_id), None
+        )
+        if item is None:
+            raise OrderInputError(f"이 실행 지시에서 확인할 화주가 아닙니다: {body.shipper_id}")
+        decision = "accepted" if body.accept else "rejected"
+        if item.status != "pending":
+            if item.status == decision:
+                return order
+            raise SessionConflict(f"이미 {item.status} 처리된 화주 확인입니다")
+        if order.status != "proposed":
+            raise SessionConflict(f"화주 확인을 받을 수 없는 상태입니다: {order.status}")
+        item.status = decision
+        item.note = body.note
+        item.decided_at = now
+        if not body.accept:
+            self._transition(
+                order,
+                "rejected",
+                now,
+                "shipper",
+                "화주 거절 → 이전 확정 계획으로 복귀",
+                body.shipper_id,
+                body.note,
+            )
+            self._rollback(plan_id, order, now)
+            return order
+        if all(c.status == "accepted" for c in order.shipper_confirmations):
+            self._transition(
+                order,
+                "shipper_confirmed",
+                now,
+                "shipper",
+                "모든 화주 확인 완료",
+                body.shipper_id,
+                body.note,
+            )
+        else:
+            order.updated_at = now
+            order.log.append(
+                OrderLogEntry(
+                    at=now,
+                    actor="shipper",
+                    action="화주 수락",
+                    status_after=order.status,
+                    shipper_id=body.shipper_id,
+                    note=body.note,
+                )
+            )
+        return order
+
+    def _confirm_forwarder(
+        self, plan_id: str, order: ExecutionOrder, body: ConfirmRequest, now: datetime
+    ) -> ExecutionOrder:
+        if order.status in ("forwarder_confirmed", "executed") and body.accept:
+            return order
+        if order.status in TERMINAL_STATUSES:
+            raise SessionConflict(f"이미 종료된 실행 지시입니다: {order.status}")
+        if order.status != "shipper_confirmed":
+            raise SessionConflict("화주 확인이 끝나지 않아 포워더가 확정할 수 없습니다")
+        if not body.accept:
+            self._transition(
+                order,
+                "rejected",
+                now,
+                "forwarder",
+                "포워더 거절 → 이전 확정 계획으로 복귀",
+                note=body.note,
+            )
+            self._rollback(plan_id, order, now)
+            return order
+        self._transition(
+            order,
+            "forwarder_confirmed",
+            now,
+            "forwarder",
+            "포워더 확정 → 계획 확정, 자동 조치 실행, 제3자 요청 발송",
+            note=body.note,
+        )
+        for action in order.automatic:
+            action.done = True
+        self._commit(plan_id, order, now)
+        self._finish_if_done(plan_id, order, now)
+        return order
+
+    def _finish_if_done(self, plan_id: str, order: ExecutionOrder, now: datetime) -> None:
+        if order.status != "forwarder_confirmed":
+            return
+        if all(r.status == "accepted" for r in order.requests):
+            self._transition(order, "executed", now, "system", "모든 요청 회신 완료 → 실행 완료")
+            session = self._sessions.get(plan_id)
+            if session and session.active_order_id == order.order_id:
+                self._sessions[plan_id] = session.model_copy(update={"active_order_id": None})
+
+    def answer_request(
+        self, plan_id: str, order_id: str, request_id: str, body: RequestResultBody
+    ) -> ExecutionOrder:
+        with self._lock:
+            order = self._orders[plan_id][order_id]
+            request = next((r for r in order.requests if r.request_id == request_id), None)
+            if request is None:
+                raise KeyError(request_id)
+            if order.status != "forwarder_confirmed":
+                if order.status == "executed" and request.status == "accepted" and body.accepted:
+                    return order
+                raise SessionConflict("포워더 확정 뒤에만 요청 회신을 기록할 수 있습니다")
+            now = self.clock()
+            request.status = "accepted" if body.accepted else "declined"
+            request.note = body.note
+            request.answered_at = now
+            order.updated_at = now
+            order.log.append(
+                OrderLogEntry(
+                    at=now,
+                    actor="forwarder",
+                    action=(
+                        f"{request.request_id} {request.counterparty} 수락"
+                        if body.accepted
+                        else f"{request.request_id} {request.counterparty} 거절 → 재계획 필요"
+                    ),
+                    status_after=order.status,
+                    note=body.note,
+                )
+            )
+            self._finish_if_done(plan_id, order, now)
+            return order
+
+    def record_inspections(self, plan_id: str, inspections: list[ArrivalInspection]) -> None:
+        with self._lock:
+            session = self._sessions[plan_id]
+            self._sessions[plan_id] = session.model_copy(
+                update={"arrival_inspections": inspections, "updated_at": self.clock()}
+            )
 
 
 store = SessionStore()

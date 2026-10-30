@@ -17,6 +17,7 @@ class PickupStop(BaseModel):
     pallets: int = Field(gt=0)
     ready_at: datetime
     lot_ids: list[str] = Field(default_factory=list)
+    cargo_group: str | None = None
 
 
 class PickupTruck(BaseModel):
@@ -35,6 +36,8 @@ class PickupRequest(BaseModel):
     road_factor: float = Field(default=1.3, gt=0)
     cost_per_km: float = Field(default=2500.0, ge=0)
     truck_fixed_cost: float = Field(default=0.0, ge=0)
+    max_trips_per_truck: int = Field(default=2, ge=1)
+    incompatible_groups: list[tuple[str, str]] = Field(default_factory=list)
 
 
 class StopVisit(BaseModel):
@@ -48,10 +51,13 @@ class StopVisit(BaseModel):
     ready_at: datetime
     eta: datetime
     latest_arrival: datetime
+    cargo_group: str | None = None
 
 
 class TruckRoute(BaseModel):
     truck_id: str
+    trip: int = 1
+    cargo_group: str | None = None
     capacity_pallets: int
     load_pallets: int
     stops: list[StopVisit]

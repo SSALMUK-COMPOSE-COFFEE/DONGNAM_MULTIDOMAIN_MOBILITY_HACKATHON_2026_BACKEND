@@ -32,6 +32,7 @@ class VoyagePickup(BaseModel):
     lot_ids: list[str]
     pickup: PickupPlan
     dropped_lot_ids: list[str] = Field(default_factory=list)
+    dropped_stops: dict[str, str] = Field(default_factory=dict)
 
 
 class PlanWithRoutes(BaseModel):
@@ -81,14 +82,16 @@ def build_routes(
         request = _pickup_request(effective, lot_ids, voyage_id)
         pickup = solve_pickup(request, time_limit_s=time_limit_s)
         dropped = set(pickup.dropped_stop_ids)
+        dropped_stops = {
+            lid: stop.id for stop in request.stops if stop.id in dropped for lid in stop.lot_ids
+        }
         pickups.append(
             VoyagePickup(
                 voyage_id=voyage_id,
                 lot_ids=lot_ids,
                 pickup=pickup,
-                dropped_lot_ids=[
-                    lid for stop in request.stops if stop.id in dropped for lid in stop.lot_ids
-                ],
+                dropped_lot_ids=list(dropped_stops),
+                dropped_stops=dropped_stops,
             )
         )
     return pickups
@@ -147,6 +150,7 @@ def allocate_route_costs(
                         pallets=lot.pallets,
                         estimate=round(estimate),
                         route=share,
+                        trip=route.trip,
                     )
                 )
     return result
@@ -172,13 +176,9 @@ def _location(plan: Plan, lot_id: str) -> str:
     return "UNASSIGNED"
 
 
-def _dropped(scenario: Scenario, routes: list[VoyagePickup]) -> dict[str, tuple[str, str]]:
-    lots = {lot.id: lot for lot in scenario.lots}
-    packhouse_of = {s.id: s.packhouse_id for s in scenario.shippers}
+def _dropped(routes: list[VoyagePickup]) -> dict[str, tuple[str, str]]:
     return {
-        lid: (vp.voyage_id, f"stop-{packhouse_of[lots[lid].shipper_id]}")
-        for vp in routes
-        for lid in vp.dropped_lot_ids
+        lid: (vp.voyage_id, stop_id) for vp in routes for lid, stop_id in vp.dropped_stops.items()
     }
 
 
@@ -202,7 +202,7 @@ def solve_with_routes(
             scenario, fixed=fixed, forbidden=forbidden, forbidden_reasons=reasons, **options
         )
         routes = build_routes(scenario, plan)
-        newly = _dropped(scenario, routes)
+        newly = _dropped(routes)
         if not newly or round_no == max_rounds:
             break
         for lid, (voyage_id, stop_id) in newly.items():
@@ -211,7 +211,7 @@ def solve_with_routes(
             for cid in containers_of[voyage_id]:
                 forbidden.append((lid, cid))
                 reasons[(lid, cid)] = CUTOFF_REASON
-    still = _dropped(scenario, routes)
+    still = _dropped(routes)
     lots = {lot.id: lot for lot in scenario.lots}
     reassigned = [
         CollectionReassignment(

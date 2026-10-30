@@ -227,6 +227,7 @@ class LotCollection(BaseModel):
     pallets: int
     estimate: int
     route: int
+    trip: int = 1
 
 
 class CollectionReassignment(BaseModel):

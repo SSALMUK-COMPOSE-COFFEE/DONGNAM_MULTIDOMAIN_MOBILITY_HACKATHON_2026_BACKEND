@@ -10,6 +10,7 @@ from freshswitch_backend.analysis.common import (
     routes,
     shipper_savings,
     solve,
+    solve_routed,
 )
 from freshswitch_backend.analysis.models import (
     AlternativeSummary,
@@ -273,6 +274,7 @@ def sensitivity(scenario: Scenario, plan_id: str | None = None) -> SensitivityRe
     params, tornado = _sweep(scenario, base, counter)
     thresholds = _plan_thresholds(scenario, base, counter)
     replan_part = _replan_sensitivity(scenario, counter)
+    routed = solve_routed(scenario)
     return SensitivityResult(
         scenario_id=scenario.id,
         plan_id=plan_id,
@@ -284,6 +286,8 @@ def sensitivity(scenario: Scenario, plan_id: str | None = None) -> SensitivityRe
         tornado=tornado,
         thresholds=thresholds,
         replan=replan_part,
+        route_base_total_savings=routed.total_savings,
+        route_base_total_fee=routed.total_fee,
         solve_count=counter.count,
         solve_ms=round((time.perf_counter() - started) * 1000),
     )

@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from itertools import pairwise
 
 import pytest
 
@@ -9,6 +10,7 @@ from freshswitch_backend.routing import (
     PickupStop,
     PickupTruck,
     build_pickup_request,
+    cargo_groups,
     solve_pickup,
 )
 
@@ -136,3 +138,78 @@ def test_oversized_stop_is_dropped() -> None:
     plan = solve_pickup(req)
     assert plan.routes == []
     assert plan.dropped_stop_ids == ["big"]
+
+
+def test_cargo_groups_follow_container_rule() -> None:
+    scenario = get_scenario("default")
+    assert scenario is not None
+    group_of, conflicts = cargo_groups(scenario.products)
+    assert group_of["strawberry"] != group_of["grape_so2"]
+    assert conflicts == [(group_of["strawberry"], group_of["grape_so2"])]
+
+
+def test_default_voyage_keeps_so2_grapes_off_strawberry_trucks() -> None:
+    scenario = get_scenario("default")
+    assert scenario is not None
+    lots = [lot.id for lot in scenario.lots if lot.id != "lot-miryang-sb-2"]
+    req = build_pickup_request(scenario, lots, "V-2611A")
+    plan = solve_pickup(req)
+    assert plan.dropped_stop_ids == []
+    for route in plan.routes:
+        assert len({v.cargo_group for v in route.stops}) == 1
+        assert route.cargo_group == route.stops[0].cargo_group
+    by_truck: dict[str, list] = {}
+    for route in plan.routes:
+        by_truck.setdefault(route.truck_id, []).append(route)
+    for trips in by_truck.values():
+        assert [r.trip for r in trips] == list(range(1, len(trips) + 1))
+        for earlier, later in pairwise(trips):
+            assert earlier.port_eta + timedelta(minutes=req.service_minutes) <= later.stops[0].eta
+    assert sum(len(t) for t in by_truck.values()) == 4
+
+
+def _mixed_request(trips: int) -> PickupRequest:
+    ready = datetime(2026, 11, 16, 8, 0, tzinfo=KST)
+    stops = [
+        _stop("a", 35.18, 128.11, 4, ready).model_copy(update={"cargo_group": "plain"}),
+        _stop("b", 35.50, 128.75, 4, ready).model_copy(update={"cargo_group": "so2"}),
+    ]
+    return PickupRequest(
+        depot=PORT,
+        stops=stops,
+        trucks=[PickupTruck(id="T1", capacity_pallets=16)],
+        deadline=DEADLINE,
+        max_trips_per_truck=trips,
+        incompatible_groups=[("plain", "so2")],
+    )
+
+
+def test_incompatible_stops_need_separate_trips() -> None:
+    plan = solve_pickup(_mixed_request(2))
+    assert plan.dropped_stop_ids == []
+    assert [(r.truck_id, r.trip, len(r.stops)) for r in plan.routes] == [
+        ("T1", 1, 1),
+        ("T1", 2, 1),
+    ]
+
+
+def test_single_trip_truck_drops_incompatible_stop() -> None:
+    plan = solve_pickup(_mixed_request(1))
+    assert plan.status == "PARTIAL"
+    assert len(plan.dropped_stop_ids) == 1
+    assert len(plan.routes) == 1 and len(plan.routes[0].stops) == 1
+
+
+def test_packhouse_with_two_groups_is_split() -> None:
+    scenario = get_scenario("default")
+    assert scenario is not None
+    lots = [
+        lot.model_copy(update={"product_id": "grape_so2"}) if lot.id == "lot-miryang-sb-2" else lot
+        for lot in scenario.lots
+    ]
+    mixed = scenario.model_copy(update={"lots": lots})
+    req = build_pickup_request(mixed, ["lot-miryang-sb-1", "lot-miryang-sb-2"], "V-2611A")
+    assert sorted(s.id for s in req.stops) == [
+        "stop-ph-miryang-grape_so2",
+        "stop-ph-miryang-strawberry",
+    ]
