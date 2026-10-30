@@ -5,6 +5,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from freshswitch_backend.config import get_settings
+from freshswitch_backend.forecast.port_congestion import PortCongestion, build_indicator
 from freshswitch_backend.integrations import (
     MissingServiceKey,
     MofVesselClient,
@@ -96,15 +97,38 @@ def ulsan_client_factory() -> UlsanClientFactory:
     return _ulsan_factory
 
 
+async def load_ulsan_feed(
+    factory: UlsanClientFactory, call_sign: str | None = None
+) -> PositionFeed:
+    return await PositionProvider(factory, offline_mode=get_settings().offline_mode).get(call_sign)
+
+
+async def load_ulsan_congestion(factory: UlsanClientFactory) -> PortCongestion:
+    return build_indicator(await load_ulsan_feed(factory))
+
+
 @router.get("/ulsan")
 async def ulsan_positions(
     factory: Annotated[UlsanClientFactory, Depends(ulsan_client_factory)],
     call_sign: str | None = None,
 ) -> PositionFeed:
-    provider = PositionProvider(factory, offline_mode=get_settings().offline_mode)
     try:
-        return await provider.get(call_sign)
+        return await load_ulsan_feed(factory, call_sign)
     except PositionsUnavailable as exc:
         raise HTTPException(
             status_code=503, detail=f"울산항 선박위치 정보를 가져오지 못했습니다: {exc}"
         ) from exc
+
+
+@router.get("/ulsan/congestion")
+async def ulsan_congestion(
+    factory: Annotated[UlsanClientFactory, Depends(ulsan_client_factory)],
+    include_vessels: bool = True,
+) -> PortCongestion:
+    try:
+        indicator = await load_ulsan_congestion(factory)
+    except PositionsUnavailable as exc:
+        raise HTTPException(
+            status_code=503, detail=f"울산항 혼잡도를 계산하지 못했습니다: {exc}"
+        ) from exc
+    return indicator if include_vessels else indicator.model_copy(update={"vessels": []})

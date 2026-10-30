@@ -1,20 +1,29 @@
 from datetime import date
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
+from freshswitch_backend.api.vessels import (
+    UlsanClientFactory,
+    load_ulsan_congestion,
+    ulsan_client_factory,
+)
 from freshswitch_backend.execution.cancellation import annotate_cancellations
+from freshswitch_backend.forecast.port_congestion import PortCongestionSummary
 from freshswitch_backend.forecast.predictor import default_predictor
 from freshswitch_backend.forecast.service import (
     AirSwitchProposal,
+    CongestionUse,
     ForecastOptions,
     VoyageForecast,
     air_switch_proposals,
+    congestion_use,
     delay_event,
     forecast_voyages,
 )
+from freshswitch_backend.integrations.ulsan_position import PositionsUnavailable
 from freshswitch_backend.planning.store import store
 from freshswitch_backend.replan import DelayEvent, ReplanResult, locations, replan
 from freshswitch_backend.replan.explanation import explain_replan, llm_enabled
@@ -39,6 +48,7 @@ class DelayForecastResponse(BaseModel):
     plan_id: str
     options: ForecastOptions
     history: HistoryInfo
+    port_congestion: CongestionUse
     voyages: list[VoyageForecast]
     at_risk_lot_ids: list[str]
     triggered: bool
@@ -74,6 +84,7 @@ def _summary(
 @router.post("/{plan_id}/delay-forecast")
 async def delay_forecast(
     plan_id: str,
+    factory: Annotated[UlsanClientFactory, Depends(ulsan_client_factory)],
     body: ForecastOptions | None = None,
     llm: Annotated[bool | None, Query()] = None,
 ) -> DelayForecastResponse:
@@ -81,7 +92,14 @@ async def delay_forecast(
     if session is None:
         raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")
     options = (body or ForecastOptions()).resolved()
-    voyages = forecast_voyages(default_predictor(), session.scenario, session.plan, options)
+    port: PortCongestionSummary | None = None
+    unavailable: str | None = None
+    if options.congestion == "auto":
+        try:
+            port = (await load_ulsan_congestion(factory)).summary()
+        except PositionsUnavailable as exc:
+            unavailable = str(exc)
+    voyages = forecast_voyages(default_predictor(), session.scenario, session.plan, options, port)
     event = delay_event(voyages)
     replan_response = None
     where: dict[str, str] = {}
@@ -117,6 +135,7 @@ async def delay_forecast(
         plan_id=plan_id,
         options=options,
         history=_history(),
+        port_congestion=congestion_use(options, voyages, port, unavailable),
         voyages=voyages,
         at_risk_lot_ids=[p.lot_id for p in proposals],
         triggered=event is not None,

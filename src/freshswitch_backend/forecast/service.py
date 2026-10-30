@@ -5,7 +5,9 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from freshswitch_backend.domain.models import KST, Lot, Plan, Scenario, Voyage
+from freshswitch_backend.forecast.port_congestion import PortCongestionSummary
 from freshswitch_backend.forecast.predictor import (
+    CONGESTION_FACTOR,
     Congestion,
     DelayForecast,
     DelayPredictor,
@@ -18,6 +20,15 @@ from freshswitch_backend.replan.models import DelayEvent
 
 Quantile = Literal["p50", "p90"]
 Preset = Literal["typhoon"]
+CongestionOption = Literal["auto", "normal", "elevated", "high"]
+CongestionMode = Literal["auto", "manual", "preset"]
+CongestionScope = Literal["manual", "ulsan_direct", "ulsan_proxy", "unavailable"]
+ULSAN_PORT_CODES = ("KRUSN", "KRONS")
+PROXY_NOTE = (
+    "부산항은 이 프로젝트에서 쓸 수 있는 공개 실시간 선박위치 API가 없어, "
+    "울산항 묘박 대기 비율을 동남권 항만 혼잡의 대리 지표로 부산 항차에도 적용한다. "
+    "울산 대기선은 유조선·케미컬선 비중이 커서 부산신항 컨테이너 선석 혼잡과 다를 수 있다"
+)
 
 GIMHAE_LAT = 35.1795
 GIMHAE_LON = 128.9382
@@ -27,7 +38,7 @@ GIMHAE_MAX_PALLETS = 6
 
 class ForecastOptions(BaseModel):
     weather: Weather = "normal"
-    congestion: Congestion = "normal"
+    congestion: CongestionOption = "auto"
     quantile: Quantile = "p90"
     min_sell_days: int = Field(default=0, ge=0, le=14)
     preset: Preset | None = None
@@ -38,6 +49,24 @@ class ForecastOptions(BaseModel):
                 update={"weather": "typhoon", "congestion": "high", "quantile": "p90"}
             )
         return self
+
+
+class CongestionEffect(BaseModel):
+    voyage_id: str
+    scope: CongestionScope
+    level: Congestion
+    factor: float
+    p50_added_hours: float
+    p90_added_hours: float
+
+
+class CongestionUse(BaseModel):
+    mode: CongestionMode
+    level: Congestion
+    indicator: PortCongestionSummary | None = None
+    unavailable_reason: str | None = None
+    effects: list[CongestionEffect]
+    note: str
 
 
 class LotRisk(BaseModel):
@@ -65,6 +94,7 @@ class VoyageForecast(BaseModel):
     quantile: Quantile
     delay_hours: float
     predicted_etd: datetime
+    congestion_scope: CongestionScope
     forecast: DelayForecast
     lots: list[LotRisk]
 
@@ -157,11 +187,71 @@ def _lot_risks(
     return risks
 
 
+def calls_ulsan(voyage: Voyage) -> bool:
+    return (
+        voyage.origin in ULSAN_PORT_CODES or "울산" in voyage.terminal or "온산" in voyage.terminal
+    )
+
+
+def voyage_congestion(
+    voyage: Voyage, options: ForecastOptions, port: PortCongestionSummary | None
+) -> tuple[Congestion, CongestionScope]:
+    if options.congestion != "auto":
+        return options.congestion, "manual"
+    if port is None:
+        return "normal", "unavailable"
+    return port.level, "ulsan_direct" if calls_ulsan(voyage) else "ulsan_proxy"
+
+
+def congestion_use(
+    options: ForecastOptions,
+    voyages: list["VoyageForecast"],
+    port: PortCongestionSummary | None,
+    unavailable_reason: str | None = None,
+) -> CongestionUse:
+    options = options.resolved()
+    mode: CongestionMode = (
+        "preset" if options.preset else "auto" if options.congestion == "auto" else "manual"
+    )
+    effects = [
+        CongestionEffect(
+            voyage_id=v.voyage_id,
+            scope=v.congestion_scope,
+            level=v.forecast.congestion,
+            factor=v.forecast.congestion_factor,
+            p50_added_hours=v.forecast.congestion_added_p50_hours,
+            p90_added_hours=v.forecast.congestion_added_p90_hours,
+        )
+        for v in voyages
+    ]
+    if mode != "auto":
+        level: Congestion = options.congestion if options.congestion != "auto" else "normal"
+        note = (
+            f"혼잡도를 {'시연 프리셋' if mode == 'preset' else '입력값'}으로 고정"
+            f"(배율 {CONGESTION_FACTOR[level]:g}, 가정). 울산항 선박위치는 조회하지 않음"
+        )
+        return CongestionUse(mode=mode, level=level, effects=effects, note=note)
+    if port is None:
+        return CongestionUse(
+            mode=mode,
+            level="normal",
+            unavailable_reason=unavailable_reason,
+            effects=effects,
+            note="울산항 선박위치(실시간·스냅샷)를 못 읽어 평시(normal)로 계산",
+        )
+    scopes = {e.scope for e in effects}
+    note = port.basis
+    if "ulsan_proxy" in scopes:
+        note += ". " + PROXY_NOTE
+    return CongestionUse(mode=mode, level=port.level, indicator=port, effects=effects, note=note)
+
+
 def forecast_voyages(
     predictor: DelayPredictor,
     scenario: Scenario,
     plan: Plan,
     options: ForecastOptions,
+    port: PortCongestionSummary | None = None,
 ) -> list[VoyageForecast]:
     options = options.resolved()
     model = CostModel(scenario)
@@ -170,7 +260,8 @@ def forecast_voyages(
     voyages = [v for v in scenario.voyages if v.id in used] or scenario.voyages
     result = []
     for voyage in sorted(voyages, key=lambda v: v.etd):
-        forecast = predictor.predict(_query(voyage), options.weather, options.congestion)
+        congestion, scope = voyage_congestion(voyage, options, port)
+        forecast = predictor.predict(_query(voyage), options.weather, congestion)
         raw = forecast.p90_hours if options.quantile == "p90" else forecast.p50_hours
         delay = _round_hours(raw)
         predicted = voyage.model_copy(update={"etd": voyage.etd + timedelta(hours=delay)})
@@ -183,6 +274,7 @@ def forecast_voyages(
                 quantile=options.quantile,
                 delay_hours=delay,
                 predicted_etd=predicted.etd,
+                congestion_scope=scope,
                 forecast=forecast,
                 lots=_lot_risks(model, voyage, predicted, plan, lots, options.min_sell_days),
             )

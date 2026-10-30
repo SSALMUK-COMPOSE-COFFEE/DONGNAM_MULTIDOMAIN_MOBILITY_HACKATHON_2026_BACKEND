@@ -16,7 +16,7 @@ from freshswitch_backend.forecast.history import (
 )
 
 Weather = Literal["normal", "strong_wind", "typhoon"]
-Congestion = Literal["normal", "high"]
+Congestion = Literal["normal", "elevated", "high"]
 Confidence = Literal["high", "medium", "low"]
 Level = Literal[
     "prior", "global", "container", "operator", "terminal", "terminal_weekday", "vessel"
@@ -31,7 +31,7 @@ WEATHER_HOURS: dict[Weather, tuple[float, float]] = {
     "strong_wind": (6.0, 12.0),
     "typhoon": (36.0, 72.0),
 }
-CONGESTION_FACTOR: dict[Congestion, float] = {"normal": 1.0, "high": 1.5}
+CONGESTION_FACTOR: dict[Congestion, float] = {"normal": 1.0, "elevated": 1.25, "high": 1.5}
 WEEKDAYS = "월화수목금토일"
 LEVEL_LABELS: dict[Level, str] = {
     "prior": "기본 사전값",
@@ -86,6 +86,9 @@ class DelayForecast(BaseModel):
     assumptions: list[Assumption]
     weather: Weather
     congestion: Congestion
+    congestion_factor: float
+    congestion_added_p50_hours: float
+    congestion_added_p90_hours: float
     method: str = METHOD
     summary: str
 
@@ -111,7 +114,7 @@ def _assumptions(weather: Weather, congestion: Congestion) -> list[Assumption]:
             name=f"혼잡 배율 ({congestion})",
             value=CONGESTION_FACTOR[congestion],
             unit="배 (양의 지연에만)",
-            source="가정: 선석 혼잡 시 대기가 1.5배로 늘어난다고 봄",
+            source="가정: 선석 혼잡 시 대기가 늘어난다고 봄(elevated 1.25배, high 1.5배)",
         ),
     ]
     if weather != "normal":
@@ -233,11 +236,13 @@ class DelayPredictor:
         factor = CONGESTION_FACTOR[congestion]
         add50, add90 = WEATHER_HOURS[weather]
 
-        def adjust(value: float, add: float) -> float:
-            return (value * factor if value > 0 else value) + add
+        def adjust(value: float, add: float, scale: float = factor) -> float:
+            return (value * scale if value > 0 else value) + add
 
         p50 = adjust(base50, add50)
         p90 = max(p50, adjust(base90, add90))
+        plain50 = adjust(base50, add50, 1.0)
+        plain90 = max(plain50, adjust(base90, add90, 1.0))
         top = basis[-1]
         where = f"{top.label}" + (f"({top.key})" if top.key else "")
         summary = (
@@ -256,6 +261,9 @@ class DelayPredictor:
             assumptions=_assumptions(weather, congestion),
             weather=weather,
             congestion=congestion,
+            congestion_factor=factor,
+            congestion_added_p50_hours=round(p50 - plain50, 1),
+            congestion_added_p90_hours=round(p90 - plain90, 1),
             summary=summary,
         )
 
