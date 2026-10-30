@@ -20,6 +20,7 @@ class ParamSpec:
     high_factor: float
     source: str
     affects_plan: bool = True
+    extra_fields: tuple[str, ...] = ()
 
 
 SPECS: tuple[ParamSpec, ...] = (
@@ -82,7 +83,9 @@ SPECS: tuple[ParamSpec, ...] = (
         low_factor=(AIR_PALLET_FREIGHT_2024_05 / PALLET_KG) / 2151,
         high_factor=(AIR_PALLET_FREIGHT_2026_04_AFTER / PALLET_KG) / 2151,
         source="하한: 원예원 2024.5 항공 t당 약 200만 원(2,000원/kg). "
-        "상한: 2026.4.16 할증 후 파렛트 155.26만 원(한국농어민신문, 3,741원/kg)",
+        "상한: 2026.4.16 할증 후 파렛트 155.26만 원(한국농어민신문, 3,741원/kg). "
+        "기본 운임과 유류할증료를 같은 배율로 바꾼다",
+        extra_fields=("air_fuel_surcharge_per_kg_krw",),
     ),
     ParamSpec(
         key="reefer_truck_cost_per_km_krw",
@@ -123,7 +126,7 @@ SPEC_BY_KEY = {spec.key: spec for spec in SPECS}
 def _quantities(scenario: Scenario, spec: ParamSpec) -> list[Quantity]:
     params = scenario.cost_params
     if not spec.per_product:
-        return [getattr(params, spec.field)]
+        return [getattr(params, name) for name in (spec.field, *spec.extra_fields)]
     groups = [*params.product_costs.values(), params.default_product_cost]
     return [getattr(group, spec.field) for group in groups]
 
@@ -131,7 +134,7 @@ def _quantities(scenario: Scenario, spec: ParamSpec) -> list[Quantity]:
 def anchor_value(scenario: Scenario, spec: ParamSpec) -> float:
     params = scenario.cost_params
     if not spec.per_product:
-        return getattr(params, spec.field).value
+        return sum(getattr(params, name).value for name in (spec.field, *spec.extra_fields))
     product_ids = [p.id for p in scenario.products]
     anchor = ANCHOR_PRODUCT if ANCHOR_PRODUCT in product_ids else (product_ids or [""])[0]
     return getattr(params.for_product(anchor), spec.field).value

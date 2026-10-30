@@ -299,3 +299,93 @@ class BusinessMatrix(BaseModel):
     highlights: list[MatrixHighlight]
     break_even_rows: int
     solve_ms: int
+
+
+class ShockLot(BaseModel):
+    lot_id: str
+    shipper_id: str
+    product_id: str
+    pallets: int
+    mode: Literal["sea", "air", "unassigned"]
+    location: str
+    voyage_id: str | None
+
+
+class ShockContainer(BaseModel):
+    container_id: str
+    voyage_id: str
+    used: bool
+    pallets: int
+    capacity_pallets: int
+    utilization: float
+    lot_ids: list[str]
+
+
+class ShockShipper(BaseModel):
+    shipper_id: str
+    pallets: int
+    sea_pallets: int
+    air_pallets: int
+    baseline_cost: int
+    plan_cost: int
+    savings: int
+    fee: int
+    shipper_gain: int
+    savings_delta: int
+
+
+class ModeSwitch(BaseModel):
+    lot_id: str
+    shipper_id: str
+    pallets: int
+    base: str
+    case: str
+    direction: Literal["air_to_sea", "sea_to_air", "sea_to_sea", "to_unassigned", "from_unassigned"]
+
+
+class FuelShockCase(BaseModel):
+    surcharge_per_kg: float
+    air_rate_per_kg: float
+    air_freight_per_pallet: int
+    is_baseline: bool
+    status: str
+    lots: list[ShockLot]
+    containers: list[ShockContainer]
+    shippers: list[ShockShipper]
+    containers_used: int
+    sea_pallets: int
+    air_pallets: int
+    unassigned_pallets: int
+    total_baseline_cost: int
+    total_shared_cost: int
+    total_savings: int
+    total_fee: int
+    plan_changed: bool
+    switches: list[ModeSwitch]
+    savings_delta: int
+    fee_delta: int
+    shared_cost_delta: int
+    summary: str
+
+
+class SurchargeThreshold(BaseModel):
+    direction: Literal["down", "up"]
+    searched_from: float
+    searched_to: float
+    surcharge_per_kg: float | None
+    iterations: int
+    switches: list[ModeSwitch]
+
+
+class FuelShockResult(BaseModel):
+    scenario_id: str
+    plan_id: str | None
+    base_freight_per_kg: float
+    baseline_surcharge_per_kg: float
+    pallet_kg: float
+    sources: dict[str, str]
+    cases: list[FuelShockCase]
+    thresholds: list[SurchargeThreshold]
+    collection_basis: Literal["route"] = "route"
+    solve_count: int
+    solve_ms: int

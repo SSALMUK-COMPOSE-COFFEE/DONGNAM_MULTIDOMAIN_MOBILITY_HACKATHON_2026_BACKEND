@@ -1,4 +1,4 @@
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BaseModel, Field
@@ -39,12 +39,19 @@ class Packhouse(Sourced):
     lon: float
 
 
+class GatePeakWindow(Sourced):
+    start: time
+    end: time
+    label: str = ""
+
+
 class Port(Sourced):
     id: str
     name: str
     unlocode: str
     lat: float
     lon: float
+    gate_peak_windows: list[GatePeakWindow] = Field(default_factory=list)
 
 
 class Shipper(Sourced):
@@ -121,7 +128,8 @@ def _default_product_cost() -> ProductCostParams:
 class CostParams(BaseModel):
     sea_freight_per_container_krw: Quantity = _q(4_560_000, "원/컨테이너")
     sea_ancillary_per_container_krw: Quantity = _q(4_500_000, "원/컨테이너")
-    air_freight_per_kg_krw: Quantity = _q(2151, "원/kg")
+    air_freight_per_kg_krw: Quantity = _q(1681, "원/kg")
+    air_fuel_surcharge_per_kg_krw: Quantity = _q(470, "원/kg")
     reefer_truck_cost_per_km_krw: Quantity = _q(2000, "원/km")
     reefer_truck_fixed_per_route_krw: Quantity = _q(0, "원/대")
     truck_capacity_pallets: Quantity = _q(16, "파렛트")

@@ -94,6 +94,11 @@ class CostModel:
     def sea_arrival_date(voyage: Voyage) -> date:
         return (voyage.etd + timedelta(days=voyage.transit_days)).date()
 
+    @property
+    def air_rate_per_kg(self) -> float:
+        p = self.params
+        return p.air_freight_per_kg_krw.value + p.air_fuel_surcharge_per_kg_krw.value
+
     def air_lead_days(self) -> int:
         return math.ceil(self.params.air_storage_days.value + self.params.air_transit_days.value)
 
@@ -136,7 +141,7 @@ class CostModel:
         p = self.params
         pc = p.for_product(lot.product_id)
         return LotCost(
-            freight=self.lot_kg(lot) * p.air_freight_per_kg_krw.value,
+            freight=self.lot_kg(lot) * self.air_rate_per_kg,
             collection=lot.pallets * self._trucking_per_pallet(p.air_trucking_km.value),
             storage=lot.pallets * p.air_storage_days.value * p.storage_per_pallet_day_krw.value,
             loss_risk=self.lot_value(lot) * pc.air_loss_rate.value,

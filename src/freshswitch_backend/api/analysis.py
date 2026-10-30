@@ -1,18 +1,22 @@
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 from freshswitch_backend.analysis import (
     DEFAULT_FORWARDER_SHARE,
     DEFAULT_OPS_COST_PER_VOYAGE,
+    DEFAULT_SURCHARGES,
+    DEFAULT_THRESHOLD_MAX,
     BenchmarkResult,
     BusinessMatrix,
     BusinessResult,
+    FuelShockResult,
     SensitivityResult,
     benchmark,
     business,
     business_matrix,
+    fuel_shock,
     sensitivity,
 )
 from freshswitch_backend.data.loader import get_scenario
@@ -31,6 +35,54 @@ class BenchmarkRequest(BaseModel):
     scenario_id: str = "default"
 
 
+MAX_SURCHARGE_POINTS = 41
+MAX_SURCHARGE_KRW = 20_000
+
+
+class SurchargeSweep(BaseModel):
+    start: float = Field(ge=0, le=MAX_SURCHARGE_KRW)
+    stop: float = Field(ge=0, le=MAX_SURCHARGE_KRW)
+    step: float = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _check(self) -> "SurchargeSweep":
+        if self.stop < self.start:
+            raise ValueError("sweep.stop은 sweep.start보다 작을 수 없습니다")
+        if (self.stop - self.start) / self.step + 1e-9 >= MAX_SURCHARGE_POINTS:
+            raise ValueError(f"유류할증료 값은 최대 {MAX_SURCHARGE_POINTS}개입니다")
+        return self
+
+    def values(self) -> list[float]:
+        count = int((self.stop - self.start) / self.step + 1e-9) + 1
+        return [round(self.start + i * self.step, 3) for i in range(count)]
+
+
+class FuelShockRequest(BaseModel):
+    scenario_id: str = "fuel-shock"
+    plan_id: str | None = None
+    surcharges: list[float] | None = Field(default=None, max_length=MAX_SURCHARGE_POINTS)
+    sweep: SurchargeSweep | None = None
+    baseline_surcharge: float | None = Field(default=None, ge=0, le=MAX_SURCHARGE_KRW)
+    find_thresholds: bool = True
+    threshold_max: float = Field(default=DEFAULT_THRESHOLD_MAX, gt=0, le=MAX_SURCHARGE_KRW)
+
+    @model_validator(mode="after")
+    def _check(self) -> "FuelShockRequest":
+        values = self.values()
+        if any(v < 0 or v > MAX_SURCHARGE_KRW for v in values):
+            raise ValueError(f"유류할증료는 0~{MAX_SURCHARGE_KRW:,}원/kg 범위여야 합니다")
+        if len(values) > MAX_SURCHARGE_POINTS:
+            raise ValueError(f"유류할증료 값은 최대 {MAX_SURCHARGE_POINTS}개입니다")
+        return self
+
+    def values(self) -> list[float]:
+        given = list(self.surcharges or [])
+        swept = self.sweep.values() if self.sweep is not None else []
+        if not given and not swept:
+            return list(DEFAULT_SURCHARGES)
+        return list(dict.fromkeys([*given, *swept]))
+
+
 def _scenario(scenario_id: str) -> Scenario:
     scenario = get_scenario(scenario_id)
     if scenario is None:
@@ -46,6 +98,25 @@ def run_sensitivity(body: SensitivityRequest) -> SensitivityResult:
             raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")
         return sensitivity(session.scenario, plan_id=body.plan_id)
     return sensitivity(_scenario(body.scenario_id))
+
+
+@router.post("/fuel-shock")
+def run_fuel_shock(body: FuelShockRequest) -> FuelShockResult:
+    if body.plan_id is not None:
+        session = store.get(body.plan_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")
+        scenario = session.scenario
+    else:
+        scenario = _scenario(body.scenario_id)
+    return fuel_shock(
+        scenario,
+        surcharges=body.values(),
+        baseline_surcharge=body.baseline_surcharge,
+        find_thresholds=body.find_thresholds,
+        threshold_max=body.threshold_max,
+        plan_id=body.plan_id,
+    )
 
 
 @router.post("/benchmark")

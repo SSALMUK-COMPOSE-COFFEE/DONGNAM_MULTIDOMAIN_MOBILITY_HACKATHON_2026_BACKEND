@@ -1,9 +1,15 @@
 from datetime import datetime, time
 from itertools import combinations
 
-from freshswitch_backend.domain.models import KST, Lot, Product, Scenario
+from freshswitch_backend.domain.models import KST, Lot, Port, Product, Scenario
 from freshswitch_backend.optimize.feasibility import products_compatible
-from freshswitch_backend.routing.models import Depot, PickupRequest, PickupStop, PickupTruck
+from freshswitch_backend.routing.models import (
+    Depot,
+    GateWindow,
+    PickupRequest,
+    PickupStop,
+    PickupTruck,
+)
 
 DEFAULT_READY_TIME = time(8, 0)
 
@@ -25,6 +31,13 @@ def cargo_groups(products: list[Product]) -> tuple[dict[str, str], list[tuple[st
         if any(not products_compatible(a, b) for a in members[i] for b in members[j])
     ]
     return group_of, conflicts
+
+
+def gate_windows(port: Port) -> list[GateWindow]:
+    return [
+        GateWindow(start=w.start, end=w.end, label=w.label, source=w.source)
+        for w in port.gate_peak_windows
+    ]
 
 
 def _truckloads(group: list[Lot], max_cap: int) -> list[list[Lot]]:
@@ -105,5 +118,5 @@ def build_pickup_request(
         trucks=trucks,
         deadline=voyage.cy_cutoff,
         incompatible_groups=[(a, b) for a, b in conflicts if a in used and b in used],
-        **options,
+        **{"gate_windows": gate_windows(port), **options},
     )

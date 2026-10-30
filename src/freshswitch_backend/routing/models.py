@@ -1,4 +1,5 @@
-from datetime import datetime
+from datetime import datetime, time
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -7,6 +8,21 @@ class Depot(BaseModel):
     id: str
     lat: float
     lon: float
+
+
+class GateWindow(BaseModel):
+    start: time
+    end: time
+    label: str = ""
+    source: str = "가정"
+
+    def text(self) -> str:
+        span = f"{self.start:%H:%M}~{self.end:%H:%M}"
+        return f"{span} {self.label}" if self.label else span
+
+
+GateStatus = Literal["off_peak", "avoided", "peak"]
+GateMode = Literal["none", "avoid", "fallback"]
 
 
 class PickupStop(BaseModel):
@@ -39,6 +55,7 @@ class PickupRequest(BaseModel):
     truck_fixed_cost: float = Field(default=0.0, ge=0)
     max_trips_per_truck: int = Field(default=2, ge=1)
     incompatible_groups: list[tuple[str, str]] = Field(default_factory=list)
+    gate_windows: list[GateWindow] = Field(default_factory=list)
 
 
 class StopVisit(BaseModel):
@@ -68,6 +85,11 @@ class TruckRoute(BaseModel):
     latest_departure: datetime
     port_eta: datetime
     slack_minutes: int
+    gate_status: GateStatus = "off_peak"
+    gate_window: str | None = None
+    gate_delay_minutes: int = 0
+    gate_slot_start: datetime | None = None
+    gate_slot_end: datetime | None = None
 
 
 class PickupPlan(BaseModel):
@@ -79,3 +101,5 @@ class PickupPlan(BaseModel):
     dropped_stop_ids: list[str]
     solve_ms: int
     assumptions: list[str]
+    gate_mode: GateMode = "none"
+    gate_windows: list[GateWindow] = Field(default_factory=list)
