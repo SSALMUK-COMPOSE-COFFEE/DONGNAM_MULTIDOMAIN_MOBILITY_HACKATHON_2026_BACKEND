@@ -123,7 +123,7 @@ class CostModel:
         effective_ready = lot.ready_date - timedelta(days=pull_forward_days)
         return max(0, (voyage.etd.date() - effective_ready).days)
 
-    def sea_lot_cost(self, lot: Lot, voyage: Voyage, pull_forward_days: int = 0) -> LotCost:
+    def sea_loss_rate(self, lot: Lot, voyage: Voyage, pull_forward_days: int = 0) -> float:
         pc = self.params.for_product(lot.product_id)
         wait = self.sea_wait_days(lot, voyage, pull_forward_days)
         rate = min(
@@ -131,6 +131,21 @@ class CostModel:
             pc.sea_base_loss_rate.value + pc.loss_rate_per_wait_day.value * wait,
         )
         rate += pc.early_harvest_loss_rate_per_day.value * pull_forward_days
+        delta = self.params.loss_delta(lot.product_id, lot.destination, "sea")
+        if delta:
+            rate = min(1.0, max(0.0, rate + delta))
+        return rate
+
+    def air_loss_rate(self, lot: Lot) -> float:
+        rate = self.params.for_product(lot.product_id).air_loss_rate.value
+        delta = self.params.loss_delta(lot.product_id, lot.destination, "air")
+        if delta:
+            rate = min(1.0, max(0.0, rate + delta))
+        return rate
+
+    def sea_lot_cost(self, lot: Lot, voyage: Voyage, pull_forward_days: int = 0) -> LotCost:
+        wait = self.sea_wait_days(lot, voyage, pull_forward_days)
+        rate = self.sea_loss_rate(lot, voyage, pull_forward_days)
         return LotCost(
             collection=lot.pallets * self._trucking_per_pallet(self.collection_km(lot, voyage)),
             storage=lot.pallets * wait * self.params.storage_per_pallet_day_krw.value,
@@ -139,12 +154,11 @@ class CostModel:
 
     def air_lot_cost(self, lot: Lot) -> LotCost:
         p = self.params
-        pc = p.for_product(lot.product_id)
         return LotCost(
             freight=self.lot_kg(lot) * self.air_rate_per_kg,
             collection=lot.pallets * self._trucking_per_pallet(p.air_trucking_km.value),
             storage=lot.pallets * p.air_storage_days.value * p.storage_per_pallet_day_krw.value,
-            loss_risk=self.lot_value(lot) * pc.air_loss_rate.value,
+            loss_risk=self.lot_value(lot) * self.air_loss_rate(lot),
         )
 
     def unassigned_penalty(self, lot: Lot) -> float:

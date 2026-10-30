@@ -125,6 +125,14 @@ def _default_product_cost() -> ProductCostParams:
     )
 
 
+class LossAdjustment(BaseModel):
+    product_id: str
+    destination: str
+    mode: Literal["sea", "air"]
+    delta: float
+    source: str = "도착 검수 학습"
+
+
 class CostParams(BaseModel):
     sea_freight_per_container_krw: Quantity = _q(4_560_000, "원/컨테이너")
     sea_ancillary_per_container_krw: Quantity = _q(4_500_000, "원/컨테이너")
@@ -143,9 +151,17 @@ class CostParams(BaseModel):
     platform_fee_rate: Quantity = _q(0.25, "비율")
     product_costs: dict[str, ProductCostParams] = Field(default_factory=dict)
     default_product_cost: ProductCostParams = Field(default_factory=_default_product_cost)
+    loss_adjustments: list[LossAdjustment] = Field(default_factory=list)
 
     def for_product(self, product_id: str) -> ProductCostParams:
         return self.product_costs.get(product_id, self.default_product_cost)
+
+    def loss_delta(self, product_id: str, destination: str, mode: str) -> float:
+        return sum(
+            a.delta
+            for a in self.loss_adjustments
+            if a.product_id == product_id and a.destination == destination and a.mode == mode
+        )
 
 
 class Scenario(BaseModel):

@@ -1,0 +1,78 @@
+{
+  "label": "가정/시드: 실제 도착 검수 기록이 아니다. JLST 6권 2호(2025.6) 부산→홍콩 딸기 실증 수치와 제안서·시나리오 가정값을 관측 형태로 옮긴 출발점이다",
+  "observations": [
+    {
+      "id": "seed-sb-hk-sea-1",
+      "product_id": "strawberry",
+      "destination": "HKHKG",
+      "mode": "sea",
+      "pallets": 4,
+      "actual_loss_pct": 1.2,
+      "wait_days": 0,
+      "outage_minutes": 0,
+      "observed_on": "2025-03-10",
+      "source": "가정/시드: JLST 6권 2호(2025.6) 부산→홍콩 딸기, 단전 없음 1~2%(모의) 하단"
+    },
+    {
+      "id": "seed-sb-hk-sea-2",
+      "product_id": "strawberry",
+      "destination": "HKHKG",
+      "mode": "sea",
+      "pallets": 4,
+      "actual_loss_pct": 1.8,
+      "wait_days": 0,
+      "outage_minutes": 0,
+      "observed_on": "2025-03-17",
+      "source": "가정/시드: JLST 6권 2호(2025.6) 부산→홍콩 딸기, 단전 없음 1~2%(모의) 상단"
+    },
+    {
+      "id": "seed-sb-hk-sea-3",
+      "product_id": "strawberry",
+      "destination": "HKHKG",
+      "mode": "sea",
+      "pallets": 2,
+      "actual_loss_pct": 7.0,
+      "wait_days": 0,
+      "outage_minutes": 356,
+      "observed_on": "2025-03-24",
+      "source": "가정/시드: JLST 6권 2호(2025.6) 부산→홍콩 딸기, 단전 있음(누적 5시간 56분) 6~8%(실측) 중앙"
+    },
+    {
+      "id": "seed-gr-hk-sea-1",
+      "product_id": "grape_so2",
+      "destination": "HKHKG",
+      "mode": "sea",
+      "pallets": 5,
+      "actual_loss_pct": 0.8,
+      "wait_days": 0,
+      "outage_minutes": 0,
+      "so2_in_container": true,
+      "observed_on": "2025-09-08",
+      "source": "가정/시드: 포도 CA 보관성 약 3주(이데일리 2024.5), 시나리오 기본 1% 주변 값"
+    },
+    {
+      "id": "seed-gr-hk-sea-2",
+      "product_id": "grape_so2",
+      "destination": "HKHKG",
+      "mode": "sea",
+      "pallets": 5,
+      "actual_loss_pct": 1.2,
+      "wait_days": 0,
+      "outage_minutes": 0,
+      "so2_in_container": true,
+      "observed_on": "2025-09-22",
+      "source": "가정/시드: 포도 CA 보관성 약 3주(이데일리 2024.5), 시나리오 기본 1% 주변 값"
+    },
+    {
+      "id": "seed-sb-hk-air-1",
+      "product_id": "strawberry",
+      "destination": "HKHKG",
+      "mode": "air",
+      "pallets": 2,
+      "actual_loss_pct": 1.0,
+      "wait_days": 0,
+      "observed_on": "2025-02-20",
+      "source": "가정/시드: 제안서·시나리오 항공 손실 1% 가정(공개 실측 없음)"
+    }
+  ]
+}

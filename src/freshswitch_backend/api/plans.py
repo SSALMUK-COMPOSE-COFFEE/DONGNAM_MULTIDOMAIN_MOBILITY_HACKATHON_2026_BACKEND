@@ -32,6 +32,7 @@ from freshswitch_backend.planning.store import (
     SessionConflict,
     store,
 )
+from freshswitch_backend.quality import with_learned_loss
 from freshswitch_backend.replan import DelayEvent, Event, ReplanResult, replan
 from freshswitch_backend.replan.explanation import explain_replan, llm_enabled
 from freshswitch_backend.replan.models import AlternativeId
@@ -41,6 +42,7 @@ router = APIRouter(prefix="/plans", tags=["plans"])
 
 class CreatePlanRequest(BaseModel):
     scenario_id: str = "default"
+    use_learned_loss: bool = False
 
 
 class EventRequest(BaseModel):
@@ -109,6 +111,8 @@ def create_plan(body: CreatePlanRequest) -> PlanSession:
     scenario = get_scenario(body.scenario_id)
     if scenario is None:
         raise HTTPException(status_code=404, detail="시나리오를 찾을 수 없습니다")
+    if body.use_learned_loss:
+        scenario = with_learned_loss(scenario)
     return store.create(scenario)
 
 

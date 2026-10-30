@@ -11,6 +11,7 @@ from freshswitch_backend.execution.quality import (
     current_inspections,
 )
 from freshswitch_backend.planning.store import store
+from freshswitch_backend.quality import quality_history
 
 router = APIRouter(prefix="/plans", tags=["settlement"])
 
@@ -47,6 +48,10 @@ def post_arrival(plan_id: str, body: ArrivalRequest) -> ArrivalSettlementResult:
     if store.get(plan_id) is None:
         raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")
     try:
-        return store.record_arrival(plan_id, body)
+        result = store.record_arrival(plan_id, body)
     except QualityError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    session = store.get(plan_id)
+    if session is not None:
+        quality_history.record_arrival(plan_id, session, result)
+    return result

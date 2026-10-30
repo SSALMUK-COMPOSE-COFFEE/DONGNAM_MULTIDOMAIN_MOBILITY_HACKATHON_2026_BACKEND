@@ -12,6 +12,7 @@ from freshswitch_backend.data.loader import load_scenarios
 from freshswitch_backend.integrations import SnapshotDate, SnapshotStore
 from freshswitch_backend.integrations.mof_snapshot import load_demo_fixture
 from freshswitch_backend.planning.store import store
+from freshswitch_backend.quality import quality_history
 
 router = APIRouter(prefix="/demo", tags=["demo"])
 
@@ -21,6 +22,7 @@ DEFAULT_CURL_BASE = "https://freshswitch.ssalhub.xyz/api"
 class ResetResponse(BaseModel):
     cleared_sessions: int
     cleared_coldchain_containers: int = 0
+    cleared_quality_observations: int = 0
 
 
 class DemoStatus(BaseModel):
@@ -431,6 +433,19 @@ _STEPS: list[dict[str, Any]] = [
         "expect": "cheaper sea, 해상이 164,164원 싸다",
     },
     {
+        "id": "ulsan_congestion",
+        "title": "울산항 실시간 혼잡도",
+        "description": "울산항만공사 선박위치(AIS)에서 소형선을 빼고 묘박 대기·접안·항행을 나눠 "
+        "대기 비율과 혼잡 단계를 낸다. 지연 예측의 congestion=auto가 이 값을 쓴다",
+        "method": "GET",
+        "path": "/api/vessels/ulsan/congestion?include_vessels=false",
+        "checks": [
+            {"path": ".dataset_url", "op": "contains", "value": "15156631"},
+            {"path": ".counts.berthed", "op": "gt", "value": 0},
+        ],
+        "expect": "source live(실패 시 snapshot), 대기·접안·항행 척수, level normal/elevated/high",
+    },
+    {
         "id": "forecast_typhoon_air",
         "title": "태풍 접안 지연 예측 → 항공 전환 제안",
         "description": "해수부 출항 이력으로 V-2611A 지연을 예측하고 태풍·혼잡 가정(p90)을 얹는다. "
@@ -497,6 +512,102 @@ _STEPS: list[dict[str, Any]] = [
             {"path": ".platform_net_change", "op": "gt", "value": -200000},
         ],
         "expect": "계획 4.2% 대비 0.3%p 초과 손실만큼 산청 성과보수 환급(한도 안)",
+    },
+    {
+        "id": "arrival_poor_jinju",
+        "title": "도착 검수 학습 1: 진주 딸기 손실 9%",
+        "description": "단전 240분을 겪은 CA-01의 진주 로트가 9% 손실로 도착했다. 검수 정산과 함께 "
+        "품질 이력에 관측 1건(홍콩·해상·딸기, 긴 단전)이 자동으로 쌓인다",
+        "method": "POST",
+        "path": "/api/plans/{plan_id}/settlement/arrival",
+        "body": {
+            "lot_id": "lot-jinju-sb-1",
+            "inspected_loss_pct": 9.0,
+            "note": "홍콩 도착 검수(긴 단전)",
+        },
+        "checks": [{"path": ".refund_after", "op": "gt", "value": 0}],
+        "expect": "계획 대비 초과 손실만큼 진주 성과보수 환급",
+    },
+    {
+        "id": "arrival_poor_miryang",
+        "title": "도착 검수 학습 2: 밀양 딸기 손실 9.5%",
+        "description": "같은 컨테이너의 밀양 로트도 9.5% 손실로 도착했다",
+        "method": "POST",
+        "path": "/api/plans/{plan_id}/settlement/arrival",
+        "body": {
+            "lot_id": "lot-miryang-sb-1",
+            "inspected_loss_pct": 9.5,
+            "note": "홍콩 도착 검수(긴 단전)",
+        },
+        "checks": [{"path": ".refund_after", "op": "gt", "value": 0}],
+        "expect": "계획 대비 초과 손실만큼 밀양 성과보수 환급",
+    },
+    {
+        "id": "quality_loss_rates",
+        "title": "학습 손실률표",
+        "description": "시드 3건(JLST 가정)에 도착 검수 3건이 더해져 홍콩 해상 딸기 손실률이 사전 1.5%에서 "
+        "올라간다. 단전 구간별 분포와 근거 문장을 함께 준다",
+        "method": "GET",
+        "path": "/api/quality/loss-rates",
+        "checks": [
+            {"path": ".cells[0].observations", "value": 6},
+            {"path": ".cells[0].origins.arrival", "value": 3},
+            {"path": ".cells[0].posterior_rate", "value": 0.030889},
+            {"path": ".cells[0].outage_breakdown[1].key", "value": "long"},
+            {"path": ".adjustments", "op": "len", "value": 1},
+        ],
+        "expect": "홍콩 해상 딸기 1.50% → 3.09%(+1.59%p), 긴 단전 17파렛트 보정 평균 5.71%",
+    },
+    {
+        "id": "quality_impact",
+        "title": "학습 손실률을 넣은 추천 비교",
+        "description": "같은 기본 시나리오를 사전 손실률과 학습 손실률로 각각 풀어 화주별 절감액·"
+        "성과보수 변화와 배정 변화를 보여준다. 새 계획에 쓰려면 POST /api/plans에 "
+        "use_learned_loss: true",
+        "method": "GET",
+        "path": "/api/quality/impact",
+        "checks": [
+            {"path": ".total_savings_prior", "value": 9987059},
+            {"path": ".total_savings_learned", "value": 7969315},
+            {"path": ".shippers[0].savings_change", "value": -949527},
+            {"path": ".shippers[3].savings_change", "value": 0},
+            {"path": ".lot_shifts", "op": "len", "value": 0},
+        ],
+        "expect": "총 절감 998.7만 → 796.9만 원, 진주 −94.9만 원, 포도 화주 그대로, 배정 변화 없음",
+    },
+    {
+        "id": "quality_observation_manual",
+        "title": "다른 항차 검수 기록 추가",
+        "description": "같은 노선 다른 항차(포워더 보고)에서 딸기 20파렛트가 긴 단전 356분 뒤 9% 손실로 "
+        "도착했다는 기록을 수동으로 넣는다",
+        "method": "POST",
+        "path": "/api/quality/observations",
+        "body": {
+            "product_id": "strawberry",
+            "destination": "HKHKG",
+            "mode": "sea",
+            "pallets": 20,
+            "actual_loss_pct": 9.0,
+            "outage_minutes": 356,
+            "mix": "shared_same_product",
+            "source": "포워더 보고(시연용 가정)",
+        },
+        "checks": [{"path": ".outage_bucket", "value": "long"}],
+        "expect": "201, 긴 단전 관측 1건 추가",
+    },
+    {
+        "id": "quality_impact_shift",
+        "title": "학습 손실률이 추천을 바꾼다",
+        "description": "홍콩 해상 딸기 학습 손실률이 더 오르면 해상 공동적재가 항공보다 비싸져 딸기 "
+        "로트가 항공으로 바뀐다. 포도는 그대로 해상",
+        "method": "GET",
+        "path": "/api/quality/impact",
+        "checks": [
+            {"path": ".lot_shifts", "op": "len", "value": 3},
+            {"path": ".lot_shifts[0].after", "value": "항공"},
+            {"path": ".shippers[3].savings_change", "value": 0},
+        ],
+        "expect": "진주·산청·밀양 딸기 해상 → 항공, 포도 해상 유지",
     },
 ]
 
@@ -599,8 +710,11 @@ def curl_script(base: str = DEFAULT_CURL_BASE) -> str:
 
 @router.post("/reset")
 def reset() -> ResetResponse:
+    cleared_quality, _ = quality_history.reset()
     return ResetResponse(
-        cleared_sessions=store.clear(), cleared_coldchain_containers=coldchain_store.clear()
+        cleared_sessions=store.clear(),
+        cleared_coldchain_containers=coldchain_store.clear(),
+        cleared_quality_observations=cleared_quality,
     )
 
 

@@ -11,6 +11,7 @@ from freshswitch_backend.api import (
     health,
     intake,
     plans,
+    quality,
     scenarios,
     settlement,
     vessels,
@@ -49,6 +50,7 @@ def create_app() -> FastAPI:
     api.include_router(intake.router)
     api.include_router(settlement.router)
     api.include_router(coldchain.router)
+    api.include_router(quality.router)
     app.include_router(api)
     app.add_exception_handler(ReplanError, _replan_error)
     return app

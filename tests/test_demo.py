@@ -78,7 +78,7 @@ def test_script_runs_offline_end_to_end(client: TestClient, monkeypatch) -> None
     ids = [s["id"] for s in steps]
     assert len(set(ids)) == len(ids)
     assert ids[0] == "reset"
-    assert ids[-1] == "arrival_settlement"
+    assert ids[-1] == "quality_impact_shift"
     for required in [
         "intake_strawberry",
         "intake_grape_so2",
@@ -97,6 +97,9 @@ def test_script_runs_offline_end_to_end(client: TestClient, monkeypatch) -> None
         "compare_air",
         "benchmark",
         "business_matrix",
+        "arrival_settlement",
+        "quality_loss_rates",
+        "quality_impact",
     ]:
         assert required in ids
     variables: dict = {}
