@@ -1,0 +1,112 @@
+import math
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+
+from freshswitch_backend.coldchain.models import PresetInfo, ReadingIn, SimulationPreset
+from freshswitch_backend.domain.models import KST
+
+DEFAULT_START = datetime(2026, 11, 17, 9, 0, tzinfo=KST)
+AMBIENT_C = 15.0
+WARMING_TAU_MIN = 240.0
+COOLING_TAU_MIN = 45.0
+
+
+@dataclass(frozen=True)
+class Phase:
+    minutes: int
+    power_on: bool
+
+
+@dataclass(frozen=True)
+class Preset:
+    id: SimulationPreset
+    title: str
+    description: str
+    phases: tuple[Phase, ...]
+    step_minutes: int = 5
+
+    @property
+    def outage_minutes(self) -> int:
+        return sum(p.minutes for p in self.phases if not p.power_on)
+
+    @property
+    def total_minutes(self) -> int:
+        return sum(p.minutes for p in self.phases)
+
+    @property
+    def readings(self) -> int:
+        return self.total_minutes // self.step_minutes + 1
+
+    def info(self) -> PresetInfo:
+        return PresetInfo(
+            id=self.id,
+            title=self.title,
+            description=self.description,
+            step_minutes=self.step_minutes,
+            readings=self.readings,
+            outage_minutes=self.outage_minutes,
+        )
+
+
+PRESETS: dict[SimulationPreset, Preset] = {
+    "power_cut_restore": Preset(
+        id="power_cut_restore",
+        title="단전 복구 (4시간 단전)",
+        description="정상 1시간 → 터미널 단전 4시간(품온 상승) → 전원 복구 후 2시간 재냉각. "
+        "경고·위험, 우선 플러그·젯셋·반입 조정·현지 냉장창고 조치가 모두 뜬다",
+        phases=(Phase(60, True), Phase(240, False), Phase(120, True)),
+    ),
+    "short_outage": Preset(
+        id="short_outage",
+        title="짧은 단전 (45분)",
+        description="정상 1시간 → 단전 45분 → 복구 1시간. 경고와 우선 플러그·젯셋 조치까지만 뜬다",
+        phases=(Phase(60, True), Phase(45, False), Phase(60, True)),
+    ),
+    "normal": Preset(
+        id="normal",
+        title="정상 운송 (2시간)",
+        description="전원이 계속 켜져 있고 품온이 적정 범위 안. 경고·조치 없음",
+        phases=(Phase(120, True),),
+    ),
+}
+
+
+def preset_readings(
+    preset: Preset,
+    *,
+    device_id: str,
+    container_id: str,
+    plan_id: str | None,
+    band_min_c: float,
+    band_max_c: float,
+    start: datetime | None = None,
+) -> list[ReadingIn]:
+    start = start or DEFAULT_START
+    setpoint = (band_min_c + band_max_c) / 2
+    step = preset.step_minutes
+    schedule: list[bool] = []
+    for phase in preset.phases:
+        schedule.extend([phase.power_on] * (phase.minutes // step))
+    schedule.append(schedule[-1] if schedule else True)
+    readings: list[ReadingIn] = []
+    temp = setpoint
+    for i, power_on in enumerate(schedule):
+        if i > 0:
+            if schedule[i - 1]:
+                temp = setpoint + (temp - setpoint) * math.exp(-step / COOLING_TAU_MIN)
+            else:
+                temp = AMBIENT_C + (temp - AMBIENT_C) * math.exp(-step / WARMING_TAU_MIN)
+        wiggle = 0.1 * math.sin(i / 3)
+        readings.append(
+            ReadingIn(
+                device_id=device_id,
+                container_id=container_id,
+                plan_id=plan_id,
+                ts=start + timedelta(minutes=i * step),
+                temp_c=round(temp + wiggle, 2),
+                power_on=power_on,
+                humidity_pct=round(92 - 0.5 * max(0.0, temp - setpoint), 1),
+                door_open=False,
+            )
+        )
+    return readings
