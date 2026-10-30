@@ -6,6 +6,7 @@ from fastapi import APIRouter, Query
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
+from freshswitch_backend.coldchain import coldchain_store
 from freshswitch_backend.config import get_settings
 from freshswitch_backend.data.loader import load_scenarios
 from freshswitch_backend.integrations import SnapshotDate, SnapshotStore
@@ -19,6 +20,7 @@ DEFAULT_CURL_BASE = "https://freshswitch.ssalhub.xyz/api"
 
 class ResetResponse(BaseModel):
     cleared_sessions: int
+    cleared_coldchain_containers: int = 0
 
 
 class DemoStatus(BaseModel):
@@ -245,6 +247,99 @@ _STEPS: list[dict[str, Any]] = [
         "expect": "status committed, committed_version 2",
     },
     {
+        "id": "fuel_shock",
+        "title": "운임 쇼크: 유류할증료 470 → 2,060원",
+        "description": "항공 유류할증료를 kg당 470원에서 2,060원(2026.4)으로 올려 다시 푼다. "
+        "다음 배 후속 딸기 9파렛트가 항공에서 CA-03 공동적재로 바뀌고 화주별 절감이 늘어난다",
+        "method": "POST",
+        "path": "/api/analysis/fuel-shock",
+        "body": {"scenario_id": "fuel-shock", "surcharges": [470, 2060]},
+        "checks": [
+            {"path": ".cases[0].plan_changed", "value": False},
+            {"path": ".cases[1].plan_changed", "value": True},
+            {"path": ".cases[1].air_freight_per_pallet", "value": 1552515},
+            {"path": ".cases[1].switches", "op": "len", "value": 3},
+            {"path": ".cases[1].switches[0].direction", "value": "air_to_sea"},
+            {"path": ".cases[1].savings_delta", "value": 26501000},
+            {"path": ".thresholds[1].surcharge_per_kg", "value": 1158},
+        ],
+        "expect": "2,060원에서 항공→해상 3로트 9파렛트, CA-03 9/20, 총 절감 +26,501,000원. "
+        "배정이 바뀌는 할증료 약 1,158원/kg",
+    },
+    {
+        "id": "coldchain_bind",
+        "title": "아두이노 센서 ↔ CA-01 연결",
+        "description": "소형 냉각 박스의 아두이노(arduino-01)를 계획의 딸기 컨테이너 CA-01에 연결한다. "
+        "이후 측정값은 container_id 없이 보내도 CA-01로 들어간다",
+        "method": "POST",
+        "path": "/api/coldchain/bindings",
+        "body": {
+            "device_id": "arduino-01",
+            "container_id": "CA-01",
+            "plan_id": "{plan_id}",
+            "stage": "terminal",
+        },
+        "checks": [{"path": ".container_id", "value": "CA-01"}],
+        "expect": "201, arduino-01 → CA-01(터미널 장치장)",
+    },
+    {
+        "id": "coldchain_power_cut",
+        "title": "단전 복구 시뮬레이션",
+        "description": "실물 아두이노 대신 같은 수집 경로로 정상 1시간 → 터미널 단전 4시간 → 복구 2시간을 "
+        "재생한다(5분 간격 85건). interval_seconds를 주면 화면에서 실시간으로 움직인다",
+        "method": "POST",
+        "path": "/api/coldchain/simulate",
+        "body": {
+            "preset": "power_cut_restore",
+            "container_id": "CA-01",
+            "plan_id": "{plan_id}",
+            "device_id": "arduino-01",
+        },
+        "checks": [
+            {"path": ".done", "value": True},
+            {"path": ".total", "value": 85},
+            {"path": ".state.cumulative_outage_minutes", "value": 240.0},
+            {"path": ".state.open_actions", "value": 4},
+        ],
+        "expect": "누적 단전 240분, 조치 4건",
+    },
+    {
+        "id": "coldchain_twin",
+        "title": "손실 디지털 트윈",
+        "description": "센서 손실률이 단전 없음 1.5%에서 6.6%로 오르고, 화주별 예상 손실액이 계획보다 "
+        "늘어난다. 우선 플러그·젯셋·반입 조정·현지 냉장창고 요청 문장이 붙는다",
+        "method": "GET",
+        "path": "/api/coldchain/containers/CA-01",
+        "checks": [
+            {"path": ".loss.no_outage_loss_rate", "value": 0.015},
+            {"path": ".loss.sensor_loss_rate", "value": 0.066015},
+            {"path": ".loss.delta_krw", "value": 4327077},
+            {"path": ".actions", "op": "len", "value": 4},
+            {"path": ".actions[0].kind", "value": "terminal_priority_plug"},
+            {"path": ".actions[1].kind", "value": "genset_dispatch"},
+            {"path": ".actions[2].kind", "value": "entry_time_adjust"},
+            {"path": ".actions[3].kind", "value": "cold_storage_booking"},
+            {
+                "path": ".actions[0].request.text",
+                "op": "contains",
+                "value": "[리퍼 우선 연결 요청]",
+            },
+        ],
+        "expect": "센서 손실률 1.5% → 6.6%, 계획 대비 예상 손실 +4,327,077원, 조치 4건",
+    },
+    {
+        "id": "coldchain_alerts",
+        "title": "폰 알림 피드",
+        "description": "프런트는 since 커서로 폴링한다(SSE는 /api/coldchain/alerts/stream)",
+        "method": "GET",
+        "path": "/api/coldchain/alerts?container_id=CA-01",
+        "checks": [
+            {"path": ".alerts", "op": "len", "value": 10},
+            {"path": ".alerts[0].kind", "value": "power_cut"},
+        ],
+        "expect": "전원 차단·경고·위험·조치 4건·복구·경고 해제 등 10건",
+    },
+    {
         "id": "detect_delay",
         "title": "해수부 출항 지연 감지",
         "description": "해수부 입출항 정보(오프라인이면 저장 스냅샷)와 시연 선박 실적을 예정 ETD와 비교한다",
@@ -334,6 +429,24 @@ _STEPS: list[dict[str, Any]] = [
             {"path": ".sea_savings", "value": 164164},
         ],
         "expect": "cheaper sea, 해상이 164,164원 싸다",
+    },
+    {
+        "id": "forecast_typhoon_air",
+        "title": "태풍 접안 지연 예측 → 항공 전환 제안",
+        "description": "해수부 출항 이력으로 V-2611A 지연을 예측하고 태풍·혼잡 가정(p90)을 얹는다. "
+        "딸기 도착이 판매기한을 넘으면 지연 이벤트로 재계획해 김해·인천 항공을 제안한다(적용은 하지 않음)",
+        "method": "POST",
+        "path": "/api/plans/{plan_id}/delay-forecast?llm=false",
+        "body": {"preset": "typhoon"},
+        "checks": [
+            {"path": ".triggered", "value": True},
+            {"path": ".event.voyage_id", "value": "V-2611A"},
+            {"path": ".air_lot_ids", "op": "len", "value": 4},
+            {"path": ".air_switch[0].options", "op": "len", "value": 2},
+            {"path": ".replan.recommended_id", "value": "pull_forward"},
+        ],
+        "expect": "triggered true, CA-01 딸기 4로트(진주·산청·밀양 1·2차) 항공 전환 제안"
+        "(김해·인천 비용), 추천 pull_forward",
     },
     {
         "id": "benchmark",
@@ -486,7 +599,9 @@ def curl_script(base: str = DEFAULT_CURL_BASE) -> str:
 
 @router.post("/reset")
 def reset() -> ResetResponse:
-    return ResetResponse(cleared_sessions=store.clear())
+    return ResetResponse(
+        cleared_sessions=store.clear(), cleared_coldchain_containers=coldchain_store.clear()
+    )
 
 
 @router.get("/status")

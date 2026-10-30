@@ -28,7 +28,7 @@ class DelayEvent(BaseModel):
     voyage_id: str
     new_etd: KstDatetime
     new_cy_cutoff: KstDatetime | None = None
-    source: Literal["manual", "해수부"] = "manual"
+    source: Literal["manual", "해수부", "예측"] = "manual"
 
 
 class AddLotEvent(BaseModel):

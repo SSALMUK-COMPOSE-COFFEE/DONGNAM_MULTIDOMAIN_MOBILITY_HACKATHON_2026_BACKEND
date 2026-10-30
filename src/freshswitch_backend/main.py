@@ -4,8 +4,10 @@ from fastapi.responses import JSONResponse
 
 from freshswitch_backend.api import (
     analysis,
+    coldchain,
     compare,
     demo,
+    forecast,
     health,
     intake,
     plans,
@@ -39,12 +41,14 @@ def create_app() -> FastAPI:
     api.include_router(health.router)
     api.include_router(scenarios.router)
     api.include_router(plans.router)
+    api.include_router(forecast.router)
     api.include_router(vessels.router)
     api.include_router(compare.router)
     api.include_router(demo.router)
     api.include_router(analysis.router)
     api.include_router(intake.router)
     api.include_router(settlement.router)
+    api.include_router(coldchain.router)
     app.include_router(api)
     app.add_exception_handler(ReplanError, _replan_error)
     return app

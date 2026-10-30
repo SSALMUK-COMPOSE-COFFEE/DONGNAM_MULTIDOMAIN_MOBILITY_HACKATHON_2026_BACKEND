@@ -15,6 +15,16 @@ from freshswitch_backend.integrations import (
 )
 from freshswitch_backend.integrations.mof_provider import LIVE_REQUEST_TIMEOUT_SECONDS
 from freshswitch_backend.integrations.mof_vessel import KST
+from freshswitch_backend.integrations.ulsan_position import (
+    LIVE_REQUEST_TIMEOUT_SECONDS as ULSAN_REQUEST_TIMEOUT_SECONDS,
+)
+from freshswitch_backend.integrations.ulsan_position import (
+    MissingUlsanKey,
+    PositionFeed,
+    PositionProvider,
+    PositionsUnavailable,
+    UlsanPositionClient,
+)
 
 router = APIRouter(prefix="/vessels", tags=["vessels"])
 
@@ -70,3 +80,31 @@ async def busan_movements(
 ) -> MovementFeed:
     day = datetime.strptime(date_str, "%Y%m%d").date() if date_str else datetime.now(KST).date()
     return await load_busan_feed(factory, day, day, direction, demo=demo)
+
+
+UlsanClientFactory = Callable[[], UlsanPositionClient]
+
+
+def _ulsan_factory() -> UlsanPositionClient:
+    key = get_settings().data_go_kr_service_key
+    if not key:
+        raise MissingUlsanKey()
+    return UlsanPositionClient(key, timeout=ULSAN_REQUEST_TIMEOUT_SECONDS)
+
+
+def ulsan_client_factory() -> UlsanClientFactory:
+    return _ulsan_factory
+
+
+@router.get("/ulsan")
+async def ulsan_positions(
+    factory: Annotated[UlsanClientFactory, Depends(ulsan_client_factory)],
+    call_sign: str | None = None,
+) -> PositionFeed:
+    provider = PositionProvider(factory, offline_mode=get_settings().offline_mode)
+    try:
+        return await provider.get(call_sign)
+    except PositionsUnavailable as exc:
+        raise HTTPException(
+            status_code=503, detail=f"울산항 선박위치 정보를 가져오지 못했습니다: {exc}"
+        ) from exc
