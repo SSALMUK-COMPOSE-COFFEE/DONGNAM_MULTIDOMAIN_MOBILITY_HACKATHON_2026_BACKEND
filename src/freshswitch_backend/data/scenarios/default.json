@@ -1,0 +1,412 @@
+{
+  "id": "default",
+  "name": "부산신항 홍콩행 CA 공동적재 (제안서 예시)",
+  "description": "진주·산청·밀양 딸기 17팔레트를 CA-01에, 상주·포항 SO2 처리 샤인머스캣 18팔레트를 CA-02에 공동적재한다. 밀양 후속 딸기 2팔레트(11/18 출하)는 이번 배 마감 이후라 항공으로 가며, 취소 발생 시 하루 당겨 싣기 후보다.",
+  "products": [
+    {
+      "id": "strawberry",
+      "name": "딸기",
+      "temp_min_c": 0.0,
+      "temp_max_c": 2.0,
+      "o2_pct": 10.0,
+      "co2_pct": 15.0,
+      "shelf_life_days": 7,
+      "so2_treated": false,
+      "pallet_kg": 415,
+      "source": "가정"
+    },
+    {
+      "id": "grape_so2",
+      "name": "샤인머스캣 (SO2 처리)",
+      "temp_min_c": -0.5,
+      "temp_max_c": 0.0,
+      "o2_pct": null,
+      "co2_pct": null,
+      "shelf_life_days": 45,
+      "so2_treated": true,
+      "pallet_kg": 415,
+      "source": "가정"
+    }
+  ],
+  "packhouses": [
+    {
+      "id": "ph-jinju",
+      "name": "진주 딸기 APC",
+      "region": "경남 진주",
+      "lat": 35.18,
+      "lon": 128.11,
+      "source": "가정"
+    },
+    {
+      "id": "ph-sancheong",
+      "name": "산청 딸기 APC",
+      "region": "경남 산청",
+      "lat": 35.42,
+      "lon": 127.87,
+      "source": "가정"
+    },
+    {
+      "id": "ph-miryang",
+      "name": "밀양 딸기 APC",
+      "region": "경남 밀양",
+      "lat": 35.5,
+      "lon": 128.75,
+      "source": "가정"
+    },
+    {
+      "id": "ph-sangju",
+      "name": "상주 포도 APC",
+      "region": "경북 상주",
+      "lat": 36.41,
+      "lon": 128.16,
+      "source": "가정"
+    },
+    {
+      "id": "ph-pohang",
+      "name": "포항 포도 APC",
+      "region": "경북 포항",
+      "lat": 36.02,
+      "lon": 129.34,
+      "source": "가정"
+    }
+  ],
+  "ports": [
+    {
+      "id": "KRPUS",
+      "name": "부산신항",
+      "unlocode": "KRPUS",
+      "lat": 35.08,
+      "lon": 128.83,
+      "source": "가정"
+    },
+    {
+      "id": "HKHKG",
+      "name": "홍콩항",
+      "unlocode": "HKHKG",
+      "lat": 22.3,
+      "lon": 114.17,
+      "source": "가정"
+    }
+  ],
+  "shippers": [
+    {
+      "id": "sh-jinju",
+      "name": "진주 딸기 수출농가 A",
+      "packhouse_id": "ph-jinju",
+      "source": "가정"
+    },
+    {
+      "id": "sh-sancheong",
+      "name": "산청 딸기 수출농가 B",
+      "packhouse_id": "ph-sancheong",
+      "source": "가정"
+    },
+    {
+      "id": "sh-miryang",
+      "name": "밀양 딸기 수출농가 C",
+      "packhouse_id": "ph-miryang",
+      "source": "가정"
+    },
+    {
+      "id": "sh-sangju",
+      "name": "상주 포도 수출농가 D",
+      "packhouse_id": "ph-sangju",
+      "source": "가정"
+    },
+    {
+      "id": "sh-pohang",
+      "name": "포항 포도 수출농가 E",
+      "packhouse_id": "ph-pohang",
+      "source": "가정"
+    }
+  ],
+  "lots": [
+    {
+      "id": "lot-jinju-sb-1",
+      "shipper_id": "sh-jinju",
+      "product_id": "strawberry",
+      "pallets": 8,
+      "ready_date": "2026-11-16",
+      "destination": "HKHKG",
+      "sell_by_date": "2026-11-23",
+      "source": "가정"
+    },
+    {
+      "id": "lot-sancheong-sb-1",
+      "shipper_id": "sh-sancheong",
+      "product_id": "strawberry",
+      "pallets": 5,
+      "ready_date": "2026-11-16",
+      "destination": "HKHKG",
+      "sell_by_date": "2026-11-23",
+      "source": "가정"
+    },
+    {
+      "id": "lot-miryang-sb-1",
+      "shipper_id": "sh-miryang",
+      "product_id": "strawberry",
+      "pallets": 4,
+      "ready_date": "2026-11-16",
+      "destination": "HKHKG",
+      "sell_by_date": "2026-11-23",
+      "source": "가정"
+    },
+    {
+      "id": "lot-miryang-sb-2",
+      "shipper_id": "sh-miryang",
+      "product_id": "strawberry",
+      "pallets": 2,
+      "ready_date": "2026-11-18",
+      "destination": "HKHKG",
+      "sell_by_date": "2026-11-25",
+      "source": "가정"
+    },
+    {
+      "id": "lot-sangju-gr-1",
+      "shipper_id": "sh-sangju",
+      "product_id": "grape_so2",
+      "pallets": 13,
+      "ready_date": "2026-11-15",
+      "destination": "HKHKG",
+      "sell_by_date": "2026-12-30",
+      "source": "가정"
+    },
+    {
+      "id": "lot-pohang-gr-1",
+      "shipper_id": "sh-pohang",
+      "product_id": "grape_so2",
+      "pallets": 5,
+      "ready_date": "2026-11-15",
+      "destination": "HKHKG",
+      "sell_by_date": "2026-12-30",
+      "source": "가정"
+    }
+  ],
+  "voyages": [
+    {
+      "id": "V-2611A",
+      "vessel_name": "MV FRESH HARMONY",
+      "terminal": "부산신항 2부두",
+      "origin": "KRPUS",
+      "destination": "HKHKG",
+      "etd": "2026-11-18T18:00:00+09:00",
+      "cy_cutoff": "2026-11-17T18:00:00+09:00",
+      "transit_days": 3,
+      "source": "가정"
+    },
+    {
+      "id": "V-2611B",
+      "vessel_name": "MV COLD BRIDGE",
+      "terminal": "부산신항 2부두",
+      "origin": "KRPUS",
+      "destination": "HKHKG",
+      "etd": "2026-11-21T18:00:00+09:00",
+      "cy_cutoff": "2026-11-20T18:00:00+09:00",
+      "transit_days": 3,
+      "source": "가정"
+    }
+  ],
+  "containers": [
+    {
+      "id": "CA-01",
+      "voyage_id": "V-2611A",
+      "kind": "40RH-CA",
+      "capacity_pallets": 20,
+      "source": "가정"
+    },
+    {
+      "id": "CA-02",
+      "voyage_id": "V-2611A",
+      "kind": "40RH-CA",
+      "capacity_pallets": 20,
+      "source": "가정"
+    },
+    {
+      "id": "CA-03",
+      "voyage_id": "V-2611B",
+      "kind": "40RH-CA",
+      "capacity_pallets": 20,
+      "source": "가정"
+    }
+  ],
+  "trucks": [
+    {
+      "id": "RT-01",
+      "depot_id": "KRPUS",
+      "capacity_pallets": 16,
+      "source": "가정"
+    },
+    {
+      "id": "RT-02",
+      "depot_id": "KRPUS",
+      "capacity_pallets": 16,
+      "source": "가정"
+    },
+    {
+      "id": "RT-03",
+      "depot_id": "KRPUS",
+      "capacity_pallets": 10,
+      "source": "가정"
+    }
+  ],
+  "cost_params": {
+    "sea_freight_per_container_krw": {
+      "value": 4560000,
+      "unit": "원/컨테이너",
+      "source": "제안서 나-1·라: 딸기 1파렛트 운임만 비교 시 해상이 항공(89.2만 원)보다 66.4만 원 싸다 → 파렛트당 22.8만 원 × 20파렛트"
+    },
+    "sea_ancillary_per_container_krw": {
+      "value": 4500000,
+      "unit": "원/컨테이너",
+      "source": "가정: CA 가스 세팅·리퍼 전력·THC·통관·현지 하역. 제안서 기준값(실운영 30% 절감, 물류신문 2023.2 / 딸기 1파렛트 절감 24.9만 원)에 맞춘 보정값"
+    },
+    "air_freight_per_kg_krw": {
+      "value": 2151,
+      "unit": "원/kg",
+      "source": "제안서 가: 딸기 1파렛트(415kg) 항공 운임 89.2만 원(2026.4 할증 이전, 한국농어민신문 2026.4) ÷ 415kg"
+    },
+    "reefer_truck_cost_per_km_krw": {
+      "value": 2000,
+      "unit": "원/km",
+      "source": "가정"
+    },
+    "truck_capacity_pallets": {
+      "value": 16,
+      "unit": "파렛트",
+      "source": "가정: 시나리오 냉장트럭 RT-01·RT-02 용량"
+    },
+    "road_distance_factor": {
+      "value": 1.3,
+      "unit": "배",
+      "source": "가정: 직선거리 대비 도로거리 배율"
+    },
+    "air_trucking_km": {
+      "value": 350,
+      "unit": "km",
+      "source": "가정: 경남 산지→인천공항 차로 약 5시간(경향신문 2023.7)"
+    },
+    "storage_per_pallet_day_krw": {
+      "value": 3000,
+      "unit": "원/파렛트·일",
+      "source": "가정"
+    },
+    "air_storage_days": {
+      "value": 1.5,
+      "unit": "일",
+      "source": "SBS 2023.1: 인천공항에서 하루 반 정도 보관"
+    },
+    "air_transit_days": {
+      "value": 0.5,
+      "unit": "일",
+      "source": "가정: 부산→홍콩 항공 3시간 30분(fluentcargo) + 통관"
+    },
+    "unassigned_penalty_per_pallet_krw": {
+      "value": 10000000,
+      "unit": "원/파렛트",
+      "source": "가정: 모델 내부 페널티(실제 비용 아님)"
+    },
+    "platform_fee_rate": {
+      "value": 0.25,
+      "unit": "비율",
+      "source": "제안서 라: 화주 절감액의 25% 성과보수, 화주가 75% 보유"
+    },
+    "product_costs": {
+      "strawberry": {
+        "value_per_kg_krw": {
+          "value": 18000,
+          "unit": "원/kg",
+          "source": "경남일보 2025.3: 진주 금실딸기 2.5t 약 4,500만 원"
+        },
+        "sea_base_loss_rate": {
+          "value": 0.015,
+          "unit": "비율",
+          "source": "JLST 6권 2호(2025.6) 부산→홍콩 딸기 실증: 단전 없음 1~2%(모의) 중앙값"
+        },
+        "loss_rate_per_wait_day": {
+          "value": 0.009,
+          "unit": "비율/일",
+          "source": "가정: JLST 6권 2호(2025.6) 부산→홍콩 딸기 실증 단전 있음 6~8%와 없음 1~2%의 차이 5.5%p를 문전 6일로 나눈 하루 증가분"
+        },
+        "max_sea_loss_rate": {
+          "value": 0.08,
+          "unit": "비율",
+          "source": "JLST 6권 2호(2025.6) 부산→홍콩 딸기 실증: 단전 있음 6~8%(실측) 상한"
+        },
+        "early_harvest_loss_rate_per_day": {
+          "value": 0.02,
+          "unit": "비율/일",
+          "source": "가정: 출하를 하루 당길 때 숙도 미달·선별 손실"
+        },
+        "air_loss_rate": {
+          "value": 0.01,
+          "unit": "비율",
+          "source": "가정: 항공 운송 손실(공개 실측 없음)"
+        }
+      },
+      "grape_so2": {
+        "value_per_kg_krw": {
+          "value": 12066,
+          "unit": "원/kg",
+          "source": "KATI 2025 포도 수출 8,574만 달러 ÷ 9,949t, 환율 1,400원 가정"
+        },
+        "sea_base_loss_rate": {
+          "value": 0.01,
+          "unit": "비율",
+          "source": "가정: 포도는 CA 보관성 약 3주(이데일리 2024.5)로 딸기보다 낮게 둠"
+        },
+        "loss_rate_per_wait_day": {
+          "value": 0.002,
+          "unit": "비율/일",
+          "source": "가정"
+        },
+        "max_sea_loss_rate": {
+          "value": 0.05,
+          "unit": "비율",
+          "source": "가정"
+        },
+        "early_harvest_loss_rate_per_day": {
+          "value": 0.01,
+          "unit": "비율/일",
+          "source": "가정"
+        },
+        "air_loss_rate": {
+          "value": 0.005,
+          "unit": "비율",
+          "source": "가정"
+        }
+      }
+    },
+    "default_product_cost": {
+      "value_per_kg_krw": {
+        "value": 15000,
+        "unit": "원/kg",
+        "source": "가정"
+      },
+      "sea_base_loss_rate": {
+        "value": 0.015,
+        "unit": "비율",
+        "source": "가정"
+      },
+      "loss_rate_per_wait_day": {
+        "value": 0.009,
+        "unit": "비율/일",
+        "source": "가정"
+      },
+      "max_sea_loss_rate": {
+        "value": 0.08,
+        "unit": "비율",
+        "source": "가정"
+      },
+      "early_harvest_loss_rate_per_day": {
+        "value": 0.02,
+        "unit": "비율/일",
+        "source": "가정"
+      },
+      "air_loss_rate": {
+        "value": 0.01,
+        "unit": "비율",
+        "source": "가정"
+      }
+    }
+  }
+}

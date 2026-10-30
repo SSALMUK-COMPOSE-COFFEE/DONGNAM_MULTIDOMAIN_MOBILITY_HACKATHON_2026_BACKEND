@@ -1,0 +1,9 @@
+name: freshswitch
+
+services:
+  api:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${HOST_PORT:-18103}:8000"
