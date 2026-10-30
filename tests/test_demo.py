@@ -1,3 +1,7 @@
+import re
+import shutil
+import subprocess
+
 from fastapi.testclient import TestClient
 
 from freshswitch_backend.api import demo, vessels
@@ -38,34 +42,95 @@ def test_status(client: TestClient, monkeypatch) -> None:
     assert all(d["directions"] == ["I", "O"] for d in body["snapshot_dates"])
 
 
+def _select(data, path: str):
+    for key, index in re.findall(r"\.?([A-Za-z_]\w*)|\[(-?\d+)\]", path):
+        data = data[key] if key else data[int(index)]
+    return data
+
+
+def _resolve(value, variables: dict):
+    if isinstance(value, dict):
+        return {k: _resolve(v, variables) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_resolve(v, variables) for v in value]
+    if isinstance(value, str):
+        whole = re.fullmatch(r"\{(\w+)\}", value)
+        if whole:
+            return variables[whole.group(1)]
+        return re.sub(r"\{(\w+)\}", lambda m: str(variables[m.group(1)]), value)
+    return value
+
+
+def _check(actual, op: str, want) -> bool:
+    if op == "eq":
+        return actual == want
+    if op == "contains":
+        return want in actual if isinstance(actual, (list, str)) else False
+    if op == "len":
+        return len(actual) == want
+    return actual > want
+
+
 def test_script_runs_offline_end_to_end(client: TestClient, monkeypatch) -> None:
     monkeypatch.setattr(vessels, "get_settings", lambda: Settings(offline_mode=True))
     steps = client.get("/api/demo/script").json()
-    assert [s["step"] for s in steps] == list(range(1, len(steps) + 1))
-    assert [s["id"] for s in steps] == [
+    assert [s["step"] for s in steps] == list(range(len(steps)))
+    ids = [s["id"] for s in steps]
+    assert len(set(ids)) == len(ids)
+    assert ids[0] == "reset"
+    assert ids[-1] == "arrival_settlement"
+    for required in [
+        "intake_strawberry",
+        "intake_grape_so2",
         "create_plan",
         "reduce_sancheong",
         "apply_pull_forward",
+        "orders_pull_forward",
+        "confirm_jinju",
+        "confirm_miryang",
+        "confirm_forwarder",
         "detect_delay",
         "replan_delay",
         "apply_delay_plan",
+        "orders_delay",
+        "confirm_delay_forwarder",
         "compare_air",
-    ]
-    plan_id = None
-    previous: dict = {}
+        "benchmark",
+        "business_matrix",
+    ]:
+        assert required in ids
+    variables: dict = {}
     for step in steps:
-        path = step["path"].replace("{plan_id}", plan_id or "")
-        body = step["body"]
-        if step["id"] == "replan_delay":
-            detected = {k: v for k, v in previous["events"][0].items() if v is not None}
-            assert detected == body["event"]
-        if step["id"] == "apply_delay_plan":
-            assert previous["recommended_id"] == body["alternative_id"]
-        if isinstance(body, dict) and body.get("plan_id") == "{plan_id}":
-            body = {**body, "plan_id": plan_id}
+        path = _resolve(step["path"], variables)
+        body = _resolve(step["body"], variables)
         response = client.request(step["method"], path, json=body)
-        assert response.status_code in (200, 201), (step["id"], response.text)
-        previous = response.json()
-        if step["id"] == "create_plan":
-            plan_id = previous["plan_id"]
-    assert previous["lot_id"] == "lot-miryang-sb-2"
+        assert 200 <= response.status_code < 300, (step["id"], response.text)
+        data = response.json()
+        for capture in step["capture"]:
+            variables[capture["name"]] = _select(data, capture["path"])
+            assert variables[capture["name"]] is not None, (step["id"], capture)
+        for check in step["checks"]:
+            actual = _select(data, check["path"])
+            assert _check(actual, check["op"], check["value"]), (step["id"], check, actual)
+    assert store.get(variables["plan_id"]).status == "committed"
+    assert store.get(variables["plan_id"]).committed_version == 3
+
+
+def test_script_curl_format(client: TestClient, tmp_path) -> None:
+    response = client.get("/api/demo/script", params={"format": "curl"})
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/x-shellscript")
+    text = response.text
+    assert text.startswith("#!/usr/bin/env bash\n")
+    assert "BASE=${BASE:-https://freshswitch.ssalhub.xyz/api}" in text
+    steps = client.get("/api/demo/script").json()
+    assert text.count("\ncall ") == len(steps)
+    assert "capture delay_event -c '.events[0]'" in text
+    assert '"event":\'"${delay_event}"\'}' in text
+    script = tmp_path / "demo.sh"
+    script.write_text(text)
+    if shutil.which("bash"):
+        result = subprocess.run(
+            ["bash", "-n", str(script)], check=False, capture_output=True, text=True
+        )
+        assert result.returncode == 0, result.stderr
