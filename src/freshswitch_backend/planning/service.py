@@ -1,6 +1,6 @@
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from pydantic import BaseModel, Field
 
@@ -77,24 +77,37 @@ def build_routes(
         if a.mode == "sea" and a.voyage_id:
             by_voyage[a.voyage_id].append(a.lot_id)
     order = {v.id: i for i, v in enumerate(scenario.voyages)}
-    pickups = []
-    for voyage_id, lot_ids in sorted(by_voyage.items(), key=lambda kv: order[kv[0]]):
+    cutoff = {v.id: v.cy_cutoff for v in scenario.voyages}
+    busy_until: dict[str, datetime] = {}
+    solved: dict[str, VoyagePickup] = {}
+    for voyage_id, lot_ids in sorted(
+        by_voyage.items(), key=lambda kv: (cutoff[kv[0]], order[kv[0]])
+    ):
         request = _pickup_request(effective, lot_ids, voyage_id)
+        request = request.model_copy(
+            update={
+                "trucks": [
+                    t.model_copy(update={"available_from": busy_until.get(t.id)})
+                    for t in request.trucks
+                ]
+            }
+        )
         pickup = solve_pickup(request, time_limit_s=time_limit_s)
+        for route in pickup.routes:
+            free = route.port_eta + timedelta(minutes=request.service_minutes)
+            busy_until[route.truck_id] = max(free, busy_until.get(route.truck_id, free))
         dropped = set(pickup.dropped_stop_ids)
         dropped_stops = {
             lid: stop.id for stop in request.stops if stop.id in dropped for lid in stop.lot_ids
         }
-        pickups.append(
-            VoyagePickup(
-                voyage_id=voyage_id,
-                lot_ids=lot_ids,
-                pickup=pickup,
-                dropped_lot_ids=list(dropped_stops),
-                dropped_stops=dropped_stops,
-            )
+        solved[voyage_id] = VoyagePickup(
+            voyage_id=voyage_id,
+            lot_ids=lot_ids,
+            pickup=pickup,
+            dropped_lot_ids=list(dropped_stops),
+            dropped_stops=dropped_stops,
         )
-    return pickups
+    return [solved[v] for v in sorted(solved, key=order.__getitem__)]
 
 
 def _largest_remainder(total: int, weights: list[float]) -> list[int]:
@@ -212,6 +225,21 @@ def solve_with_routes(
                 forbidden.append((lid, cid))
                 reasons[(lid, cid)] = CUTOFF_REASON
     still = _dropped(routes)
+    if still:
+        kept = {
+            a.lot_id: a.container_id if a.mode == "sea" else AIR
+            for a in plan.assignments
+            if a.lot_id not in still
+        }
+        for lid, (voyage_id, stop_id) in still.items():
+            dropped_at.setdefault(lid, (voyage_id, stop_id))
+            for c in scenario.containers:
+                forbidden.append((lid, c.id))
+                reasons[(lid, c.id)] = CUTOFF_REASON
+        plan = solve_plan(
+            scenario, fixed=kept, forbidden=forbidden, forbidden_reasons=reasons, **options
+        )
+        routes = build_routes(scenario, plan)
     lots = {lot.id: lot for lot in scenario.lots}
     reassigned = [
         CollectionReassignment(

@@ -230,6 +230,7 @@ class MofVesselClient:
             page += 1
 
 
+MAX_GAP_HOURS = 72.0
 _PREFIX = re.compile(r"^(M/?V|M\.V\.?)\s+")
 
 
@@ -253,18 +254,26 @@ def detect_schedule_changes(
     voyages: Iterable[PlannedVoyage | tuple[str, str, datetime]],
     movements: Sequence[VesselMovement],
     threshold_hours: float = 3.0,
+    max_gap_hours: float = MAX_GAP_HOURS,
 ) -> list[ScheduleChange]:
     by_name: dict[str, list[VesselMovement]] = {}
     for movement in movements:
         if movement.vessel_name and movement.observed_departure_at is not None:
             by_name.setdefault(normalize_vessel_name(movement.vessel_name), []).append(movement)
     changes: list[ScheduleChange] = []
-    for voyage in map(_as_voyage, voyages):
-        candidates = by_name.get(normalize_vessel_name(voyage.vessel_name))
+    taken: set[int] = set()
+    max_gap = timedelta(hours=max_gap_hours)
+    for voyage in sorted(map(_as_voyage, voyages), key=lambda v: _aware(v.etd)):
+        planned = _aware(voyage.etd)
+        candidates = [
+            m
+            for m in by_name.get(normalize_vessel_name(voyage.vessel_name), [])
+            if id(m) not in taken and abs(m.observed_departure_at - planned) <= max_gap
+        ]
         if not candidates:
             continue
-        planned = _aware(voyage.etd)
         best = min(candidates, key=lambda m: abs(m.observed_departure_at - planned))
+        taken.add(id(best))
         observed = best.observed_departure_at
         delta = (observed - planned).total_seconds() / 3600
         if abs(delta) >= threshold_hours:

@@ -8,7 +8,7 @@ from freshswitch_backend.execution.quality import (
     QualityError,
     QualitySettlement,
     adjusted_settlements,
-    arrival_settlement,
+    current_inspections,
 )
 from freshswitch_backend.planning.store import store
 
@@ -35,7 +35,7 @@ def read_settlement(plan_id: str) -> SettlementView:
         plan_id=plan_id,
         version=session.version,
         settlements=settlements,
-        inspections=session.arrival_inspections,
+        inspections=current_inspections(session.plan, session.arrival_inspections),
         total_fee_before_refund=sum(s.fee_before_refund for s in settlements),
         total_refund=sum(s.quality_refund for s in settlements),
         total_fee=sum(s.fee for s in settlements),
@@ -44,19 +44,9 @@ def read_settlement(plan_id: str) -> SettlementView:
 
 @router.post("/{plan_id}/settlement/arrival")
 def post_arrival(plan_id: str, body: ArrivalRequest) -> ArrivalSettlementResult:
-    session = store.get(plan_id)
-    if session is None:
+    if store.get(plan_id) is None:
         raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")
     try:
-        result, inspections = arrival_settlement(
-            plan_id,
-            session.scenario,
-            session.plan,
-            session.arrival_inspections,
-            body,
-            store.clock(),
-        )
+        return store.record_arrival(plan_id, body)
     except QualityError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    store.record_inspections(plan_id, inspections)
-    return result

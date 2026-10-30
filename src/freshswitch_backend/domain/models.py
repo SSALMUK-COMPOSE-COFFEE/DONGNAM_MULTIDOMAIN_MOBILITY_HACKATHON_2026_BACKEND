@@ -1,7 +1,18 @@
-from datetime import date, datetime
-from typing import Literal
+from datetime import date, datetime, timedelta, timezone
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field
+
+KST = timezone(timedelta(hours=9))
+
+
+def to_kst(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=KST)
+    return value.astimezone(KST)
+
+
+KstDatetime = Annotated[datetime, AfterValidator(to_kst)]
 
 
 class Sourced(BaseModel):
@@ -58,10 +69,10 @@ class Voyage(Sourced):
     terminal: str
     origin: str
     destination: str
-    etd: datetime
-    cy_cutoff: datetime
+    etd: KstDatetime
+    cy_cutoff: KstDatetime
     transit_days: float
-    original_etd: datetime | None = None
+    original_etd: KstDatetime | None = None
 
 
 class Container(Sourced):

@@ -1,10 +1,6 @@
-from datetime import timedelta, timezone
-
 from pydantic import BaseModel
 
 from freshswitch_backend.domain.models import Quantity
-
-KST = timezone(timedelta(hours=9))
 
 
 def _q(value: float, unit: str, source: str) -> Quantity:

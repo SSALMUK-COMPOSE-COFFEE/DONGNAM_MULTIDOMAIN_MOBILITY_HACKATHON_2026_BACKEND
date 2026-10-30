@@ -18,6 +18,7 @@ from freshswitch_backend.execution.models import (
     RequestResultBody,
 )
 from freshswitch_backend.integrations import (
+    MAX_GAP_HOURS,
     PlannedVoyage,
     ScheduleChange,
     VesselMovement,
@@ -62,6 +63,7 @@ class ApplyRequest(BaseModel):
 class ScheduleCheckRequest(BaseModel):
     movements: list[VesselMovement] | None = None
     threshold_hours: float = 3.0
+    max_gap_hours: float = Field(default=MAX_GAP_HOURS, gt=0)
 
 
 class ScheduleCheckResponse(BaseModel):
@@ -149,18 +151,22 @@ async def post_event(
 @router.post("/{plan_id}/apply")
 def apply_alternative(plan_id: str, body: ApplyRequest) -> PlanSession:
     _session(plan_id)
-    replayed = _replayed(plan_id, body.idempotency_key, "apply", body)
-    if replayed is not None:
-        return replayed
+    key = body.idempotency_key
     try:
-        session = store.apply(plan_id, body.alternative_id, body.replan_id)
+        return store.apply(
+            plan_id,
+            body.alternative_id,
+            body.replan_id,
+            idempotency=(key, _fingerprint(body)) if key is not None else None,
+        )
+    except IdempotencyMismatch as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except SessionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(
             status_code=404, detail="재최적화 결과 또는 대안을 찾을 수 없습니다"
         ) from exc
-    return _remember(plan_id, body.idempotency_key, "apply", body, session)
 
 
 @router.get("/{plan_id}/orders")
@@ -233,6 +239,7 @@ async def schedule_check(
         [PlannedVoyage(voyage_id=v.id, vessel_name=v.vessel_name, etd=v.etd) for v in voyages],
         movements,
         threshold_hours=body.threshold_hours,
+        max_gap_hours=body.max_gap_hours,
     )
     events = [
         DelayEvent(

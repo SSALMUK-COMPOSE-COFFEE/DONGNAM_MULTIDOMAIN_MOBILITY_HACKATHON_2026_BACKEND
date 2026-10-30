@@ -1,7 +1,7 @@
 from datetime import datetime, time
 from itertools import combinations
 
-from freshswitch_backend.domain.models import Product, Scenario
+from freshswitch_backend.domain.models import KST, Lot, Product, Scenario
 from freshswitch_backend.optimize.feasibility import products_compatible
 from freshswitch_backend.routing.models import Depot, PickupRequest, PickupStop, PickupTruck
 
@@ -27,6 +27,21 @@ def cargo_groups(products: list[Product]) -> tuple[dict[str, str], list[tuple[st
     return group_of, conflicts
 
 
+def _truckloads(group: list[Lot], max_cap: int) -> list[list[Lot]]:
+    if sum(lot.pallets for lot in group) <= max_cap or len(group) == 1:
+        return [group]
+    loads: list[list[Lot]] = []
+    for lot in sorted(group, key=lambda x: (-x.pallets, x.id)):
+        target = next(
+            (b for b in loads if sum(x.pallets for x in b) + lot.pallets <= max_cap), None
+        )
+        if target is None:
+            loads.append([lot])
+        else:
+            target.append(lot)
+    return loads
+
+
 def build_pickup_request(
     scenario: Scenario,
     lot_ids: list[str],
@@ -43,7 +58,6 @@ def build_pickup_request(
     lots = {lot.id: lot for lot in scenario.lots}
     shippers = {s.id: s for s in scenario.shippers}
     packhouses = {p.id: p for p in scenario.packhouses}
-    tz = voyage.cy_cutoff.tzinfo
     group_of, conflicts = cargo_groups(scenario.products)
 
     grouped: dict[tuple[str, str], list] = {}
@@ -55,31 +69,36 @@ def build_pickup_request(
         grouped.setdefault(key, []).append(lot)
     split = {ph for ph, _ in grouped if sum(1 for other, _ in grouped if other == ph) > 1}
 
-    stops = []
-    for (packhouse_id, group_id), group in grouped.items():
-        ph = packhouses[packhouse_id]
-        ready = max(datetime.combine(lot.ready_date, ready_time, tzinfo=tz) for lot in group)
-        stops.append(
-            PickupStop(
-                id=f"stop-{packhouse_id}-{group_id}"
-                if packhouse_id in split
-                else f"stop-{packhouse_id}",
-                packhouse_id=packhouse_id,
-                lat=ph.lat,
-                lon=ph.lon,
-                pallets=sum(lot.pallets for lot in group),
-                ready_at=ready,
-                lot_ids=[lot.id for lot in group],
-                cargo_group=group_id,
-            )
-        )
-
-    used = {stop.cargo_group for stop in stops}
     trucks = [
         PickupTruck(id=t.id, capacity_pallets=t.capacity_pallets)
         for t in scenario.trucks
         if t.depot_id == port.id
     ]
+    max_cap = max((t.capacity_pallets for t in trucks), default=0)
+
+    stops = []
+    for (packhouse_id, group_id), group in grouped.items():
+        ph = packhouses[packhouse_id]
+        base = (
+            f"stop-{packhouse_id}-{group_id}" if packhouse_id in split else f"stop-{packhouse_id}"
+        )
+        loads = _truckloads(group, max_cap)
+        for k, load in enumerate(loads, start=1):
+            ready = max(datetime.combine(lot.ready_date, ready_time, tzinfo=KST) for lot in load)
+            stops.append(
+                PickupStop(
+                    id=base if len(loads) == 1 else f"{base}-{k}",
+                    packhouse_id=packhouse_id,
+                    lat=ph.lat,
+                    lon=ph.lon,
+                    pallets=sum(lot.pallets for lot in load),
+                    ready_at=ready,
+                    lot_ids=[lot.id for lot in load],
+                    cargo_group=group_id,
+                )
+            )
+
+    used = {stop.cargo_group for stop in stops}
     return PickupRequest(
         depot=Depot(id=port.id, lat=port.lat, lon=port.lon),
         stops=stops,

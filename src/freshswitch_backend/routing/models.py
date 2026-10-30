@@ -23,6 +23,7 @@ class PickupStop(BaseModel):
 class PickupTruck(BaseModel):
     id: str
     capacity_pallets: int = Field(gt=0)
+    available_from: datetime | None = None
 
 
 class PickupRequest(BaseModel):

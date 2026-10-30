@@ -3,7 +3,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
-from freshswitch_backend.domain.models import Lot, Plan, Scenario
+from freshswitch_backend.domain.models import KST, Lot, Plan, Scenario
 from freshswitch_backend.execution.models import (
     AutomaticAction,
     ConfirmationReason,
@@ -13,7 +13,7 @@ from freshswitch_backend.execution.models import (
     OrderLogEntry,
     ShipperConfirmation,
 )
-from freshswitch_backend.execution.params import KST, ExecutionParams
+from freshswitch_backend.execution.params import ExecutionParams
 from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.planning.service import VoyagePickup
 from freshswitch_backend.replan.engine import locations
@@ -217,6 +217,13 @@ def build_order(
         if before != after:
             changed.append((cid, before, after))
     affected_voyages = {ctx.model_after.containers[cid].voyage_id for cid, _, _ in changed}
+    rescheduled = {
+        vid
+        for vid, v in voyages_after.items()
+        if vid in voyages_before
+        and (v.etd, v.cy_cutoff) != (voyages_before[vid].etd, voyages_before[vid].cy_cutoff)
+    }
+    affected_voyages |= rescheduled
     if isinstance(event, DelayEvent):
         affected_voyages.add(event.voyage_id)
     cutoffs = [voyages_after[v].cy_cutoff for v in affected_voyages if v in voyages_after]
@@ -365,12 +372,10 @@ def build_order(
                     ),
                     **common,
                 )
-    if isinstance(event, DelayEvent):
-        voyage = voyages_after.get(event.voyage_id)
-        old = voyages_before.get(event.voyage_id)
-        extra = CostModel.terminal_extra_days(voyage) if voyage else 0.0
-        before_extra = CostModel.terminal_extra_days(old) if old else 0.0
-        if voyage and extra > before_extra:
+    for voyage_id in sorted(rescheduled):
+        voyage = voyages_after[voyage_id]
+        extra = CostModel.terminal_extra_days(voyage)
+        if extra > CostModel.terminal_extra_days(voyages_before[voyage_id]):
             for load in alternative.plan.containers:
                 if load.voyage_id != voyage.id or not load.used:
                     continue

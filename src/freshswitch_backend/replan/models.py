@@ -1,9 +1,8 @@
-from datetime import datetime
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
-from freshswitch_backend.domain.models import Lot, Plan, Scenario
+from freshswitch_backend.domain.models import KstDatetime, Lot, Plan, Scenario
 from freshswitch_backend.explain.models import Explanation
 from freshswitch_backend.planning.service import VoyagePickup
 
@@ -27,8 +26,8 @@ class AirSwitchEvent(BaseModel):
 class DelayEvent(BaseModel):
     type: Literal["delay"] = "delay"
     voyage_id: str
-    new_etd: datetime
-    new_cy_cutoff: datetime | None = None
+    new_etd: KstDatetime
+    new_cy_cutoff: KstDatetime | None = None
     source: Literal["manual", "해수부"] = "manual"
 
 

@@ -17,11 +17,23 @@ from freshswitch_backend.execution.models import (
     RequestResultBody,
 )
 from freshswitch_backend.execution.orders import build_order
-from freshswitch_backend.execution.quality import ArrivalInspection
+from freshswitch_backend.execution.quality import (
+    ArrivalInspection,
+    ArrivalRequest,
+    ArrivalSettlementResult,
+    arrival_settlement,
+)
 from freshswitch_backend.explain.models import Explanation
 from freshswitch_backend.planning.service import VoyagePickup, build_plan
-from freshswitch_backend.replan import AirSwitchEvent, CancelEvent, Event, ReplanResult
-from freshswitch_backend.replan.models import AlternativeId
+from freshswitch_backend.replan import (
+    AirSwitchEvent,
+    Alternative,
+    CancelEvent,
+    Event,
+    ReplanResult,
+    diff_plans,
+)
+from freshswitch_backend.replan.models import AlternativeId, CancellationCharge
 
 MAX_SESSIONS = 200
 MAX_PENDING = 20
@@ -103,6 +115,31 @@ def _snapshot(session: PlanSession) -> _Snapshot:
     )
 
 
+def _cumulative(
+    committed: _Snapshot,
+    scenario_after: Scenario,
+    alternative: Alternative,
+    superseded: list[ExecutionOrder],
+) -> Alternative:
+    diff = diff_plans(scenario_after, committed.plan, alternative.plan)
+    charges: list[CancellationCharge] = [
+        o.cancellation for o in superseded if o.cancellation and o.cancellation.fee
+    ]
+    if alternative.diff.cancellation and alternative.diff.cancellation.fee:
+        charges.append(alternative.diff.cancellation)
+    adjustments: dict[str, int] = {}
+    for charge in charges:
+        payer = charge.payer_shipper_id
+        adjustments[payer] = adjustments.get(payer, 0) + charge.fee
+        for transfer in charge.transfers:
+            sid = transfer.shipper_id
+            adjustments[sid] = adjustments.get(sid, 0) - transfer.amount
+    for delta in diff.shippers:
+        delta.cancellation_adjustment = adjustments.get(delta.shipper_id, 0)
+    diff.cancellation = charges[-1] if charges else alternative.diff.cancellation
+    return alternative.model_copy(update={"diff": diff})
+
+
 class SessionStore:
     def __init__(self, max_sessions: int = MAX_SESSIONS) -> None:
         self._sessions: OrderedDict[str, PlanSession] = OrderedDict()
@@ -149,6 +186,8 @@ class SessionStore:
 
     def get(self, plan_id: str) -> PlanSession | None:
         with self._lock:
+            if plan_id in self._sessions:
+                self._expire_due(plan_id)
             return self._sessions.get(plan_id)
 
     def count(self) -> int:
@@ -198,9 +237,19 @@ class SessionStore:
                 queue.popitem(last=False)
         return pending
 
-    def apply(self, plan_id: str, alternative_id: str, replan_id: str | None = None) -> PlanSession:
+    def apply(
+        self,
+        plan_id: str,
+        alternative_id: str,
+        replan_id: str | None = None,
+        idempotency: tuple[str, str] | None = None,
+    ) -> PlanSession:
         with self._lock:
             session = self._sessions[plan_id]
+            if idempotency is not None:
+                replayed = self.idempotent(plan_id, idempotency[0], "apply", idempotency[1])
+                if replayed is not None:
+                    return replayed
             self._expire_due(plan_id)
             session = self._sessions[plan_id]
             queue = self._pending.get(plan_id) or OrderedDict()
@@ -234,27 +283,29 @@ class SessionStore:
                 locked.discard(event.lot_id)
             now = self.clock()
             orders = self._orders.setdefault(plan_id, OrderedDict())
-            for previous in orders.values():
-                if previous.status in ("proposed", "shipper_confirmed"):
-                    self._transition(
-                        previous,
-                        "expired",
-                        now,
-                        "system",
-                        "새 대안 적용으로 대체됨",
-                    )
-                    previous.expired_reason = "superseded"
+            superseded = [
+                o for o in orders.values() if o.status in ("proposed", "shipper_confirmed")
+            ]
+            for previous in superseded:
+                self._transition(previous, "expired", now, "system", "새 대안 적용으로 대체됨")
+                previous.expired_reason = "superseded"
+            committed = self._committed[plan_id]
+            before = session
+            ordered = alternative
+            if committed.version != session.version:
+                before = committed
+                ordered = _cumulative(committed, scenario, alternative, superseded)
             order = build_order(
                 plan_id=plan_id,
                 replan_id=pending.replan_id,
                 base_version=session.version,
                 target_version=session.version + 1,
-                rollback_version=self._committed[plan_id].version,
-                scenario_before=session.scenario,
-                plan_before=session.plan,
-                routes_before=session.routes,
+                rollback_version=committed.version,
+                scenario_before=before.scenario,
+                plan_before=before.plan,
+                routes_before=before.routes,
                 scenario_after=scenario,
-                alternative=alternative,
+                alternative=ordered,
                 event=event,
                 now=now,
             )
@@ -288,6 +339,8 @@ class SessionStore:
             orders[order.order_id] = order
             while len(orders) > MAX_ORDERS:
                 orders.popitem(last=False)
+            if idempotency is not None:
+                self.remember(plan_id, idempotency[0], "apply", idempotency[1], updated)
             return updated
 
     def orders(self, plan_id: str) -> list[ExecutionOrder]:
@@ -498,16 +551,20 @@ class SessionStore:
         self, plan_id: str, order_id: str, request_id: str, body: RequestResultBody
     ) -> ExecutionOrder:
         with self._lock:
+            self._expire_due(plan_id)
             order = self._orders[plan_id][order_id]
             request = next((r for r in order.requests if r.request_id == request_id), None)
             if request is None:
                 raise KeyError(request_id)
-            if order.status != "forwarder_confirmed":
-                if order.status == "executed" and request.status == "accepted" and body.accepted:
+            decision = "accepted" if body.accepted else "declined"
+            if request.status != "pending":
+                if request.status == decision:
                     return order
+                raise SessionConflict(f"이미 {request.status} 처리된 요청입니다")
+            if order.status != "forwarder_confirmed":
                 raise SessionConflict("포워더 확정 뒤에만 요청 회신을 기록할 수 있습니다")
             now = self.clock()
-            request.status = "accepted" if body.accepted else "declined"
+            request.status = decision
             request.note = body.note
             request.answered_at = now
             order.updated_at = now
@@ -527,12 +584,18 @@ class SessionStore:
             self._finish_if_done(plan_id, order, now)
             return order
 
-    def record_inspections(self, plan_id: str, inspections: list[ArrivalInspection]) -> None:
+    def record_arrival(self, plan_id: str, body: ArrivalRequest) -> ArrivalSettlementResult:
         with self._lock:
+            self._expire_due(plan_id)
             session = self._sessions[plan_id]
-            self._sessions[plan_id] = session.model_copy(
-                update={"arrival_inspections": inspections, "updated_at": self.clock()}
+            now = self.clock()
+            result, inspections = arrival_settlement(
+                plan_id, session.scenario, session.plan, session.arrival_inspections, body, now
             )
+            self._sessions[plan_id] = session.model_copy(
+                update={"arrival_inspections": inspections, "updated_at": now}
+            )
+            return result
 
 
 store = SessionStore()

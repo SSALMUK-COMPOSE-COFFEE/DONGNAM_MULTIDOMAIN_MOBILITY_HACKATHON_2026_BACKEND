@@ -147,9 +147,11 @@ def solve_pickup(request: PickupRequest, time_limit_s: float = 5.0) -> PickupPla
             index = manager.NodeToIndex(pos)
             time_dim.CumulVar(index).SetRange(*windows[node])
             routing.AddDisjunction([index], DROP_PENALTY)
+        truck_start = [_truck_start(t.available_from, start_min, to_min) for t in req.trucks]
         for v in range(vehicles):
-            time_dim.CumulVar(routing.Start(v)).SetRange(start_min, horizon)
-            time_dim.CumulVar(routing.End(v)).SetRange(start_min, horizon)
+            begin = min(truck_start[v % n_trucks], horizon)
+            time_dim.CumulVar(routing.Start(v)).SetRange(begin, horizon)
+            time_dim.CumulVar(routing.End(v)).SetRange(begin, horizon)
         for v in range(n_trucks, vehicles):
             routing.solver().Add(
                 time_dim.CumulVar(routing.End(v - n_trucks)) + req.service_minutes
@@ -216,7 +218,7 @@ def solve_pickup(request: PickupRequest, time_limit_s: float = 5.0) -> PickupPla
                         km,
                         travel,
                         service,
-                        start_min,
+                        truck_start[t],
                         deadline,
                         to_dt,
                     )
@@ -241,6 +243,12 @@ def solve_pickup(request: PickupRequest, time_limit_s: float = 5.0) -> PickupPla
         solve_ms=round((time.perf_counter() - started) * 1000),
         assumptions=_assumptions(req),
     )
+
+
+def _truck_start(available_from: datetime | None, start_min: int, to_min) -> int:
+    if available_from is None:
+        return start_min
+    return max(start_min, to_min(available_from))
 
 
 def _schedule(

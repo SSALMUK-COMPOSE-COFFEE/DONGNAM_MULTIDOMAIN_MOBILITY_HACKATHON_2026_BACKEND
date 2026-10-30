@@ -83,6 +83,13 @@ def planned_loss_rate(scenario: Scenario, plan: Plan, lot_id: str) -> tuple[floa
     return loss / value, round(value), assignment.mode, lot.pallets
 
 
+def current_inspections(
+    plan: Plan, inspections: list[ArrivalInspection]
+) -> list[ArrivalInspection]:
+    assigned = {(a.lot_id, a.shipper_id) for a in plan.assignments}
+    return [i for i in inspections if (i.lot_id, i.shipper_id) in assigned]
+
+
 def _refund(fee: int, inspections: list[ArrivalInspection], shipper_id: str) -> tuple[int, int]:
     excess = sum(i.excess_loss_value for i in inspections if i.shipper_id == shipper_id)
     return min(max(fee, 0), excess), excess
@@ -104,6 +111,7 @@ def adjusted(settlement: Settlement, refund: int) -> QualitySettlement:
 def adjusted_settlements(
     plan: Plan, inspections: list[ArrivalInspection]
 ) -> list[QualitySettlement]:
+    inspections = current_inspections(plan, inspections)
     return [adjusted(s, _refund(s.fee, inspections, s.shipper_id)[0]) for s in plan.settlements]
 
 
@@ -134,8 +142,12 @@ def arrival_settlement(
     )
     previous = [i for i in inspections if i.lot_id != body.lot_id]
     updated = [*previous, record]
-    refund_before, _ = _refund(settlement.fee, inspections, lot.shipper_id)
-    refund_after, excess_total = _refund(settlement.fee, updated, lot.shipper_id)
+    refund_before, _ = _refund(
+        settlement.fee, current_inspections(plan, inspections), lot.shipper_id
+    )
+    refund_after, excess_total = _refund(
+        settlement.fee, current_inspections(plan, updated), lot.shipper_id
+    )
     total_before = sum(s.fee for s in adjusted_settlements(plan, inspections))
     total_after = sum(s.fee for s in adjusted_settlements(plan, updated))
     result = ArrivalSettlementResult(

@@ -4,7 +4,7 @@ from collections.abc import Callable, Iterable
 from freshswitch_backend.domain.models import Plan, Scenario
 from freshswitch_backend.optimize import AIR
 from freshswitch_backend.optimize.costs import CostModel
-from freshswitch_backend.optimize.feasibility import sea_option
+from freshswitch_backend.optimize.feasibility import air_rejection, sea_option
 from freshswitch_backend.planning.service import PlanWithRoutes, solve_with_routes
 from freshswitch_backend.replan.models import (
     AddLotEvent,
@@ -57,7 +57,10 @@ def apply_event(scenario: Scenario, event: Event) -> Scenario:
                     ]
                 }
             )
-        case AirSwitchEvent():
+        case AirSwitchEvent(lot_id=lot_id):
+            reason = air_rejection(CostModel(scenario), lots[lot_id])
+            if reason:
+                raise ReplanError(f"항공 전환 불가: {lot_id} {reason}")
             return scenario
         case DelayEvent(voyage_id=voyage_id, new_etd=new_etd, new_cy_cutoff=new_cutoff):
             voyage = next((v for v in scenario.voyages if v.id == voyage_id), None)
