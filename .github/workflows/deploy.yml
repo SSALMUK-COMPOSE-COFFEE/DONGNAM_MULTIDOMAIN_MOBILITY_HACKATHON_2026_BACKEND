@@ -13,11 +13,14 @@ jobs:
   deploy:
     runs-on: [self-hosted, freshswitch-backend]
     timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: /srv/freshswitch/backend
     steps:
-      - uses: actions/checkout@v4
-
-      - name: env
-        run: install -m 600 "$HOME/deploy-env/freshswitch-backend.env" .env
+      - name: checkout
+        run: |
+          git fetch --depth 1 origin "$GITHUB_SHA"
+          git checkout --force --detach "$GITHUB_SHA"
 
       - name: build and up
         run: docker compose up -d --build --remove-orphans
