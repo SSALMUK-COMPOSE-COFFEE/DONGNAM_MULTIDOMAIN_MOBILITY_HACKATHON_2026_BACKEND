@@ -1,0 +1,39 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, freshswitch-backend]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: env
+        run: install -m 600 "$HOME/deploy-env/freshswitch-backend.env" .env
+
+      - name: build and up
+        run: docker compose up -d --build --remove-orphans
+
+      - name: health
+        run: |
+          port=$(sed -n 's/^HOST_PORT=//p' .env)
+          for _ in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:${port:-18103}/api/health"; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose logs --tail 100 api
+          exit 1
+
+      - name: prune
+        if: always()
+        run: docker image prune -f
