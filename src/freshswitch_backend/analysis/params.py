@@ -21,6 +21,7 @@ class ParamSpec:
     source: str
     affects_plan: bool = True
     extra_fields: tuple[str, ...] = ()
+    tariff_fields: tuple[str, ...] = ()
 
 
 SPECS: tuple[ParamSpec, ...] = (
@@ -32,7 +33,9 @@ SPECS: tuple[ParamSpec, ...] = (
         per_product=True,
         low_factor=0.01 / 0.015,
         high_factor=0.02 / 0.015,
-        source="JLST 6권 2호(2025.6) 단전 없음 1~2%(모의) 범위 양 끝. 포도 등 다른 품목도 같은 배율",
+        source="JLST 6권 2호(2025.6) 단전 없음 1~2%(모의) 범위 양 끝. 포도 등 다른 품목도 같은 배율. "
+        "딸기 정산표 해상 품질손실 위험도 같은 배율",
+        tariff_fields=("sea_loss_risk", "sea_loss_risk_short_window"),
     ),
     ParamSpec(
         key="loss_rate_per_wait_day",
@@ -62,7 +65,9 @@ SPECS: tuple[ParamSpec, ...] = (
         per_product=False,
         low_factor=0.7,
         high_factor=1.3,
-        source="가정 ±30%. 기준 450만 원은 제안서 파렛트당 절감 24.9만 원에 맞춘 보정값",
+        source="가정 ±30%. 기준 450만 원은 제안서 파렛트당 절감 24.9만 원에 맞춘 보정값. "
+        "딸기 정산표 해상 내륙·장비·보관도 같은 배율",
+        tariff_fields=("sea_inland",),
     ),
     ParamSpec(
         key="sea_freight_per_container_krw",
@@ -72,7 +77,9 @@ SPECS: tuple[ParamSpec, ...] = (
         per_product=False,
         low_factor=0.2 * AIR_PALLET_FREIGHT_2026_04_BEFORE * 20 / 4_560_000,
         high_factor=0.3 * AIR_PALLET_FREIGHT_2026_04_BEFORE * 20 / 4_560_000,
-        source="원예원 CA 해상 물류비 = 항공의 20~30%(이데일리 2024.5, 콜드체인뉴스) × 항공 89.3만 원 × 20파렛트",
+        source="원예원 CA 해상 물류비 = 항공의 20~30%(이데일리 2024.5, 콜드체인뉴스) × 항공 89.3만 원 × 20파렛트. "
+        "딸기 정산표 해상 운임도 같은 배율",
+        tariff_fields=("sea_freight",),
     ),
     ParamSpec(
         key="air_freight_per_kg_krw",
@@ -144,4 +151,7 @@ def scaled(scenario: Scenario, spec: ParamSpec, factor: float) -> Scenario:
     copy = scenario.model_copy(deep=True)
     for quantity in _quantities(copy, spec):
         quantity.value = quantity.value * factor
+    for tariff in copy.cost_params.pallet_tariffs.values():
+        for name in spec.tariff_fields:
+            getattr(tariff, name).value *= factor
     return copy

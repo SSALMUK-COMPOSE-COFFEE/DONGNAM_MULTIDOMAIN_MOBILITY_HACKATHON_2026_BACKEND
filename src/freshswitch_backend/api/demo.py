@@ -168,9 +168,53 @@ _STEPS: list[dict[str, Any]] = [
         "checks": [
             {"path": ".version", "value": 1},
             {"path": ".status", "value": "committed"},
-            {"path": ".plan.total_savings", "value": 9987059},
+            {"path": ".plan.total_savings", "value": 10318577},
+            {"path": ".plan.container_settlements[0].container_id", "value": "CA-01"},
+            {"path": ".plan.container_settlements[0].pallets", "value": 17},
+            {"path": ".plan.container_settlements[0].total_savings", "value": 4233000},
         ],
-        "expect": "201, 절감 9,987,059원. plan_id를 이후 단계 {plan_id}에 넣는다",
+        "expect": "201, 절감 10,318,577원(딸기 정산표 423.3만 + 포도 608.6만). "
+        "plan_id를 이후 단계 {plan_id}에 넣는다",
+    },
+    {
+        "id": "settlement_ca01",
+        "title": "CA-01 화주별 정산표",
+        "description": "딸기 1파렛트 정산표(항공 96.9만 / 해상 72.0만 원, 절감 24.9만 원)로 CA-01 화주별 "
+        "절감·성과보수 25%·화주 몫 75%를 낸다. 해상 내륙·장비·보관과 품질손실 위험은 가정 표시",
+        "method": "GET",
+        "path": "/api/plans/{plan_id}/settlement",
+        "checks": [
+            {"path": ".tariffs[0].air_total", "value": 969000},
+            {"path": ".tariffs[0].sea_total", "value": 720000},
+            {"path": ".tariffs[0].savings_per_pallet", "value": 249000},
+            {"path": ".containers[0].shippers[0].savings", "value": 1992000},
+            {"path": ".containers[0].shippers[1].fee", "value": 311250},
+            {"path": ".containers[0].shippers[2].shipper_gain", "value": 747000},
+            {"path": ".containers[0].total_fee", "value": 1058250},
+            {"path": ".containers[0].total_shipper_gain", "value": 3174750},
+            {"path": ".assumed_items", "op": "contains", "value": "strawberry.sea.inland"},
+        ],
+        "expect": "진주 8·산청 5·밀양 4 = 17파렛트, 절감 199.2·124.5·99.6만 원(계 423.3만), "
+        "성과보수 49.8·31.1·24.9만 원(계 105.8만), 화주 몫 계 317.5만 원",
+    },
+    {
+        "id": "air_switch_short_window",
+        "title": "판매 기간 짧은 화주 → 항공",
+        "description": "산청 로트의 판매 기간이 짧아지면 해상 품질손실 위험을 119.1만 원으로 잡는다. "
+        "해상 179.2만 원 > 항공 96.9만 원이라 엔진이 산청을 항공으로 돌린다(미리보기, 적용 안 함)",
+        "method": "POST",
+        "path": "/api/plans/{plan_id}/events?llm=false",
+        "body": {"event": {"type": "air_switch", "lot_id": "lot-sancheong-sb-1"}},
+        "checks": [
+            {"path": ".recommended_id", "value": "pull_forward"},
+            {"path": ".alternatives[0].plan.assignments[1].lot_id", "value": "lot-sancheong-sb-1"},
+            {"path": ".alternatives[0].plan.assignments[1].mode", "value": "air"},
+            {
+                "path": ".alternatives[0].plan.settlement_tariffs[0].sea_total_short_window",
+                "value": 1792000,
+            },
+        ],
+        "expect": "산청 해상 179.2만 > 항공 96.9만 → 산청 항공, 빈자리에 밀양 2차 당겨 싣기",
     },
     {
         "id": "reduce_sancheong",
@@ -216,13 +260,14 @@ _STEPS: list[dict[str, Any]] = [
     {
         "id": "orders_pull_forward",
         "title": "실행 지시 확인",
-        "description": "확인할 화주(진주·밀양), 자동 조치, 포워더가 선사·터미널·항공사에 보낼 요청 문장",
+        "description": "확인할 화주(밀양. 진주는 정산표 단가라 비용 변화 없음), 자동 조치, "
+        "포워더가 선사·터미널·항공사에 보낼 요청 문장",
         "method": "GET",
         "path": "/api/plans/{plan_id}/orders",
         "capture": [{"name": "order_id", "path": ".[-1].order_id"}],
         "checks": [
             {"path": ".[-1].status", "value": "proposed"},
-            {"path": ".[-1].shipper_confirmations", "op": "len", "value": 2},
+            {"path": ".[-1].shipper_confirmations", "op": "len", "value": 1},
             {"path": ".[-1].requests[0].kind", "value": "booking_amendment"},
             {"path": ".[-1].requests[0].text", "op": "contains", "value": "[부킹 변경 요청]"},
             {"path": ".[-1].requests[1].kind", "value": "cy_entry"},
@@ -231,7 +276,6 @@ _STEPS: list[dict[str, Any]] = [
         ],
         "expect": "requests: 부킹 변경(선사)·CY 반입(터미널)·항공 취소(항공사). order_id를 이후 {order_id}에",
     },
-    _confirm_shipper("confirm_jinju", "sh-jinju", "진주", "order_id", "proposed", "감축"),
     _confirm_shipper(
         "confirm_miryang", "sh-miryang", "밀양", "order_id", "shipper_confirmed", "감축"
     ),
@@ -262,11 +306,11 @@ _STEPS: list[dict[str, Any]] = [
             {"path": ".cases[1].air_freight_per_pallet", "value": 1552515},
             {"path": ".cases[1].switches", "op": "len", "value": 3},
             {"path": ".cases[1].switches[0].direction", "value": "air_to_sea"},
-            {"path": ".cases[1].savings_delta", "value": 26501000},
-            {"path": ".thresholds[1].surcharge_per_kg", "value": 1158},
+            {"path": ".cases[1].savings_delta", "value": 31274400},
+            {"path": ".thresholds[1].surcharge_per_kg", "value": 1046},
         ],
-        "expect": "2,060원에서 항공→해상 3로트 9파렛트, CA-03 9/20, 총 절감 +26,501,000원. "
-        "배정이 바뀌는 할증료 약 1,158원/kg",
+        "expect": "2,060원에서 항공→해상 3로트 9파렛트, CA-03 9/20, 총 절감 +31,274,400원. "
+        "배정이 바뀌는 할증료 약 1,046원/kg",
     },
     {
         "id": "coldchain_bind",
@@ -428,9 +472,9 @@ _STEPS: list[dict[str, Any]] = [
         "checks": [
             {"path": ".sea.in_plan", "value": True},
             {"path": ".cheaper", "value": "sea"},
-            {"path": ".sea_savings", "value": 164164},
+            {"path": ".sea_savings", "value": 55799},
         ],
-        "expect": "cheaper sea, 해상이 164,164원 싸다",
+        "expect": "cheaper sea, 해상이 55,799원 싸다(하루 당김·지연 하루 손실 반영)",
     },
     {
         "id": "ulsan_congestion",
@@ -473,12 +517,13 @@ _STEPS: list[dict[str, Any]] = [
         "checks": [
             {"path": ".methods[0].method", "value": "optimizer"},
             {"path": ".methods[0].containers_used", "value": 2},
-            {"path": ".methods[0].total_savings", "value": 9987059},
+            {"path": ".methods[0].total_operational_savings", "value": 9987059},
             {"path": ".methods[1].method", "value": "fcfs"},
             {"path": ".methods[1].containers_used", "value": 3},
-            {"path": ".methods[1].total_savings", "value": 2154542},
+            {"path": ".methods[1].total_operational_savings", "value": 2154542},
         ],
-        "expect": "최적화 컨테이너 2대·절감 9,987,059원 vs 선착순 3대·2,154,542원",
+        "expect": "운영비 기준 최적화 컨테이너 2대·절감 9,987,059원 vs 선착순 3대·2,154,542원 "
+        "(정산표 기준 절감은 빈 컨테이너 비용을 반영하지 않아 비교에 쓰지 않는다)",
     },
     {
         "id": "business_matrix",
@@ -496,7 +541,8 @@ _STEPS: list[dict[str, Any]] = [
     {
         "id": "arrival_settlement",
         "title": "도착 검수 품질 사후정산",
-        "description": "산청 로트 홍콩 도착 검수 손실률이 계획 가정(지연 반영 4.2%)을 넘으면 "
+        "description": "산청 로트 홍콩 도착 검수 손실률이 계획 가정(정산표 1.59% + 지연 하루 0.9%p "
+        "= 2.49%)을 넘으면 "
         "넘은 손실액만큼 성과보수를 환급한다",
         "method": "POST",
         "path": "/api/plans/{plan_id}/settlement/arrival",
@@ -506,12 +552,14 @@ _STEPS: list[dict[str, Any]] = [
             "note": "홍콩 도착 검수",
         },
         "checks": [
-            {"path": ".planned_loss_rate", "value": 0.042},
+            {"path": ".planned_loss_rate", "value": 0.02493},
             {"path": ".refund_after", "op": "gt", "value": 0},
-            {"path": ".capped", "value": False},
-            {"path": ".platform_net_change", "op": "gt", "value": -200000},
+            {"path": ".capped", "value": True},
+            {"path": ".refund_after", "value": 132974},
+            {"path": ".uncovered_loss", "value": 316795},
         ],
-        "expect": "계획 4.2% 대비 0.3%p 초과 손실만큼 산청 성과보수 환급(한도 안)",
+        "expect": "계획 2.49% 대비 2.01%p 초과 손실 449,769원 중 산청 성과보수 전액 "
+        "132,974원 환급(한도), 나머지 316,795원은 적하보험 영역",
     },
     {
         "id": "arrival_poor_jinju",
@@ -567,13 +615,13 @@ _STEPS: list[dict[str, Any]] = [
         "method": "GET",
         "path": "/api/quality/impact",
         "checks": [
-            {"path": ".total_savings_prior", "value": 9987059},
-            {"path": ".total_savings_learned", "value": 7969315},
+            {"path": ".total_savings_prior", "value": 10318577},
+            {"path": ".total_savings_learned", "value": 8300833},
             {"path": ".shippers[0].savings_change", "value": -949527},
             {"path": ".shippers[3].savings_change", "value": 0},
             {"path": ".lot_shifts", "op": "len", "value": 0},
         ],
-        "expect": "총 절감 998.7만 → 796.9만 원, 진주 −94.9만 원, 포도 화주 그대로, 배정 변화 없음",
+        "expect": "총 절감 1,031.9만 → 830.1만 원, 진주 −94.9만 원, 포도 화주 그대로, 배정 변화 없음",
     },
     {
         "id": "quality_observation_manual",

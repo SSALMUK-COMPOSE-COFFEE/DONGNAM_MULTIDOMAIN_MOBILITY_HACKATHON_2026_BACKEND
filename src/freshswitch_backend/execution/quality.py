@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 
 from freshswitch_backend.domain.models import Plan, Scenario, Settlement
 from freshswitch_backend.optimize.costs import CostModel
+from freshswitch_backend.optimize.settlement import lot_settle_cost
 
 RULE = (
     "실제 손실률이 계획 손실 가정을 넘으면 넘은 손실액만큼 그 화주의 성과보수에서 뺀다(하한 0). "
@@ -75,11 +76,8 @@ def planned_loss_rate(scenario: Scenario, plan: Plan, lot_id: str) -> tuple[floa
     if lot is None or assignment is None:
         raise QualityError(f"계획에 실린 로트가 아닙니다: {lot_id}")
     value = model.lot_value(lot)
-    if assignment.mode == "sea":
-        voyage = model.voyage_of(model.containers[assignment.container_id])
-        loss = model.sea_lot_cost(lot, voyage, assignment.pull_forward_days).loss_risk
-    else:
-        loss = model.air_lot_cost(lot).loss_risk
+    loads = {c.container_id: c.pallets for c in plan.containers}
+    loss = lot_settle_cost(model, lot, assignment, loads).loss_risk
     return loss / value, round(value), assignment.mode, lot.pallets
 
 
@@ -97,10 +95,7 @@ def _refund(fee: int, inspections: list[ArrivalInspection], shipper_id: str) -> 
 
 def adjusted(settlement: Settlement, refund: int) -> QualitySettlement:
     return QualitySettlement(
-        shipper_id=settlement.shipper_id,
-        baseline_cost=settlement.baseline_cost,
-        shared_cost=settlement.shared_cost,
-        savings=settlement.savings,
+        **settlement.model_dump(exclude={"fee", "shipper_gain"}),
         fee=settlement.fee - refund,
         shipper_gain=settlement.shipper_gain + refund,
         fee_before_refund=settlement.fee,
@@ -129,6 +124,7 @@ def arrival_settlement(
     if settlement is None:
         raise QualityError(f"정산 내역이 없는 화주입니다: {lot.shipper_id}")
     inspected = body.inspected_loss_pct / 100
+    rate = round(rate, 6)
     excess_rate = max(0.0, inspected - rate)
     excess_value = round(value * excess_rate)
     record = ArrivalInspection(

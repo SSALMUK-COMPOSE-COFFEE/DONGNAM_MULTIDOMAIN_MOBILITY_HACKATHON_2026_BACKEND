@@ -13,6 +13,7 @@ from freshswitch_backend.optimize.feasibility import (
     sea_option,
 )
 from freshswitch_backend.optimize.settlement import (
+    SettlementResult,
     container_loads,
     shipper_costs_and_settlements,
 )
@@ -90,6 +91,7 @@ def solve_plan(
         objective.append(fixed_cost[container.id] * z[container.id])
 
     variable_cost: dict[tuple[str, str], int] = {}
+    tariff_margin: dict[tuple[str, str], int] = {}
     air_cost: dict[str, int] = {}
     n = len(lots)
     container_index = {c.id: i for i, c in enumerate(containers)}
@@ -102,6 +104,9 @@ def solve_plan(
             voyage = model.voyage_of(model.containers[cid])
             cost = round(model.sea_lot_cost(lot, voyage, option.pull_forward_days).total)
             variable_cost[lot.id, cid] = cost
+            if model.tariff(lot) is not None:
+                sea = model.tariff_sea_cost(lot, voyage, option.pull_forward_days).total
+                tariff_margin[lot.id, cid] = round(model.tariff_air_cost(lot).total - sea)
             objective.append(cost * var)
             tie_break.append(container_index[cid] * (n - l_idx) * var)
             cp.add_implication(var, z[cid])
@@ -141,9 +146,12 @@ def solve_plan(
             for b in product_ids[i + 1 :]:
                 if not products_compatible(model.products[a], model.products[b]):
                     cp.add(has[a] + has[b] <= 1)
+        for lot, var in members:
+            if lot.id not in fixed and tariff_margin.get((lot.id, cid), 1) <= 0:
+                cp.add(var == 0)
         if require_savings:
             for lot, var in members:
-                if lot.id in fixed:
+                if lot.id in fixed or (lot.id, cid) in tariff_margin:
                     continue
                 margin = air_cost[lot.id] - variable_cost[lot.id, cid]
                 if margin <= 0:
@@ -239,7 +247,7 @@ def _build_plan(
     objective: int,
     started: float,
 ) -> Plan:
-    costs, settlements = shipper_costs_and_settlements(model, lot_by_id, assignments)
+    result = shipper_costs_and_settlements(model, lot_by_id, assignments)
     return Plan(
         scenario_id=scenario.id,
         status=status,
@@ -248,14 +256,26 @@ def _build_plan(
         assignments=assignments,
         unassigned=unassigned,
         containers=container_loads(model, assignments),
-        shipper_costs=costs,
-        settlements=settlements,
-        total_baseline_cost=sum(s.baseline_cost for s in settlements),
-        total_shared_cost=sum(s.shared_cost for s in settlements),
-        total_savings=sum(s.savings for s in settlements),
-        total_fee=sum(s.fee for s in settlements),
-        total_collection_estimate=sum(c.plan.collection for c in costs),
+        **_settlement_fields(result),
     )
+
+
+def _settlement_fields(result: SettlementResult) -> dict:
+    settlements = result.settlements
+    return {
+        "shipper_costs": result.costs,
+        "settlements": settlements,
+        "total_baseline_cost": sum(s.baseline_cost for s in settlements),
+        "total_shared_cost": sum(s.shared_cost for s in settlements),
+        "total_savings": sum(s.savings for s in settlements),
+        "total_fee": sum(s.fee for s in settlements),
+        "total_operational_baseline_cost": result.operational_baseline,
+        "total_operational_cost": result.operational_cost,
+        "total_operational_savings": result.operational_baseline - result.operational_cost,
+        "container_settlements": result.containers,
+        "settlement_tariffs": result.tariffs,
+        "total_collection_estimate": result.collection_estimate,
+    }
 
 
 def resettle_plan(
@@ -263,20 +283,12 @@ def resettle_plan(
 ) -> Plan:
     model = CostModel(scenario)
     lot_by_id = {lot.id: lot for lot in scenario.lots}
-    costs, settlements = shipper_costs_and_settlements(
-        model, lot_by_id, plan.assignments, route_collection
-    )
+    result = shipper_costs_and_settlements(model, lot_by_id, plan.assignments, route_collection)
     return plan.model_copy(
         update={
-            "shipper_costs": costs,
-            "settlements": settlements,
-            "total_baseline_cost": sum(s.baseline_cost for s in settlements),
-            "total_shared_cost": sum(s.shared_cost for s in settlements),
-            "total_savings": sum(s.savings for s in settlements),
-            "total_fee": sum(s.fee for s in settlements),
+            **_settlement_fields(result),
             "collection_basis": "route",
-            "total_collection_estimate": sum(c.plan.collection_estimate or 0 for c in costs),
-            "total_collection_route": sum(c.plan.collection for c in costs),
+            "total_collection_route": result.collection_route,
             **updates,
         }
     )

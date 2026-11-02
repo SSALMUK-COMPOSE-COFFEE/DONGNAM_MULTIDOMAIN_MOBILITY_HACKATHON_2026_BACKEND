@@ -7,7 +7,7 @@ from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.quality import quality_history
 from freshswitch_backend.quality.learning import with_adjustments
 
-DEFAULT_SAVINGS = 9987059
+DEFAULT_SAVINGS = 10318577
 
 
 @pytest.fixture(autouse=True)

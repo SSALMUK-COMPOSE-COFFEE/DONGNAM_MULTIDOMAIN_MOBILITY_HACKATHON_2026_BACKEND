@@ -26,12 +26,13 @@ from freshswitch_backend.execution.quality import (
 from freshswitch_backend.explain.models import Explanation
 from freshswitch_backend.planning.service import VoyagePickup, build_plan
 from freshswitch_backend.replan import (
-    AirSwitchEvent,
     Alternative,
     CancelEvent,
     Event,
     ReplanResult,
     diff_plans,
+    locks_air,
+    plan_score,
 )
 from freshswitch_backend.replan.models import AlternativeId, CancellationCharge
 
@@ -277,7 +278,7 @@ class SessionStore:
             event = pending.result.event
             scenario = pending.result.scenario_after
             locked = set(session.air_locked_lot_ids)
-            if isinstance(event, AirSwitchEvent):
+            if locks_air(scenario, event):
                 locked.add(event.lot_id)
             if isinstance(event, CancelEvent):
                 locked.discard(event.lot_id)
@@ -315,7 +316,7 @@ class SessionStore:
                 event=event,
                 alternative_id=alternative.id,
                 applied_at=now,
-                cost_before=session.plan.total_shared_cost,
+                cost_before=plan_score(session.plan),
                 cost_after=alternative.total_cost,
                 cost_delta=alternative.cost_delta,
                 solve_ms=pending.result.solve_ms,
@@ -401,9 +402,9 @@ class SessionStore:
             event=order.event,
             alternative_id=order.alternative_id,
             applied_at=now,
-            cost_before=session.plan.total_shared_cost,
-            cost_after=snapshot.plan.total_shared_cost,
-            cost_delta=snapshot.plan.total_shared_cost - session.plan.total_shared_cost,
+            cost_before=plan_score(session.plan),
+            cost_after=plan_score(snapshot.plan),
+            cost_delta=plan_score(snapshot.plan) - plan_score(session.plan),
             solve_ms=0,
             kind="rollback",
             order_id=order.order_id,

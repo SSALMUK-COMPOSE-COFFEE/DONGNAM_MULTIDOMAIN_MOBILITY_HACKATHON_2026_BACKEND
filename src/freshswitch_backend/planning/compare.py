@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from freshswitch_backend.domain.models import Assignment, CostBreakdown, Plan, Scenario
 from freshswitch_backend.optimize.costs import CostModel, LotCost
 from freshswitch_backend.optimize.feasibility import air_rejection, products_compatible, sea_option
-from freshswitch_backend.optimize.settlement import lot_plan_cost
+from freshswitch_backend.optimize.settlement import lot_plan_cost, lot_settle_cost
 
 MAX_PULL_FORWARD_DAYS = 2
 
@@ -44,6 +44,7 @@ class AirSeaComparison(BaseModel):
 def breakdown(cost: LotCost) -> CostBreakdown:
     parts = {
         "freight": round(cost.freight),
+        "inland": round(cost.inland),
         "handling": round(cost.handling),
         "collection": round(cost.collection),
         "storage": round(cost.storage),
@@ -63,7 +64,7 @@ def _sea_quote(model: CostModel, plan: Plan, lot_id: str) -> SeaQuote:
     assigned = next((a for a in plan.assignments if a.lot_id == lot_id), None)
     if assigned is not None and assigned.mode == "sea":
         routed = next((c.route for c in plan.lot_collections if c.lot_id == lot_id), None)
-        cost = lot_plan_cost(model, lot, assigned, loads, routed)
+        cost = lot_settle_cost(model, lot, assigned, loads, routed)
         return SeaQuote(
             feasible=True,
             in_plan=True,
@@ -75,6 +76,7 @@ def _sea_quote(model: CostModel, plan: Plan, lot_id: str) -> SeaQuote:
         )
     products = {c.container_id: c.product_ids for c in plan.containers}
     best: SeaQuote | None = None
+    best_operational = 0.0
     reasons: list[str] = []
     for container in model.scenario.containers:
         option, reason = sea_option(model, lot, container, MAX_PULL_FORWARD_DAYS)
@@ -103,8 +105,11 @@ def _sea_quote(model: CostModel, plan: Plan, lot_id: str) -> SeaQuote:
             voyage_id=container.voyage_id,
             pull_forward_days=option.pull_forward_days,
         )
-        cost = breakdown(lot_plan_cost(model, lot, hypothetical, {container.id: load}))
-        if best is None or cost.total < best.cost.total:
+        loads_after = {container.id: load}
+        operational = lot_plan_cost(model, lot, hypothetical, loads_after).total
+        cost = breakdown(lot_settle_cost(model, lot, hypothetical, loads_after))
+        if best is None or operational < best_operational:
+            best_operational = operational
             best = SeaQuote(
                 feasible=True,
                 in_plan=False,
@@ -128,7 +133,7 @@ def compare_air_sea(scenario: Scenario, plan: Plan, lot_id: str) -> AirSeaCompar
     sea = _sea_quote(model, plan, lot_id)
     air_reason = air_rejection(model, lot)
     air = AirQuote(
-        feasible=air_reason is None, cost=breakdown(model.air_lot_cost(lot)), reason=air_reason
+        feasible=air_reason is None, cost=breakdown(model.settle_air_cost(lot)), reason=air_reason
     )
     options = []
     if sea.feasible and sea.cost is not None:

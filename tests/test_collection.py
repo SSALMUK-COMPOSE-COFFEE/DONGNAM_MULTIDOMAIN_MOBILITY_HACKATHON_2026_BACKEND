@@ -60,16 +60,23 @@ def test_settlement_uses_route_cost_and_exposes_estimate(built: PlanWithRoutes) 
         by_shipper[c.shipper_id] = by_shipper.get(c.shipper_id, 0) + c.route
     sea_only = {"sh-jinju", "sh-sancheong", "sh-sangju", "sh-pohang"}
     for cost in plan.shipper_costs:
-        b = cost.plan
-        assert b.collection == b.collection_route
+        b = cost.operational
+        assert b.collection == b.collection_route == cost.plan.collection_route
         assert b.collection_estimate is not None
         assert b.total == b.freight + b.handling + b.collection + b.storage + b.loss_risk
         if cost.shipper_id in sea_only:
             assert b.collection == by_shipper[cost.shipper_id]
-    assert plan.total_collection_route == sum(c.plan.collection for c in plan.shipper_costs)
+    assert plan.total_collection_route == sum(c.operational.collection for c in plan.shipper_costs)
     assert plan.total_collection_estimate == sum(
-        c.plan.collection_estimate for c in plan.shipper_costs
+        c.operational.collection_estimate for c in plan.shipper_costs
     )
+    grape = {"sh-sangju", "sh-pohang"}
+    for cost in plan.shipper_costs:
+        if cost.shipper_id in grape:
+            assert cost.plan.total == cost.operational.total
+        else:
+            assert cost.plan.collection == 0
+    assert plan.total_operational_cost == sum(c.operational.total for c in plan.shipper_costs)
     for s in plan.settlements:
         assert s.savings == s.baseline_cost - s.shared_cost
         assert s.fee + s.shipper_gain == s.savings

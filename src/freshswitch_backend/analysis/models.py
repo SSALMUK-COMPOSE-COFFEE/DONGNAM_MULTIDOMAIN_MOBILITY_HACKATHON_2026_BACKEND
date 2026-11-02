@@ -117,6 +117,9 @@ class MethodResult(BaseModel):
     total_shipper_cost: int
     total_savings: int
     total_fee: int
+    total_operational_baseline_cost: int = 0
+    total_operational_cost: int = 0
+    total_operational_savings: int = 0
     collection_basis: Literal["route"] = "route"
     total_collection_estimate: int = 0
     total_collection_route: int = 0

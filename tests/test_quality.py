@@ -27,8 +27,9 @@ def test_no_refund_within_planned_loss(client: TestClient) -> None:
 
 def test_partial_refund_below_cap(client: TestClient) -> None:
     plan_id = _plan(client)
-    result = _arrival(client, plan_id, 3.8)
-    excess = round(result["lot_value"] * (0.038 - result["planned_loss_rate"]))
+    result = _arrival(client, plan_id, 2.4)
+    assert result["planned_loss_rate"] == 0.01593
+    excess = round(result["lot_value"] * (0.024 - result["planned_loss_rate"]))
     assert abs(result["excess_loss_value"] - excess) <= 1
     assert result["refund_after"] == result["excess_loss_value"] < result["refund_cap"]
     assert result["capped"] is False
@@ -54,7 +55,7 @@ def test_refund_capped_at_fee(client: TestClient) -> None:
 def test_reinspection_replaces_and_shipper_cap_is_shared(client: TestClient) -> None:
     plan_id = _plan(client)
     first = _arrival(client, plan_id, 20, "lot-miryang-sb-1")
-    second = _arrival(client, plan_id, 3.0, "lot-miryang-sb-1")
+    second = _arrival(client, plan_id, 2.0, "lot-miryang-sb-1")
     assert second["refund_before"] == first["refund_after"]
     assert second["refund_after"] < second["refund_before"]
     view = client.get(f"/api/plans/{plan_id}/settlement").json()

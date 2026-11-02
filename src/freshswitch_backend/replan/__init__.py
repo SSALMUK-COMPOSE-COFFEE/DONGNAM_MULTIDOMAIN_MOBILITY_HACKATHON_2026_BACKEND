@@ -1,4 +1,11 @@
-from freshswitch_backend.replan.engine import apply_event, diff_plans, locations, replan
+from freshswitch_backend.replan.engine import (
+    apply_event,
+    diff_plans,
+    locations,
+    locks_air,
+    plan_score,
+    replan,
+)
 from freshswitch_backend.replan.models import (
     AddLotEvent,
     AirSwitchEvent,
@@ -24,5 +31,7 @@ __all__ = [
     "apply_event",
     "diff_plans",
     "locations",
+    "locks_air",
+    "plan_score",
     "replan",
 ]

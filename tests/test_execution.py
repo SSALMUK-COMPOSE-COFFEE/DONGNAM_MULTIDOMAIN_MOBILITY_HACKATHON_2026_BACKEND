@@ -69,12 +69,12 @@ def test_apply_creates_order_with_split_actions(client: TestClient) -> None:
     assert session["active_order_id"] == order["order_id"]
     assert order["status"] == "proposed"
     confirmations = {c["shipper_id"]: c for c in order["shipper_confirmations"]}
-    assert set(confirmations) == {"sh-jinju", "sh-miryang"}
+    assert set(confirmations) == {"sh-miryang"}
     assert "pull_forward" in confirmations["sh-miryang"]["reasons"]
     assert "mode_change" in confirmations["sh-miryang"]["reasons"]
     assert confirmations["sh-miryang"]["pull_forward_days"] == 1
-    assert confirmations["sh-jinju"]["reasons"] == ["cost_increase"]
     assert "sh-sancheong" in order["notified_shipper_ids"]
+    assert "sh-jinju" not in order["notified_shipper_ids"]
     kinds = {a["kind"] for a in order["automatic"]}
     assert kinds == {"slot_reassignment", "truck_dispatch", "settlement_recompute"}
     requests = {r["kind"]: r for r in order["requests"]}
@@ -107,10 +107,8 @@ def test_sail_as_is_requests_and_fee_confirmation(client: TestClient) -> None:
     confirmations = {c["shipper_id"]: c for c in order["shipper_confirmations"]}
     assert confirmations["sh-sancheong"]["reasons"] == ["cancellation_fee"]
     assert confirmations["sh-sancheong"]["cancellation_adjustment"] == order["cancellation"]["fee"]
-    jinju = confirmations["sh-jinju"]
-    assert "cost_increase" in jinju["reasons"]
-    assert jinju["net_cost_delta"] == jinju["cost_delta"] + jinju["cancellation_adjustment"]
-    assert "sh-miryang" not in confirmations
+    assert set(confirmations) == {"sh-sancheong"}
+    assert {"sh-jinju", "sh-miryang"} <= set(order["notified_shipper_ids"])
     assert "sh-miryang" in order["notified_shipper_ids"]
     amendment = next(r for r in order["requests"] if r["kind"] == "booking_amendment")
     assert amendment["pallets_before"] == 17 and amendment["pallets_after"] == 15
@@ -124,14 +122,18 @@ def test_status_flow_to_executed(client: TestClient) -> None:
     order_id = _order(client, plan_id)["order_id"]
     early = _confirm(client, plan_id, order_id, actor="forwarder", accept=True)
     assert early.status_code == 409
-    first = _confirm(client, plan_id, order_id, actor="shipper", shipper_id="sh-jinju", accept=True)
-    assert first.json()["status"] == "proposed"
-    again = _confirm(client, plan_id, order_id, actor="shipper", shipper_id="sh-jinju", accept=True)
-    assert again.status_code == 200 and again.json()["status"] == "proposed"
-    second = _confirm(
+    outsider = _confirm(
+        client, plan_id, order_id, actor="shipper", shipper_id="sh-jinju", accept=True
+    )
+    assert outsider.status_code == 422
+    first = _confirm(
         client, plan_id, order_id, actor="shipper", shipper_id="sh-miryang", accept=True
     )
-    assert second.json()["status"] == "shipper_confirmed"
+    assert first.json()["status"] == "shipper_confirmed"
+    again = _confirm(
+        client, plan_id, order_id, actor="shipper", shipper_id="sh-miryang", accept=True
+    )
+    assert again.status_code == 200 and again.json()["status"] == "shipper_confirmed"
     assert client.get(f"/api/plans/{plan_id}").json()["status"] == "pending_confirmation"
     done = _confirm(client, plan_id, order_id, actor="forwarder", accept=True, note="부킹 반영")
     body = done.json()
@@ -236,7 +238,7 @@ def test_deadline_expiry_rolls_back(client: TestClient) -> None:
     session = client.get(f"/api/plans/{plan_id}").json()
     assert session["history"][-1]["kind"] == "rollback"
     response = _confirm(
-        client, plan_id, order["order_id"], actor="shipper", shipper_id="sh-jinju", accept=True
+        client, plan_id, order["order_id"], actor="shipper", shipper_id="sh-miryang", accept=True
     )
     assert response.status_code == 409
 

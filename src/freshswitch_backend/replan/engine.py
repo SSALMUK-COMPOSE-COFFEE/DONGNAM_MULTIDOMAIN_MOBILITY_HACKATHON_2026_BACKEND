@@ -58,10 +58,20 @@ def apply_event(scenario: Scenario, event: Event) -> Scenario:
                 }
             )
         case AirSwitchEvent(lot_id=lot_id):
-            reason = air_rejection(CostModel(scenario), lots[lot_id])
+            model = CostModel(scenario)
+            reason = air_rejection(model, lots[lot_id])
             if reason:
                 raise ReplanError(f"항공 전환 불가: {lot_id} {reason}")
-            return scenario
+            if model.tariff(lots[lot_id]) is None:
+                return scenario
+            return scenario.model_copy(
+                update={
+                    "lots": [
+                        lot.model_copy(update={"sell_window": "short"}) if lot.id == lot_id else lot
+                        for lot in scenario.lots
+                    ]
+                }
+            )
         case DelayEvent(voyage_id=voyage_id, new_etd=new_etd, new_cy_cutoff=new_cutoff):
             voyage = next((v for v in scenario.voyages if v.id == voyage_id), None)
             if voyage is None:
@@ -90,6 +100,17 @@ def apply_event(scenario: Scenario, event: Event) -> Scenario:
                 raise ReplanError(f"품목을 찾을 수 없음: {lot.product_id}")
             return scenario.model_copy(update={"lots": [*scenario.lots, lot]})
     raise ReplanError(f"알 수 없는 이벤트: {event}")
+
+
+def locks_air(scenario: Scenario, event: Event) -> bool:
+    if not isinstance(event, AirSwitchEvent):
+        return False
+    lot = next((x for x in scenario.lots if x.id == event.lot_id), None)
+    return lot is not None and CostModel(scenario).tariff(lot) is None
+
+
+def plan_score(plan: Plan) -> int:
+    return plan.total_operational_cost
 
 
 def locations(plan: Plan) -> dict[str, str]:
@@ -135,8 +156,11 @@ class _Context:
         self.voyage_of = {c.id: c.voyage_id for c in after.containers}
         self.etd = {v.id: v.etd for v in after.voyages}
         self.air_locked = set(air_locked) & set(self.lot_ids)
-        if isinstance(event, AirSwitchEvent):
+        self.rule_switched: set[str] = set()
+        if locks_air(after, event):
             self.air_locked.add(event.lot_id)
+        elif isinstance(event, AirSwitchEvent):
+            self.rule_switched.add(event.lot_id)
         self.touched_lots = self._touched_lots()
         self.touched_containers = self._touched_containers()
 
@@ -189,10 +213,6 @@ class _Context:
 
     def new_unassigned(self, plan: Plan) -> list[str]:
         return [u.lot_id for u in plan.unassigned if self.where.get(u.lot_id) != UNASSIGNED]
-
-
-def _score(plan: Plan) -> int:
-    return plan.total_shared_cost
 
 
 def _timed(fn: Callable[[], PlanWithRoutes]) -> tuple[PlanWithRoutes, int]:
@@ -325,7 +345,9 @@ def _moved_for_next_voyage(ctx: _Context) -> tuple[set[str], set[str]]:
     moved = {
         lid
         for lid in ctx.lot_ids
-        if ctx.where.get(lid) in ctx.touched_containers and lid not in ctx.air_locked
+        if ctx.where.get(lid) in ctx.touched_containers
+        and lid not in ctx.air_locked
+        and lid not in ctx.rule_switched
     }
     if isinstance(ctx.event, ReduceEvent):
         moved.add(ctx.event.lot_id)
@@ -370,8 +392,8 @@ def _alternative(
         summary=_describe(ctx, diff),
         feasible=not reasons,
         infeasible_reasons=reasons,
-        total_cost=_score(plan),
-        cost_delta=_score(plan) - _score(ctx.current),
+        total_cost=plan_score(plan),
+        cost_delta=plan_score(plan) - plan_score(ctx.current),
         plan=plan,
         routes=built.routes,
         diff=diff,
@@ -453,7 +475,9 @@ def replan(
 
     remaining = set(ctx.lot_ids)
     as_is_fixed = {
-        lid: loc for lid, loc in ctx.where.items() if lid in remaining and loc != UNASSIGNED
+        lid: loc
+        for lid, loc in ctx.where.items()
+        if lid in remaining and loc != UNASSIGNED and lid not in ctx.rule_switched
     }
     as_is_fixed.update({lid: AIR for lid in ctx.air_locked})
     as_is_forbidden = []

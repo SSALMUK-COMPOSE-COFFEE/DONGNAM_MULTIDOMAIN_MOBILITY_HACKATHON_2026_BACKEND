@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -13,6 +14,7 @@ class IntakeRequest(BaseModel):
     shipper: str = Field(min_length=1)
     destination: str = Field(min_length=1)
     sell_by_date: date | None = None
+    sell_window: Literal["normal", "short"] = "normal"
     scenario_id: str = "default"
     plan_id: str | None = None
     lot_id: str | None = None

@@ -31,7 +31,7 @@ def test_surcharge_split_reproduces_previous_air_rate():
     assert CostModel(scenario).air_rate_per_kg == 2151
     assert "유류할증료" in params.air_fuel_surcharge_per_kg_krw.source
     plan = build_plan(scenario).plan
-    assert plan.total_savings == 9_987_059
+    assert plan.total_savings == 10_318_577
 
 
 def test_with_surcharge_does_not_mutate(shock_scenario):

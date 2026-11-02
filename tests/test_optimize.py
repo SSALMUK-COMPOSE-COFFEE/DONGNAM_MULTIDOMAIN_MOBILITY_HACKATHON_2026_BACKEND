@@ -56,15 +56,23 @@ def test_default_plan_sends_late_miryang_lot_by_air(default_plan: Plan) -> None:
 
 
 def test_default_plan_costs_add_up(default_plan: Plan) -> None:
+    parts = ("freight", "inland", "handling", "collection", "storage", "loss_risk")
     for cost in default_plan.shipper_costs:
-        parts = cost.plan.model_dump(
-            include={"freight", "handling", "collection", "storage", "loss_risk"}
-        )
-        assert sum(parts.values()) == cost.plan.total
+        for breakdown in (cost.plan, cost.baseline, cost.operational):
+            assert sum(breakdown.model_dump(include=set(parts)).values()) == breakdown.total
     ca01 = _container(default_plan, "CA-01")
     jinju = next(c for c in default_plan.shipper_costs if c.shipper_id == "sh-jinju")
-    share = jinju.plan.freight + jinju.plan.handling
+    share = jinju.operational.freight + jinju.operational.handling
     assert share == pytest.approx(ca01.container_cost * 8 / 17, abs=2)
+    assert jinju.plan.model_dump(include=set(parts)) == {
+        "freight": 8 * 166_000,
+        "inland": 8 * 435_000,
+        "handling": 0,
+        "collection": 0,
+        "storage": 0,
+        "loss_risk": 8 * 119_000,
+    }
+    assert jinju.baseline.total == 8 * 969_000
 
 
 def test_every_shipper_saves_and_fee_is_quarter(default_plan: Plan) -> None:

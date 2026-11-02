@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from freshswitch_backend.domain.models import ContainerSettlement, TariffSheet
 from freshswitch_backend.execution.quality import (
     ArrivalInspection,
     ArrivalRequest,
@@ -24,6 +25,10 @@ class SettlementView(BaseModel):
     total_fee_before_refund: int
     total_refund: int
     total_fee: int
+    total_savings: int
+    containers: list[ContainerSettlement]
+    tariffs: list[TariffSheet]
+    assumed_items: list[str]
 
 
 @router.get("/{plan_id}/settlement")
@@ -40,6 +45,16 @@ def read_settlement(plan_id: str) -> SettlementView:
         total_fee_before_refund=sum(s.fee_before_refund for s in settlements),
         total_refund=sum(s.quality_refund for s in settlements),
         total_fee=sum(s.fee for s in settlements),
+        total_savings=sum(s.savings for s in settlements),
+        containers=session.plan.container_settlements,
+        tariffs=session.plan.settlement_tariffs,
+        assumed_items=sorted(
+            {
+                f"{t.product_id}.{item}"
+                for t in session.plan.settlement_tariffs
+                for item in t.assumed_items
+            }
+        ),
     )
 
 

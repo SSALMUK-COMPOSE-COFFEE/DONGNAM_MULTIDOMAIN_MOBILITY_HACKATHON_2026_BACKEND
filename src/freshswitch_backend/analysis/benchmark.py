@@ -131,8 +131,8 @@ def greedy_plan(scenario: Scenario) -> Plan:
             trial = solve(scenario, fixed={**loader.placed, lot.id: option}, exclude_lot_ids=later)
             if trial.unassigned:
                 continue
-            if best is None or trial.total_shared_cost < best[0]:
-                best = (trial.total_shared_cost, option)
+            if best is None or trial.total_operational_cost < best[0]:
+                best = (trial.total_operational_cost, option)
         loader.place(lot, best[1] if best else None)
     return loader.plan()
 
@@ -226,6 +226,9 @@ def _result(method: str, parts: list[Part], elapsed_ms: int) -> MethodResult:
         total_shipper_cost=sum(p.total_shared_cost for _, p, _ in parts),
         total_savings=sum(p.total_savings for _, p, _ in parts),
         total_fee=sum(p.total_fee for _, p, _ in parts),
+        total_operational_baseline_cost=sum(p.total_operational_baseline_cost for _, p, _ in parts),
+        total_operational_cost=sum(p.total_operational_cost for _, p, _ in parts),
+        total_operational_savings=sum(p.total_operational_savings for _, p, _ in parts),
         total_collection_estimate=sum(p.total_collection_estimate or 0 for _, p, _ in parts),
         total_collection_route=sum(p.total_collection_route or 0 for _, p, _ in parts),
         shippers_with_loss=sum(1 for s in settlements if s.savings < 0),

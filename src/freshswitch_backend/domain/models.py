@@ -68,6 +68,7 @@ class Lot(Sourced):
     ready_date: date
     destination: str
     sell_by_date: date
+    sell_window: Literal["normal", "short"] = "normal"
 
 
 class Voyage(Sourced):
@@ -133,6 +134,17 @@ class LossAdjustment(BaseModel):
     source: str = "도착 검수 학습"
 
 
+class PalletTariff(BaseModel):
+    air_freight: Quantity
+    air_inland: Quantity
+    air_loss_risk: Quantity
+    sea_freight: Quantity
+    sea_inland: Quantity
+    sea_loss_risk: Quantity
+    sea_loss_risk_short_window: Quantity
+    air_rate_basis_per_kg: Quantity
+
+
 class CostParams(BaseModel):
     sea_freight_per_container_krw: Quantity = _q(4_560_000, "원/컨테이너")
     sea_ancillary_per_container_krw: Quantity = _q(4_500_000, "원/컨테이너")
@@ -152,6 +164,7 @@ class CostParams(BaseModel):
     product_costs: dict[str, ProductCostParams] = Field(default_factory=dict)
     default_product_cost: ProductCostParams = Field(default_factory=_default_product_cost)
     loss_adjustments: list[LossAdjustment] = Field(default_factory=list)
+    pallet_tariffs: dict[str, PalletTariff] = Field(default_factory=dict)
 
     def for_product(self, product_id: str) -> ProductCostParams:
         return self.product_costs.get(product_id, self.default_product_cost)
@@ -223,6 +236,7 @@ class ContainerLoad(BaseModel):
 
 class CostBreakdown(BaseModel):
     freight: int = 0
+    inland: int = 0
     handling: int = 0
     collection: int = 0
     storage: int = 0
@@ -239,6 +253,11 @@ class ShipperCost(BaseModel):
     air_pallets: int
     plan: CostBreakdown
     baseline: CostBreakdown
+    operational: CostBreakdown | None = None
+    operational_baseline: CostBreakdown | None = None
+
+
+SettlementBasis = Literal["tariff", "operational", "mixed"]
 
 
 class Settlement(BaseModel):
@@ -248,6 +267,58 @@ class Settlement(BaseModel):
     savings: int
     fee: int
     shipper_gain: int
+    sea_pallets: int = 0
+    air_pallets: int = 0
+    basis: SettlementBasis = "operational"
+
+
+class ContainerShipperSettlement(BaseModel):
+    shipper_id: str
+    pallets: int
+    baseline_cost: int
+    shared_cost: int
+    savings: int
+    fee: int
+    shipper_gain: int
+    basis: SettlementBasis
+
+
+class ContainerSettlement(BaseModel):
+    container_id: str
+    voyage_id: str
+    pallets: int
+    capacity_pallets: int
+    shippers: list[ContainerShipperSettlement]
+    total_savings: int
+    total_fee: int
+    total_shipper_gain: int
+
+
+class TariffLine(BaseModel):
+    key: Literal["freight", "inland", "loss_risk"]
+    label: str
+    air: int
+    sea: int
+    air_assumed: bool
+    sea_assumed: bool
+    air_source: str
+    sea_source: str
+
+
+class TariffSheet(BaseModel):
+    product_id: str
+    unit: str = "원/파렛트"
+    lines: list[TariffLine]
+    air_total: int
+    sea_total: int
+    savings_per_pallet: int
+    fee_rate: float
+    fee_per_pallet: int
+    shipper_share_per_pallet: int
+    sea_loss_risk_short_window: int
+    sea_total_short_window: int
+    short_window_rule: str
+    assumed_items: list[str]
 
 
 CollectionBasis = Literal["estimate", "route"]
@@ -288,6 +359,11 @@ class Plan(BaseModel):
     total_shared_cost: int
     total_savings: int
     total_fee: int
+    total_operational_baseline_cost: int = 0
+    total_operational_cost: int = 0
+    total_operational_savings: int = 0
+    container_settlements: list[ContainerSettlement] = Field(default_factory=list)
+    settlement_tariffs: list[TariffSheet] = Field(default_factory=list)
     collection_basis: CollectionBasis = "estimate"
     total_collection_estimate: int = 0
     total_collection_route: int | None = None

@@ -106,12 +106,14 @@ def test_create_event_apply_history(client: TestClient) -> None:
     assert history[0]["cost_delta"] < 0
 
 
-def test_air_switch_then_followup_keeps_lock(client: TestClient) -> None:
+def test_air_switch_then_followup_keeps_short_window(client: TestClient) -> None:
     plan_id = _create(client)["plan_id"]
     event = {"type": "air_switch", "lot_id": "lot-sancheong-sb-1"}
     client.post(f"/api/plans/{plan_id}/events", json={"event": event})
     applied = client.post(f"/api/plans/{plan_id}/apply", json={"alternative_id": "pull_forward"})
-    assert applied.json()["air_locked_lot_ids"] == ["lot-sancheong-sb-1"]
+    assert applied.json()["air_locked_lot_ids"] == []
+    lots = client.get(f"/api/plans/{plan_id}").json()["scenario"]["lots"]
+    assert next(x for x in lots if x["id"] == "lot-sancheong-sb-1")["sell_window"] == "short"
     follow = client.post(
         f"/api/plans/{plan_id}/events",
         json={"event": {"type": "reduce", "lot_id": "lot-jinju-sb-1", "new_pallets": 6}},

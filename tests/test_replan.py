@@ -156,7 +156,7 @@ def test_delay_keeps_cy_cutoff_and_charges_terminal_dwell(scenario: Scenario, pl
     jinju_before = next(c for c in plan.shipper_costs if c.shipper_id == "sh-jinju").plan
     jinju_after = next(c for c in as_is.plan.shipper_costs if c.shipper_id == "sh-jinju").plan
     plug_share = 50_000 * 8 / 17
-    assert jinju_after.storage - jinju_before.storage == pytest.approx(8 * 3000 + plug_share, abs=1)
+    assert jinju_after.inland - jinju_before.inland == pytest.approx(8 * 3000 + plug_share, abs=1)
     assert jinju_after.loss_risk > jinju_before.loss_risk
 
 

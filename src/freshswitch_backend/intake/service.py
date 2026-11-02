@@ -13,6 +13,7 @@ from freshswitch_backend.intake.models import (
 )
 from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.optimize.feasibility import air_rejection, products_compatible, sea_option
+from freshswitch_backend.optimize.settlement import tariff_sheet
 from freshswitch_backend.replan.models import AddLotEvent
 
 MAX_PULL_FORWARD_DAYS = 2
@@ -159,6 +160,7 @@ def preview_lot(scenario: Scenario, body: IntakeRequest, plan: Plan | None = Non
         ready_date=body.ready_date,
         destination=resolved.destination_port_id,
         sell_by_date=sell_by,
+        sell_window=body.sell_window,
         source="화주 간편 등록",
     )
     hints = _hints(scenario, lot, plan)
@@ -231,6 +233,15 @@ def _hints(scenario: Scenario, lot: Lot, plan: Plan | None) -> FeasibilityHints:
         warnings.append(
             "지금 계획에서 실을 수 있는 컨테이너가 없습니다. 항공 또는 새 컨테이너가 필요합니다"
         )
+    tariff = model.tariff(lot)
+    if tariff is not None and lot.sell_window == "short":
+        sea = tariff_sheet(model, lot.product_id, tariff)
+        if sea.sea_total_short_window >= sea.air_total:
+            warnings.append(
+                f"판매 기간이 짧아 해상 품질손실 위험을 {sea.sea_loss_risk_short_window:,}원/파렛트로 "
+                f"잡습니다. 해상 {sea.sea_total_short_window:,}원 > 항공 {sea.air_total:,}원이라 "
+                "항공으로 배정됩니다"
+            )
     air_reason = air_rejection(model, lot)
     return FeasibilityHints(
         based_on="plan" if plan is not None else "scenario",

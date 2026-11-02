@@ -118,8 +118,9 @@ def test_manual_baselines_not_better_than_optimizer(bench):
     for name in ("fcfs", "greedy", "solo"):
         other = methods[name]
         assert other.total_baseline_cost == best.total_baseline_cost
-        assert best.total_shipper_cost <= other.total_shipper_cost
-        assert best.total_savings >= other.total_savings
+        assert other.total_operational_baseline_cost == best.total_operational_baseline_cost
+        assert best.total_operational_cost <= other.total_operational_cost
+        assert best.total_operational_savings >= other.total_operational_savings
         assert other.constraint_violations == 0
         assert other.collection_basis == "route"
 
