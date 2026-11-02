@@ -98,8 +98,7 @@ def _resolve(scenario: Scenario, body: IntakeRequest) -> tuple[Resolved | None, 
     )
 
 
-def _lot_id(scenario: Scenario, resolved: Resolved) -> str:
-    taken = {lot.id for lot in scenario.lots}
+def _lot_id(taken: set[str], resolved: Resolved) -> str:
     short = resolved.shipper_id.removeprefix("sh-")
     n = 1
     while f"lot-{short}-{resolved.product_id}-{n}" in taken:
@@ -119,7 +118,21 @@ def _loads(plan: Plan | None) -> tuple[dict[str, int], dict[str, set[str]]]:
     return pallets, products
 
 
-def preview_lot(scenario: Scenario, body: IntakeRequest, plan: Plan | None = None) -> IntakePreview:
+def resolve_names(scenario: Scenario, body: IntakeRequest) -> Resolved:
+    resolved, errors = _resolve(scenario, body)
+    if errors or resolved is None:
+        raise IntakeError(errors)
+    return resolved
+
+
+def preview_lot(
+    scenario: Scenario,
+    body: IntakeRequest,
+    plan: Plan | None = None,
+    taken_ids: set[str] | None = None,
+    reserved_ids: set[str] | None = None,
+) -> IntakePreview:
+    taken = {lot.id for lot in scenario.lots} | (taken_ids or set())
     resolved, errors = _resolve(scenario, body)
     max_capacity = max((c.capacity_pallets for c in scenario.containers), default=20)
     if body.pallets <= 0:
@@ -131,7 +144,7 @@ def preview_lot(scenario: Scenario, body: IntakeRequest, plan: Plan | None = Non
                 message=f"컨테이너 1대 용량({max_capacity}파렛트)을 넘습니다. 나눠서 등록하세요",
             )
         )
-    if body.lot_id and any(lot.id == body.lot_id for lot in scenario.lots):
+    if body.lot_id and body.lot_id in taken:
         errors.append(FieldError(field="lot_id", message=f"이미 있는 로트 ID입니다: {body.lot_id}"))
     if body.sell_by_date and body.sell_by_date < body.ready_date:
         errors.append(
@@ -149,7 +162,7 @@ def preview_lot(scenario: Scenario, body: IntakeRequest, plan: Plan | None = Non
             f"sell_by_date = 출하 가능일 + {product.name} 신선 유지 기간 "
             f"{product.shelf_life_days}일 = {sell_by.isoformat()} (출처: {product.source})"
         )
-    lot_id = body.lot_id or _lot_id(scenario, resolved)
+    lot_id = body.lot_id or _lot_id(taken | (reserved_ids or set()), resolved)
     if body.lot_id is None:
         defaults.append(f"lot_id 자동 생성: {lot_id}")
     lot = Lot(

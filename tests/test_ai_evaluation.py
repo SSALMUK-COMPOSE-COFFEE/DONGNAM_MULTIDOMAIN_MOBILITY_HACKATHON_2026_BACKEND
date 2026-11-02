@@ -5,13 +5,22 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import func, select
 
 from freshswitch_backend.api import computation, plans
 from freshswitch_backend.config import Settings
 from freshswitch_backend.evaluation import forecast_backtest, plan_checks
 from freshswitch_backend.forecast.history import DepartureRecord
+from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.tables import PendingRow
 from freshswitch_backend.planning.budget import PlanningTimeout
 from freshswitch_backend.planning.store import store
+
+
+def pending_count(plan_id):
+    with database.begin() as db:
+        query = select(func.count()).select_from(PendingRow).where(PendingRow.plan_id == plan_id)
+        return db.scalar(query)
 
 
 def history():
@@ -107,7 +116,7 @@ def test_expired_request_never_starts_worker():
 def test_timeout_does_not_register_partial_plan(client, monkeypatch):
     session = client.post("/api/plans", json={"scenario_id": "default"}).json()
     plan_id = session["plan_id"]
-    pending_before = len(store._pending[plan_id])
+    pending_before = pending_count(plan_id)
 
     def expired(*args, **kwargs):
         raise PlanningTimeout()
@@ -118,7 +127,7 @@ def test_timeout_does_not_register_partial_plan(client, monkeypatch):
         json={"event": {"type": "reduce", "lot_id": "lot-sancheong-sb-1", "new_pallets": 3}},
     )
     assert response.status_code == 503
-    assert len(store._pending[plan_id]) == pending_before
+    assert pending_count(plan_id) == pending_before
     assert client.get(f"/api/plans/{plan_id}").json()["plan"] == session["plan"]
 
 

@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.concurrency import run_in_threadpool
 
 from freshswitch_backend.data.loader import get_scenario
@@ -49,6 +49,20 @@ def add_observation(body: ObservationIn) -> Observation:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+@router.get("/observations/{obs_id}")
+def read_observation(obs_id: str) -> Observation:
+    observation = quality_history.get(obs_id)
+    if observation is None:
+        raise HTTPException(status_code=404, detail="관측을 찾을 수 없습니다")
+    return observation
+
+
+@router.delete("/observations/{obs_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_observation(obs_id: str) -> None:
+    if not quality_history.delete(obs_id):
+        raise HTTPException(status_code=404, detail="관측을 찾을 수 없습니다")
+
+
 @router.post("/reset")
 def reset(seed: Annotated[bool, Query()] = True) -> ResetResult:
     cleared, seeded = quality_history.reset(seed=seed)
@@ -58,6 +72,6 @@ def reset(seed: Annotated[bool, Query()] = True) -> ResetResult:
 @router.get("/impact")
 async def impact(scenario_id: Annotated[str, Query()] = "default") -> ImpactResult:
     scenario = _scenario(scenario_id)
-    table = learned_table(scenario)
+    table = await run_in_threadpool(learned_table, scenario)
     cells = [c for c in table.cells if c.observations]
     return await run_in_threadpool(learning_impact, scenario, table.adjustments, cells)

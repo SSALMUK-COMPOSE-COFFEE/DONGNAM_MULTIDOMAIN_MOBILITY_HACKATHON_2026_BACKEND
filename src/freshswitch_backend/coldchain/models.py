@@ -211,6 +211,7 @@ class TwinState(BaseModel):
     actions: list[ColdchainAction]
     alerts: list[Alert]
     params: dict[str, Quantity]
+    has_data: bool = True
 
 
 class IngestRejected(BaseModel):
@@ -269,6 +270,7 @@ class SimulationRun(BaseModel):
     start: datetime
     end: datetime
     state: TwinSummary | None = None
+    error: str | None = None
 
 
 class SettlementPreviewLot(BaseModel):

@@ -8,6 +8,7 @@ from freshswitch_backend.api import (
     forecast,
     health,
     intake,
+    lots,
     plans,
     provenance,
     quality,
@@ -26,6 +27,7 @@ api_router.include_router(compare.router)
 api_router.include_router(demo.router)
 api_router.include_router(analysis.router)
 api_router.include_router(intake.router)
+api_router.include_router(lots.router)
 api_router.include_router(settlement.router)
 api_router.include_router(coldchain.router)
 api_router.include_router(quality.router)

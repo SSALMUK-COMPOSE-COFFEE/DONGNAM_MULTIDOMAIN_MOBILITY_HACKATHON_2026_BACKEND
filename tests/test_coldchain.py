@@ -180,7 +180,20 @@ def test_bad_plan_or_container(client: TestClient) -> None:
         json={"device_id": "a", "container_id": "CA-99", "plan_id": plan_id},
     )
     assert wrong.status_code == 422
-    assert client.get("/api/coldchain/containers/CA-77").status_code == 404
+    empty = client.get("/api/coldchain/containers/CA-77")
+    assert empty.status_code == 200
+    twin = empty.json()
+    assert twin["has_data"] is False
+    assert twin["reading_count"] == 0
+    assert twin["timeline"] == []
+    assert twin["loss"]["delta_krw"] is None
+    assert twin["status"] == "no_data"
+    assert client.get("/api/coldchain/containers").json() == []
+    with_plan = client.get("/api/coldchain/containers/CA-01", params={"plan_id": plan_id}).json()
+    assert with_plan["has_data"] is False
+    assert with_plan["plan_id"] == plan_id
+    assert with_plan["loss"]["delta_krw"] == 0
+    assert with_plan["outage"]["cumulative_minutes"] == 0
 
 
 def test_actions_are_idempotent(client: TestClient) -> None:

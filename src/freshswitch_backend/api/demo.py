@@ -12,6 +12,7 @@ from freshswitch_backend.config import get_settings
 from freshswitch_backend.data.loader import load_scenarios
 from freshswitch_backend.integrations import SnapshotDate, SnapshotStore
 from freshswitch_backend.integrations.mof_snapshot import load_demo_fixture
+from freshswitch_backend.lots import lot_store
 from freshswitch_backend.planning.store import store
 from freshswitch_backend.quality import quality_history
 
@@ -24,6 +25,7 @@ class ResetResponse(BaseModel):
     cleared_sessions: int
     cleared_coldchain_containers: int = 0
     cleared_quality_observations: int = 0
+    cleared_lots: int = 0
 
 
 class DemoStatus(BaseModel):
@@ -763,12 +765,13 @@ def curl_script(base: str = DEFAULT_CURL_BASE) -> str:
 
 
 @router.post("/reset", dependencies=[Depends(require_demo_reset)])
-def reset() -> ResetResponse:
+def reset(include_lots: bool = Query(False)) -> ResetResponse:
     cleared_quality, _ = quality_history.reset()
     return ResetResponse(
         cleared_sessions=store.clear(),
         cleared_coldchain_containers=coldchain_store.clear(),
         cleared_quality_observations=cleared_quality,
+        cleared_lots=lot_store.clear() if include_lots else 0,
     )
 
 

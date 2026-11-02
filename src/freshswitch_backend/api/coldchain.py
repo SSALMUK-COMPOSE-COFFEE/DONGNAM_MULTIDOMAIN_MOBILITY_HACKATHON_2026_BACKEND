@@ -4,6 +4,7 @@ import time
 from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, HTTPException, Query, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 
 from freshswitch_backend.coldchain import ColdchainError, NotFound, coldchain_store
@@ -117,7 +118,9 @@ async def stream_alerts(
         cursor = since
         deadline = time.monotonic() + timeout
         while True:
-            feed = coldchain_store.alerts(cursor, container_id, 1000, plan_id)
+            feed = await run_in_threadpool(
+                coldchain_store.alerts, cursor, container_id, 1000, plan_id
+            )
             for alert in feed.alerts:
                 data = json.dumps(alert.model_dump(mode="json"), ensure_ascii=False)
                 yield f"id: {alert.seq}\nevent: alert\ndata: {data}\n\n"

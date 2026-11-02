@@ -2,6 +2,7 @@ from datetime import date
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from freshswitch_backend.api.computation import (
@@ -93,7 +94,7 @@ async def delay_forecast(
     llm: Annotated[bool | None, Query()] = None,
 ) -> DelayForecastResponse:
     deadline = request_deadline()
-    session = store.get(plan_id)
+    session = await run_in_threadpool(store.get, plan_id)
     if session is None:
         raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")
     options = (body or ForecastOptions()).resolved()
@@ -126,7 +127,7 @@ async def delay_forecast(
             use_llm=llm_enabled(llm),
             timeout_s=explanation_budget(deadline),
         )
-        pending = store.add_pending(session, result)
+        pending = await run_in_threadpool(store.add_pending, session, result)
         replan_response = DelayForecastReplan(
             **{name: getattr(result, name) for name in ReplanResult.model_fields},
             plan_id=plan_id,

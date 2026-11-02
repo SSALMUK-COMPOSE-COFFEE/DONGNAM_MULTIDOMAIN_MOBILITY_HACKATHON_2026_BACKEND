@@ -3,11 +3,16 @@ import threading
 import uuid
 from pathlib import Path
 
+from sqlalchemy import delete, func, select
+from sqlalchemy.orm import Session
+
 from freshswitch_backend.coldchain import ColdchainError, NotFound, coldchain_store
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import KST, Scenario
 from freshswitch_backend.execution.quality import ArrivalSettlementResult
 from freshswitch_backend.optimize.costs import CostModel
+from freshswitch_backend.persistence import Database, database, get_meta, set_meta
+from freshswitch_backend.persistence.tables import ObservationRow
 from freshswitch_backend.planning.store import PlanSession
 from freshswitch_backend.planning.store import store as plan_store
 from freshswitch_backend.quality.learning import condition_uplift, outage_bucket, prior_model_rate
@@ -21,6 +26,7 @@ from freshswitch_backend.quality.params import QualityParams
 
 SEED_PATH = Path(__file__).resolve().parent.parent / "data" / "quality" / "seed-observations.json"
 MAX_OBSERVATIONS = 5000
+SEEDED_KEY = "quality_seeded"
 
 
 class QualityInputError(ValueError):
@@ -42,15 +48,25 @@ def _container_outage(plan_id: str, container_id: str) -> float | None:
         return None
 
 
+def _row(observation: Observation, inspection_revision: int | None = None) -> ObservationRow:
+    return ObservationRow(
+        id=observation.id,
+        origin=observation.origin,
+        product_id=observation.product_id,
+        plan_id=observation.plan_id,
+        lot_id=observation.lot_id,
+        recorded_at=observation.recorded_at,
+        inspection_revision=inspection_revision,
+        payload=observation.model_dump(mode="json"),
+    )
+
+
 class QualityHistory:
-    def __init__(self, params: QualityParams | None = None) -> None:
+    def __init__(self, params: QualityParams | None = None, db: Database | None = None) -> None:
         self.params = params or QualityParams()
+        self._db = db or database
         self._lock = threading.RLock()
-        self._observations: list[Observation] = []
-        self._arrival_keys: dict[str, str] = {}
-        self._arrival_revisions: dict[str, int] = {}
         self.seed_label, self._seed = _load_seed()
-        self.reset()
 
     def reference_scenario(self) -> Scenario:
         scenario = get_scenario("default")
@@ -93,36 +109,68 @@ class QualityHistory:
             note=body.note,
         )
 
+    def _seed_rows(self, db: Session, scenario: Scenario) -> int:
+        for item in self._seed:
+            db.add(_row(self._from_input(item, "seed", item.id, scenario)))
+        set_meta(db, SEEDED_KEY, True)
+        return len(self._seed)
+
+    def _ensure_seeded(self, db: Session) -> None:
+        if get_meta(db, SEEDED_KEY):
+            return
+        self._seed_rows(db, self.reference_scenario())
+        db.flush()
+
     def reset(self, seed: bool = True) -> tuple[int, int]:
         scenario = self.reference_scenario()
-        with self._lock:
-            cleared = len(self._observations)
-            self._observations = (
-                [self._from_input(s, "seed", s.id, scenario) for s in self._seed] if seed else []
-            )
-            self._arrival_keys.clear()
-            self._arrival_revisions.clear()
-            return cleared, len(self._observations)
+        with self._lock, self._db.begin() as db:
+            cleared = db.scalar(select(func.count()).select_from(ObservationRow)) or 0
+            db.execute(delete(ObservationRow))
+            if seed:
+                return cleared, self._seed_rows(db, scenario)
+            set_meta(db, SEEDED_KEY, True)
+            return cleared, 0
 
     def observations(self) -> list[Observation]:
-        with self._lock:
-            return list(self._observations)
+        with self._lock, self._db.begin() as db:
+            self._ensure_seeded(db)
+            rows = db.scalars(select(ObservationRow).order_by(ObservationRow.seq))
+            return [Observation.model_validate(row.payload) for row in rows]
 
-    def _append(self, observation: Observation) -> None:
-        self._observations.append(observation)
-        while len(self._observations) > MAX_OBSERVATIONS:
-            dropped = self._observations.pop(0)
-            self._arrival_keys = {k: v for k, v in self._arrival_keys.items() if v != dropped.id}
-            self._arrival_revisions = {
-                k: v for k, v in self._arrival_revisions.items() if k in self._arrival_keys
-            }
+    def get(self, obs_id: str) -> Observation | None:
+        with self._lock, self._db.begin() as db:
+            self._ensure_seeded(db)
+            row = db.get(ObservationRow, obs_id)
+            return Observation.model_validate(row.payload) if row is not None else None
+
+    def delete(self, obs_id: str) -> bool:
+        with self._lock, self._db.begin() as db:
+            self._ensure_seeded(db)
+            return (
+                db.execute(delete(ObservationRow).where(ObservationRow.id == obs_id)).rowcount > 0
+            )
+
+    def _append(
+        self, db: Session, observation: Observation, inspection_revision: int | None = None
+    ) -> None:
+        db.add(_row(observation, inspection_revision))
+        db.flush()
+        cutoff = db.scalar(
+            select(ObservationRow.seq)
+            .order_by(ObservationRow.seq.desc())
+            .offset(MAX_OBSERVATIONS)
+            .limit(1)
+        )
+        if cutoff is not None:
+            db.execute(delete(ObservationRow).where(ObservationRow.seq <= cutoff))
 
     def add(self, body: ObservationIn) -> Observation:
         observation = self._from_input(
             body, "manual", f"obs-{uuid.uuid4().hex[:12]}", self.reference_scenario()
         )
-        with self._lock:
-            self._append(observation)
+        with self._lock, self._db.begin() as db:
+            self._ensure_seeded(db)
+            self._append(db, observation)
         return observation
 
     def record_arrival(
@@ -165,12 +213,22 @@ class QualityHistory:
         uplift = baseline - reference
         actual = result.inspected_loss_rate
         now = plan_store.clock()
-        key = f"{plan_id}:{result.lot_id}"
-        with self._lock:
-            if session.inspection_revision < self._arrival_revisions.get(key, -1):
-                return next(o for o in self._observations if o.id == self._arrival_keys[key])
-            self._arrival_revisions[key] = session.inspection_revision
-            obs_id = self._arrival_keys.get(key) or f"arr-{uuid.uuid4().hex[:12]}"
+        with self._lock, self._db.begin() as db:
+            self._ensure_seeded(db)
+            existing = db.scalars(
+                select(ObservationRow).where(
+                    ObservationRow.origin == "arrival",
+                    ObservationRow.plan_id == plan_id,
+                    ObservationRow.lot_id == result.lot_id,
+                )
+            ).first()
+            obs_id = existing.id if existing is not None else f"arr-{uuid.uuid4().hex[:12]}"
+            if (
+                existing is not None
+                and existing.inspection_revision is not None
+                and session.inspection_revision < existing.inspection_revision
+            ):
+                return Observation.model_validate(existing.payload)
             observation = Observation(
                 id=obs_id,
                 origin="arrival",
@@ -199,13 +257,13 @@ class QualityHistory:
                 voyage_id=voyage_id,
                 note=result.note,
             )
-            if key in self._arrival_keys:
-                self._observations = [
-                    observation if o.id == obs_id else o for o in self._observations
-                ]
+            if existing is not None:
+                existing.product_id = observation.product_id
+                existing.recorded_at = observation.recorded_at
+                existing.inspection_revision = session.inspection_revision
+                existing.payload = observation.model_dump(mode="json")
             else:
-                self._arrival_keys[key] = obs_id
-                self._append(observation)
+                self._append(db, observation, session.inspection_revision)
             return observation
 
 
