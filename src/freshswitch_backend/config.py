@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     session_cookie_path: str = "/"
     session_ttl: int = Field(default=14 * 24 * 3600, gt=0)
     session_cookie_secure: bool = True
+    saas_mode: bool = False
 
     @field_validator("api_prefix", "session_cookie_path")
     @classmethod

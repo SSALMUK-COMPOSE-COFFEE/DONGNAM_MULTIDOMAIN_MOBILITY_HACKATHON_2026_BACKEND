@@ -1,11 +1,19 @@
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
+from fastapi.security import HTTPAuthorizationCredentials
 
+from freshswitch_backend.api.access import bearer, require_demo_reset
+from freshswitch_backend.api.auth import OptionalPrincipal, app_settings
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import Scenario
-from freshswitch_backend.quality import QualityInputError, learned_table, quality_history
+from freshswitch_backend.quality import (
+    QualityAccessDenied,
+    QualityInputError,
+    learned_table,
+    quality_history,
+)
 from freshswitch_backend.quality.impact import learning_impact
 from freshswitch_backend.quality.models import (
     ImpactResult,
@@ -17,6 +25,24 @@ from freshswitch_backend.quality.models import (
 )
 
 router = APIRouter(prefix="/quality", tags=["quality"])
+
+
+def reset_org_type(
+    request: Request,
+    principal: OptionalPrincipal,
+    credential: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
+) -> str | None:
+    if principal is None and not app_settings(request).saas_mode:
+        return None
+    if credential is not None:
+        require_demo_reset(credential)
+        return None
+    if principal is None:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다")
+    return principal.org_type
+
+
+ResetOrgType = Annotated[str | None, Depends(reset_org_type)]
 
 
 def _scenario(scenario_id: str) -> Scenario:
@@ -58,14 +84,21 @@ def read_observation(obs_id: str) -> Observation:
 
 
 @router.delete("/observations/{obs_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_observation(obs_id: str) -> None:
-    if not quality_history.delete(obs_id):
+def delete_observation(obs_id: str, org_type: ResetOrgType) -> None:
+    try:
+        deleted = quality_history.delete(obs_id, org_type=org_type)
+    except QualityAccessDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if not deleted:
         raise HTTPException(status_code=404, detail="관측을 찾을 수 없습니다")
 
 
 @router.post("/reset")
-def reset(seed: Annotated[bool, Query()] = True) -> ResetResult:
-    cleared, seeded = quality_history.reset(seed=seed)
+def reset(org_type: ResetOrgType, seed: Annotated[bool, Query()] = True) -> ResetResult:
+    try:
+        cleared, seeded = quality_history.reset(seed=seed, org_type=org_type)
+    except QualityAccessDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     return ResetResult(cleared=cleared, seeded=seeded)
 
 
