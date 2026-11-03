@@ -3,7 +3,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from freshswitch_backend.domain.models import Lot
+from freshswitch_backend.domain.models import Lot, Mode
 from freshswitch_backend.lots.models import RegisteredLot
 from freshswitch_backend.replan.models import AddLotEvent
 
@@ -66,6 +66,24 @@ class SeasonCheck(BaseModel):
     source: str
 
 
+class SavingsEstimate(BaseModel):
+    mode: Mode
+    container_id: str | None = None
+    voyage_id: str | None = None
+    pallets: int
+    basis: Literal["tariff", "operational"]
+    billing_rule: Literal["performance", "usage_fee"]
+    rule: str
+    baseline_cost: int
+    shared_cost: int
+    savings: int
+    savings_per_pallet: int
+    fee: int
+    shipper_gain: int
+    assumed_container_pallets: int | None = None
+    assumptions: list[str]
+
+
 class FeasibilityHints(BaseModel):
     based_on: str
     sea_options: list[SeaHint]
@@ -83,3 +101,4 @@ class IntakePreview(BaseModel):
     hints: FeasibilityHints
     next_step: str
     registered: RegisteredLot | None = None
+    savings_estimate: SavingsEstimate | None = None

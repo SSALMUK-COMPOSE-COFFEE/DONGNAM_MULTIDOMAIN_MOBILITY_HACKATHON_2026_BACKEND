@@ -7,6 +7,7 @@ from freshswitch_backend.api.auth import OptionalPrincipal
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import Scenario
 from freshswitch_backend.intake.models import IntakePreview, IntakeRequest
+from freshswitch_backend.intake.savings import estimate_savings
 from freshswitch_backend.intake.service import IntakeError, preview_lot
 from freshswitch_backend.intake.tenants import load_catalog, tenant_scenario
 from freshswitch_backend.lots import ANY_ORG, LotConflict, Reservation, lot_store
@@ -96,7 +97,8 @@ def build_preview(
         )
     except IntakeError as exc:
         raise intake_error(exc) from exc
-    return preview, scenario.id
+    estimate = estimate_savings(scenario, preview.lot, plan, preview.hints)
+    return preview.model_copy(update={"savings_estimate": estimate}), scenario.id
 
 
 def register(body: IntakeRequest, scope: IntakeScope = DEMO_SCOPE) -> IntakePreview:
