@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 
 from freshswitch_backend.api.auth import Principal, require_role
 from freshswitch_backend.api.computation import compute_replan, request_deadline
@@ -13,12 +14,14 @@ from freshswitch_backend.api.plans import (
     ApplyRequest,
     EventRequest,
     ReplanResponse,
+    _fingerprint,
     apply_alternative,
     post_event,
 )
 from freshswitch_backend.api.saas_access import PlanAccess, plan_for
 from freshswitch_backend.domain.models import Lot
 from freshswitch_backend.execution.cancellation import annotate_cancellations
+from freshswitch_backend.execution.models import OrderStatus
 from freshswitch_backend.notifications import (
     ChangeRequestNotice,
     Notification,
@@ -27,8 +30,13 @@ from freshswitch_backend.notifications import (
     notify_order_confirmation,
 )
 from freshswitch_backend.persistence import database
-from freshswitch_backend.persistence.tables import ChangeRequestRow, LotRow, OrganizationRow
-from freshswitch_backend.planning.store import PlanSession, store
+from freshswitch_backend.persistence.tables import (
+    OPEN_CHANGE_REQUEST_INDEX,
+    ChangeRequestRow,
+    LotRow,
+    OrganizationRow,
+)
+from freshswitch_backend.planning.store import IdempotencyMismatch, PlanSession, store
 from freshswitch_backend.replan import (
     AirSwitchEvent,
     CancelEvent,
@@ -50,7 +58,6 @@ ChangeStatus = Literal["open", "applied", "rejected"]
 
 NOT_FOUND = "변경 요청을 찾을 수 없습니다"
 LOT_NOT_IN_PLAN = "계획에 없는 출하입니다"
-FOREIGN_LOT = "다른 화주의 출하는 변경을 요청할 수 없습니다"
 NOT_PLANNED = "계획에 배정된(planned) 자기 출하만 변경을 요청할 수 있습니다"
 ALREADY_OPEN = "이 출하에 처리 중인 변경 요청이 있습니다"
 ALREADY_AIR = "이미 항공으로 배정된 출하입니다"
@@ -98,6 +105,7 @@ class ShipperChangeRequest(BaseModel):
     cancellation_estimate: CancellationEstimate | None
     alternative_id: AlternativeId | None
     order_id: str | None
+    order_status: OrderStatus | None
     decision_note: str | None
     created_at: datetime
     updated_at: datetime
@@ -165,7 +173,16 @@ def _estimate(result: ReplanResult) -> CancellationEstimate | None:
     )
 
 
-def _shipper_view(row: ChangeRequestRow) -> ShipperChangeRequest:
+def _order_statuses(rows: list[ChangeRequestRow]) -> dict[str, str]:
+    plans = {(row.plan_id, row.org_id) for row in rows if row.order_id is not None}
+    statuses: dict[str, str] = {}
+    for plan_id, org_id in sorted(plans):
+        for order in store.orders(plan_id, org_id=org_id):
+            statuses[order.order_id] = order.status
+    return statuses
+
+
+def _shipper_view(row: ChangeRequestRow, order_status: str | None = None) -> ShipperChangeRequest:
     return ShipperChangeRequest(
         request_id=row.id,
         plan_id=row.plan_id,
@@ -178,6 +195,7 @@ def _shipper_view(row: ChangeRequestRow) -> ShipperChangeRequest:
         cancellation_estimate=row.estimate,
         alternative_id=row.alternative_id,
         order_id=row.order_id,
+        order_status=order_status,
         decision_note=row.decision_note,
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -185,9 +203,11 @@ def _shipper_view(row: ChangeRequestRow) -> ShipperChangeRequest:
     )
 
 
-def _platform_view(row: ChangeRequestRow, org_name: str) -> PlatformChangeRequest:
+def _platform_view(
+    row: ChangeRequestRow, org_name: str, order_status: str | None = None
+) -> PlatformChangeRequest:
     return PlatformChangeRequest(
-        **_shipper_view(row).model_dump(),
+        **_shipper_view(row, order_status).model_dump(),
         shipper_org_id=row.shipper_org_id,
         shipper_org_name=org_name,
         event=to_event(row.type, row.lot_id, row.new_pallets),
@@ -198,10 +218,8 @@ def _platform_view(row: ChangeRequestRow, org_name: str) -> PlatformChangeReques
 def _own_lot(access: PlanAccess, lot_id: str, org_id: str) -> Lot:
     session = access.session
     lot = next((x for x in session.scenario.lots if x.id == lot_id), None)
-    if lot is None:
+    if lot is None or lot.shipper_id not in access.viewer.shipper_ids:
         raise HTTPException(status_code=404, detail=LOT_NOT_IN_PLAN)
-    if lot.shipper_id not in access.viewer.shipper_ids:
-        raise HTTPException(status_code=403, detail=FOREIGN_LOT)
     assigned = next((a for a in session.plan.assignments if a.lot_id == lot_id), None)
     if lot_id not in session.registered_lot_ids or assigned is None:
         raise HTTPException(status_code=409, detail=NOT_PLANNED)
@@ -247,8 +265,15 @@ def _insert(
         created_at=now,
         updated_at=now,
     )
-    with database.begin() as db:
-        db.add(row)
+    try:
+        with database.begin() as db:
+            db.add(row)
+    except IntegrityError as exc:
+        if getattr(exc.orig, "diag", None) is None:
+            raise
+        if exc.orig.diag.constraint_name != OPEN_CHANGE_REQUEST_INDEX:
+            raise
+        raise HTTPException(status_code=409, detail=ALREADY_OPEN) from exc
     return row
 
 
@@ -294,8 +319,11 @@ def list_shipper_requests(
     if plan_id is not None:
         query = query.where(ChangeRequestRow.plan_id == plan_id)
     with database.begin() as db:
-        rows = db.scalars(query.order_by(ChangeRequestRow.seq.desc()).limit(limit).offset(offset))
-        return [_shipper_view(row) for row in rows]
+        rows = db.scalars(
+            query.order_by(ChangeRequestRow.seq.desc()).limit(limit).offset(offset)
+        ).all()
+    statuses = _order_statuses(rows)
+    return [_shipper_view(row, statuses.get(row.order_id)) for row in rows]
 
 
 @router.get("/shipper/notifications")
@@ -324,7 +352,7 @@ def _platform_request(request_id: str, principal: Principal) -> PlatformChangeRe
     if found is None:
         raise HTTPException(status_code=404, detail=NOT_FOUND)
     row, name = found
-    return _platform_view(row, name)
+    return _platform_view(row, name, _order_statuses([row]).get(row.order_id))
 
 
 def _open_request(request_id: str, principal: Principal) -> PlatformChangeRequest:
@@ -332,6 +360,63 @@ def _open_request(request_id: str, principal: Principal) -> PlatformChangeReques
     if request.status != "open":
         raise HTTPException(status_code=409, detail=NOT_OPEN)
     return request
+
+
+def _replayed_apply(
+    request: PlatformChangeRequest, body: ChangeRequestApply, principal: Principal
+) -> PlanSession | None:
+    if body.idempotency_key is None or request.status != "applied" or request.replan_id is None:
+        return None
+    probe = ApplyRequest(
+        alternative_id=body.alternative_id,
+        replan_id=request.replan_id,
+        idempotency_key=body.idempotency_key,
+    )
+    try:
+        return store.idempotent(
+            request.plan_id,
+            body.idempotency_key,
+            "apply",
+            _fingerprint(probe),
+            PlanSession,
+            org_id=principal.org_id,
+        )
+    except IdempotencyMismatch as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _apply_locked(
+    request_id: str, body: ChangeRequestApply, principal: Principal
+) -> tuple[PlanSession, datetime]:
+    with database.begin() as db:
+        row = db.execute(
+            select(ChangeRequestRow)
+            .where(ChangeRequestRow.id == request_id, ChangeRequestRow.org_id == principal.org_id)
+            .with_for_update()
+        ).scalar_one_or_none()
+        if row is None:
+            raise HTTPException(status_code=404, detail=NOT_FOUND)
+        if row.status != "open":
+            raise HTTPException(status_code=409, detail=NOT_OPEN)
+        if row.replan_id is None:
+            raise HTTPException(status_code=409, detail=NO_REPLAN)
+        session = apply_alternative(
+            row.plan_id,
+            ApplyRequest(
+                alternative_id=body.alternative_id,
+                replan_id=row.replan_id,
+                idempotency_key=body.idempotency_key,
+            ),
+            org_id=principal.org_id,
+        )
+        now = store.clock()
+        row.status = "applied"
+        row.alternative_id = body.alternative_id
+        row.order_id = session.active_order_id
+        row.decision_note = body.note
+        row.decided_at = now
+        row.updated_at = now
+    return session, now
 
 
 def _update(request_id: str, **values) -> bool:
@@ -375,7 +460,8 @@ def list_platform_requests(
         rows = db.execute(
             query.order_by(ChangeRequestRow.seq.desc()).limit(limit).offset(offset)
         ).all()
-        return [_platform_view(row, name) for row, name in rows]
+    statuses = _order_statuses([row for row, _ in rows])
+    return [_platform_view(row, name, statuses.get(row.order_id)) for row, name in rows]
 
 
 @router.get("/platform/change-requests/{request_id}")
@@ -403,33 +489,24 @@ async def replan_change_request(
 def apply_change_request(
     request_id: str, body: ChangeRequestApply, principal: PlatformPrincipal
 ) -> ChangeRequestApplied:
-    request = _open_request(request_id, principal)
-    if request.replan_id is None:
-        raise HTTPException(status_code=409, detail=NO_REPLAN)
-    session = apply_alternative(
-        request.plan_id,
-        ApplyRequest(
-            alternative_id=body.alternative_id,
-            replan_id=request.replan_id,
-            idempotency_key=body.idempotency_key,
-        ),
-        org_id=principal.org_id,
-    )
-    now = store.clock()
-    _update(
-        request_id,
-        status="applied",
-        alternative_id=body.alternative_id,
-        order_id=session.active_order_id,
-        decision_note=body.note,
-        decided_at=now,
-    )
+    request = _platform_request(request_id, principal)
+    replayed = _replayed_apply(request, body, principal)
+    if replayed is not None:
+        return ChangeRequestApplied(change_request=request, plan=replayed, notifications=[])
+    session, now = _apply_locked(request_id, body, principal)
     applied = _platform_request(request_id, principal)
     notifications: list[Notification] = []
+    confirmation_sent = False
     if session.active_order_id is not None:
         order = store.order(request.plan_id, session.active_order_id, org_id=principal.org_id)
+        confirmation_sent = any(
+            c.shipper_id == applied.shipper_id and c.status == "pending"
+            for c in order.shipper_confirmations
+        )
         notifications += notify_order_confirmation(session, order, principal.org_id, now)
-    notifications += notify_change_request_decision(_notice(applied), applied=True, now=now)
+    notifications += notify_change_request_decision(
+        _notice(applied), applied=True, now=now, confirmation_sent=confirmation_sent
+    )
     return ChangeRequestApplied(change_request=applied, plan=session, notifications=notifications)
 
 

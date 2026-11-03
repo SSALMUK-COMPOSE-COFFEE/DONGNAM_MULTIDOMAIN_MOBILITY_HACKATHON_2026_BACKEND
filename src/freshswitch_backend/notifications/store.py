@@ -11,6 +11,7 @@ from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.orgs import same_sandbox
 from freshswitch_backend.persistence.tables import (
     DEMO_ORG,
+    LotRow,
     NotificationRow,
     OrganizationRow,
     ShipperProfileRow,
@@ -62,6 +63,13 @@ def shipper_orgs(shipper_ids: Iterable[str], owner_org_id: str) -> dict[str, str
             )
         ).all()
     return {shipper_id: org_id for shipper_id, org_id in rows}
+
+
+def lot_shipper(lot_id: str | None) -> str | None:
+    if lot_id is None:
+        return None
+    with database.begin() as db:
+        return db.scalar(select(LotRow.shipper_id).where(LotRow.id == lot_id))
 
 
 def record(drafts: Iterable[Draft], now: datetime) -> list[Notification]:

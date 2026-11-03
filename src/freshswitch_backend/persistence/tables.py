@@ -334,6 +334,7 @@ class ObservationRow(Base):
 
 CHANGE_REQUEST_TYPES = ("reduce", "cancel", "air_switch")
 CHANGE_REQUEST_STATUSES = ("open", "applied", "rejected")
+OPEN_CHANGE_REQUEST_INDEX = "ux_plan_change_requests_open"
 
 
 class ChangeRequestRow(Base):
@@ -346,6 +347,13 @@ class ChangeRequestRow(Base):
             "status IN ('open', 'applied', 'rejected')", name="plan_change_requests_status_check"
         ),
         Index("ix_plan_change_requests_org_status", "org_id", "status"),
+        Index(
+            OPEN_CHANGE_REQUEST_INDEX,
+            "plan_id",
+            "lot_id",
+            unique=True,
+            postgresql_where=text("status = 'open'"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)

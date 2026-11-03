@@ -7,6 +7,7 @@ MOCK_CHANNEL = "알림톡(모의)"
 
 NotificationKind = Literal[
     "order_confirmation_requested",
+    "order_notified",
     "order_committed",
     "change_request_applied",
     "change_request_rejected",

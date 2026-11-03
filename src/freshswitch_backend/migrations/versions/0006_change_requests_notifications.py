@@ -61,6 +61,13 @@ def upgrade() -> None:
         ["org_id", "status"],
         unique=False,
     )
+    op.create_index(
+        "ux_plan_change_requests_open",
+        "plan_change_requests",
+        ["plan_id", "lot_id"],
+        unique=True,
+        postgresql_where=sa.text("status = 'open'"),
+    )
     op.create_table(
         "notifications",
         sa.Column("id", sa.String(length=64), nullable=False),
@@ -98,6 +105,7 @@ def downgrade() -> None:
     op.drop_index("ix_notifications_change_request_id", table_name="notifications")
     op.drop_index("ix_notifications_plan_id", table_name="notifications")
     op.drop_table("notifications")
+    op.drop_index("ux_plan_change_requests_open", table_name="plan_change_requests")
     op.drop_index("ix_plan_change_requests_org_status", table_name="plan_change_requests")
     op.drop_index("ix_plan_change_requests_shipper_org_id", table_name="plan_change_requests")
     op.drop_index("ix_plan_change_requests_plan_id", table_name="plan_change_requests")
