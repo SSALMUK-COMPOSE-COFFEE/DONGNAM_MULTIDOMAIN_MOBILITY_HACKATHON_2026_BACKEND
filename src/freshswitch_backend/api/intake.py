@@ -92,6 +92,7 @@ def build_preview(
             plan,
             taken_ids=reservation.taken,
             reserved_ids=reservation.reserved,
+            check_season=scope.org_id != DEMO_ORG,
         )
     except IntakeError as exc:
         raise intake_error(exc) from exc

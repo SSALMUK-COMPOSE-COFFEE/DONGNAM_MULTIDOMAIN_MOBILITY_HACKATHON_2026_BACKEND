@@ -72,7 +72,7 @@ class FeasibilityHints(BaseModel):
     earliest_feasible: SeaHint | None
     air: AirHint
     warnings: list[str]
-    season: SeasonCheck | None = None
+    season: SeasonCheck | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class IntakePreview(BaseModel):

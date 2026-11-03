@@ -138,6 +138,8 @@ def preview_lot(
     plan: Plan | None = None,
     taken_ids: set[str] | None = None,
     reserved_ids: set[str] | None = None,
+    *,
+    check_season: bool = False,
 ) -> IntakePreview:
     taken = {lot.id for lot in scenario.lots} | (taken_ids or set())
     resolved, errors = _resolve(scenario, body)
@@ -183,7 +185,7 @@ def preview_lot(
         sell_window=body.sell_window,
         source="화주 간편 등록",
     )
-    hints = _hints(scenario, lot, plan)
+    hints = _hints(scenario, lot, plan, check_season=check_season)
     return IntakePreview(
         lot=lot,
         event=AddLotEvent(lot=lot),
@@ -218,14 +220,16 @@ def _season_warning(season: SeasonCheck, lot: Lot) -> str:
     )
 
 
-def _hints(scenario: Scenario, lot: Lot, plan: Plan | None) -> FeasibilityHints:
+def _hints(
+    scenario: Scenario, lot: Lot, plan: Plan | None, *, check_season: bool = False
+) -> FeasibilityHints:
     model = CostModel(scenario)
     product = model.product(lot)
     pallets, loaded = _loads(plan)
     products = {p.id: p for p in scenario.products}
     options: list[SeaHint] = []
     warnings: list[str] = []
-    season = season_check(product, lot)
+    season = season_check(product, lot) if check_season else None
     if season is not None and not season.in_season:
         warnings.append(_season_warning(season, lot))
     if product.so2_treated:

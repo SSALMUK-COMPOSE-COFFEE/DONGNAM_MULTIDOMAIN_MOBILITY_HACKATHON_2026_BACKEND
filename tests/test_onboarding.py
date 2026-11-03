@@ -11,6 +11,8 @@ from saas_fixtures import (
 )
 
 from freshswitch_backend.main import app
+from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.tables import LotRow
 
 PASSWORD = "onboarding-password"
 PACKHOUSE = {
@@ -121,10 +123,10 @@ def test_profile_create_and_patch() -> None:
     ).json()
     assert second["in_use"] is False
 
-    duplicate = shipper.post(
+    no_create = shipper.post(
         "/api/saas/shipper/profile", json={"packhouse_id": first["packhouse_id"]}
     )
-    assert duplicate.status_code == 409
+    assert no_create.status_code == 405
 
     patched = shipper.patch(
         "/api/saas/shipper/profile",
@@ -148,6 +150,8 @@ def test_profile_create_and_patch() -> None:
     assert moved.json()["in_use"] is False
     far = shipper.patch(f"/api/saas/shipper/packhouses/{first['packhouse_id']}", json={"lat": 50})
     assert far.status_code == 422
+    west = shipper.post("/api/saas/shipper/packhouses", json={**PACKHOUSE, "lon": 120})
+    assert west.status_code == 422
 
     in_use = shipper.delete(f"/api/saas/shipper/packhouses/{second['packhouse_id']}")
     assert in_use.status_code == 409
@@ -162,7 +166,55 @@ def test_profile_requires_existing_profile_and_own_packhouse() -> None:
     missing = shipper.patch("/api/saas/shipper/profile", json={"name": "x"})
     assert missing.status_code == 404
     foreign = shipper.post("/api/saas/shipper/profile", json={"packhouse_id": "ph-jinju"})
-    assert foreign.status_code == 422
+    assert foreign.status_code == 405
+    assert shipper.get("/api/saas/shipper/profile").json()["profile"] is None
+
+
+def test_second_packhouse_merges_products_without_moving_profile() -> None:
+    shipper, first = _onboarded("owner@merge.example.com", "합치기 농장")
+    second = shipper.post(
+        "/api/saas/shipper/packhouses",
+        json={
+            **PACKHOUSE,
+            "name": "둘째 선과장",
+            "product_ids": ["grape_so2", "strawberry", "grape_so2"],
+        },
+    )
+    assert second.status_code == 201, second.text
+    assert second.json()["in_use"] is False
+    profile = shipper.get("/api/saas/shipper/profile").json()["profile"]
+    assert profile["product_ids"] == ["strawberry", "grape_so2"]
+    assert profile["packhouse_id"] == first["packhouse_id"]
+
+
+def test_profile_packhouse_change_moves_registered_lots_and_guards_delete() -> None:
+    shipper, first = _onboarded("owner@moving.example.com", "이전 농장")
+    old = first["packhouse_id"]
+    planned = shipper.post("/api/saas/shipper/lots", json=_lot()).json()["registered"]
+    waiting = shipper.post("/api/saas/shipper/lots", json=_lot(ready="2026-11-18")).json()[
+        "registered"
+    ]
+    with database.begin() as db:
+        db.get(LotRow, planned["id"]).status = "planned"
+    new = shipper.post(
+        "/api/saas/shipper/packhouses", json={**PACKHOUSE, "name": "새 선과장"}
+    ).json()["packhouse_id"]
+
+    moved = shipper.patch("/api/saas/shipper/profile", json={"packhouse_id": new})
+    assert moved.status_code == 200, moved.text
+    lots = {lot["id"]: lot for lot in shipper.get("/api/saas/shipper/lots").json()}
+    assert lots[waiting["id"]]["packhouse"] == new
+    assert lots[planned["id"]]["packhouse"] == old
+
+    listed = {p["packhouse_id"]: p for p in shipper.get("/api/saas/shipper/packhouses").json()}
+    assert listed[old]["in_use"] is True
+    assert shipper.delete(f"/api/saas/shipper/packhouses/{old}").status_code == 409
+
+    with database.begin() as db:
+        db.get(LotRow, planned["id"]).status = "cancelled"
+    assert shipper.delete(f"/api/saas/shipper/packhouses/{old}").status_code == 204
+    lots = {lot["id"]: lot for lot in shipper.get("/api/saas/shipper/lots").json()}
+    assert lots[waiting["id"]]["packhouse"] == new
 
 
 def test_other_org_profile_and_packhouses_are_unreachable(demo_tenants) -> None:
@@ -189,6 +241,11 @@ def test_other_org_profile_and_packhouses_are_unreachable(demo_tenants) -> None:
     )
     assert sandbox.post("/api/saas/shipper/packhouses", json=PACKHOUSE).status_code == 403
     assert sandbox.patch("/api/saas/shipper/profile", json={"name": "x"}).status_code == 403
+    assert sandbox.delete("/api/saas/shipper/packhouses/ph-jinju").status_code == 403
+    assert (
+        sandbox.post("/api/saas/shipper/profile", json={"packhouse_id": "ph-jinju"}).status_code
+        == 405
+    )
     sandbox_view = sandbox.get("/api/saas/shipper/profile").json()
     assert sandbox_view["sandbox"] is True
     assert sandbox_view["profile"]["shipper_id"] == "sh-jinju"
@@ -227,8 +284,11 @@ def test_out_of_season_lot_registers_with_warning() -> None:
     assert not any("수출 시기" in w for w in winter.json()["hints"]["warnings"])
 
 
-def test_demo_intake_preview_in_season_has_no_season_warning(client: TestClient) -> None:
-    response = client.post("/api/intake/lots", json={**_lot(), "shipper": "sh-jinju"})
-    assert response.status_code == 200, response.text
-    assert response.json()["hints"]["season"]["in_season"] is True
-    assert not any("수출 시기" in w for w in response.json()["hints"]["warnings"])
+def test_demo_intake_preview_skips_season_check(client: TestClient) -> None:
+    for ready in ("2026-11-17", "2026-07-01"):
+        response = client.post(
+            "/api/intake/lots", json={**_lot(ready=ready), "shipper": "sh-jinju"}
+        )
+        assert response.status_code == 200, response.text
+        assert "season" not in response.json()["hints"]
+        assert not any("수출 시기" in w for w in response.json()["hints"]["warnings"])

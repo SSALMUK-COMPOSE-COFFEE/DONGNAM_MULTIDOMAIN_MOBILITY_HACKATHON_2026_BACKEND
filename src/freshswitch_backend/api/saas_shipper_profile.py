@@ -1,9 +1,10 @@
 import uuid
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field, StringConstraints
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from freshswitch_backend.api.auth import Principal, require_role
@@ -11,6 +12,7 @@ from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import Product
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.tables import (
+    LotRow,
     OrganizationRow,
     PackhouseRow,
     ShipperProfileRow,
@@ -21,7 +23,7 @@ REGISTERED_SOURCE = "등록"
 SANDBOX_LOCKED = "데모(sandbox) 조직의 화주 정보는 바꿀 수 없습니다"
 PACKHOUSE_NOT_FOUND = "선과장을 찾을 수 없습니다"
 PROFILE_NOT_FOUND = "화주 프로필이 없습니다"
-PACKHOUSE_IN_USE = "화주 프로필이 쓰는 선과장은 지울 수 없습니다"
+PACKHOUSE_IN_USE = "화주 프로필이나 출하가 쓰는 선과장은 지울 수 없습니다"
 LAT_RANGE = (33.0, 39.0)
 LON_RANGE = (124.0, 132.0)
 
@@ -70,12 +72,6 @@ class ShipperProfileOut(BaseModel):
     packhouse_id: str
     product_ids: list[str]
     source: str
-
-
-class ShipperProfileCreate(BaseModel):
-    name: Name | None = None
-    packhouse_id: str = Field(min_length=1, max_length=100)
-    product_ids: list[str] = Field(default_factory=list, max_length=20)
 
 
 class ShipperProfilePatch(BaseModel):
@@ -153,9 +149,17 @@ def _own_packhouse_id(db: Session, org_id: str, packhouse_id: str) -> str:
 
 
 def _used_packhouses(db: Session, org_id: str) -> set[str]:
-    return set(
-        db.scalars(select(ShipperProfileRow.packhouse_id).where(ShipperProfileRow.org_id == org_id))
+    profiles = db.scalars(
+        select(ShipperProfileRow.packhouse_id).where(ShipperProfileRow.org_id == org_id)
     )
+    lots = db.scalars(
+        select(LotRow.packhouse).where(
+            LotRow.shipper_org_id == org_id,
+            LotRow.packhouse.is_not(None),
+            LotRow.status != "cancelled",
+        )
+    )
+    return {*profiles, *(packhouse for packhouse in lots if packhouse is not None)}
 
 
 def _packhouse_out(row: PackhouseRow, used: set[str]) -> PackhouseOut:
@@ -206,26 +210,6 @@ def read_profile(principal: ShipperPrincipal) -> ShipperProfileView:
         )
 
 
-@router.post("/profile", status_code=status.HTTP_201_CREATED)
-def create_profile(body: ShipperProfileCreate, principal: ShipperPrincipal) -> ShipperProfileOut:
-    products = _checked_products(body.product_ids)
-    with database.begin() as db:
-        org = _writable_org(db, principal)
-        if _profile(db, org.id) is not None:
-            raise HTTPException(status_code=409, detail="화주 프로필이 이미 있습니다")
-        row = ShipperProfileRow(
-            id=f"sh-{uuid.uuid4().hex[:12]}",
-            org_id=org.id,
-            name=body.name or org.name,
-            packhouse_id=_own_packhouse_id(db, org.id, body.packhouse_id),
-            product_ids=products,
-            source=REGISTERED_SOURCE,
-        )
-        db.add(row)
-        db.flush()
-        return _profile_out(row)
-
-
 @router.patch("/profile")
 def update_profile(body: ShipperProfilePatch, principal: ShipperPrincipal) -> ShipperProfileOut:
     products = _checked_products(body.product_ids) if body.product_ids is not None else None
@@ -236,8 +220,17 @@ def update_profile(body: ShipperProfilePatch, principal: ShipperPrincipal) -> Sh
             raise HTTPException(status_code=404, detail=PROFILE_NOT_FOUND)
         if body.name is not None:
             row.name = body.name
-        if body.packhouse_id is not None:
+        if body.packhouse_id is not None and body.packhouse_id != row.packhouse_id:
             row.packhouse_id = _own_packhouse_id(db, org.id, body.packhouse_id)
+            db.execute(
+                update(LotRow)
+                .where(
+                    LotRow.shipper_org_id == org.id,
+                    LotRow.shipper_id == row.id,
+                    LotRow.status == "registered",
+                )
+                .values(packhouse=row.packhouse_id, updated_at=datetime.now(UTC))
+            )
         if products is not None:
             row.product_ids = products
         db.flush()
