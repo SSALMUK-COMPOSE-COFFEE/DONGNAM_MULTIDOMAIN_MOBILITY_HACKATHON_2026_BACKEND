@@ -41,6 +41,11 @@ router = APIRouter(prefix="/saas/shipper", tags=["saas-shipper"])
 ShipperPrincipal = Annotated[Principal, Depends(require_role("shipper"))]
 
 
+class ShipperLotCreate(IntakeRequest):
+    shipper: str | None = None
+    shipper_org_id: str | None = None
+
+
 class ShipperDecision(BaseModel):
     accept: bool
     note: str | None = None
@@ -82,13 +87,10 @@ def list_lots(
 
 
 @router.post("/lots", status_code=status.HTTP_201_CREATED)
-def create_lot(body: IntakeRequest, principal: ShipperPrincipal) -> IntakePreview:
-    owned = body.model_copy(
-        update={
-            "shipper": _own_shipper(principal, body.shipper),
-            "plan_id": None,
-            "save": True,
-        }
+def create_lot(body: ShipperLotCreate, principal: ShipperPrincipal) -> IntakePreview:
+    fields = body.model_dump(exclude={"shipper", "shipper_org_id", "plan_id", "save"})
+    owned = IntakeRequest(
+        **fields, shipper=_own_shipper(principal, body.shipper), plan_id=None, save=True
     )
     return register(owned, _scope(principal))
 
