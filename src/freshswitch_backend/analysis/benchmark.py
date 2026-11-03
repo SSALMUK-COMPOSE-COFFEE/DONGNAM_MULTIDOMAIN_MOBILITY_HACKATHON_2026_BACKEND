@@ -278,6 +278,25 @@ def empty_slot_cost(plan: Plan) -> int:
     )
 
 
+def tariff_empty_slot_cost(plan: Plan) -> int:
+    tariff_products = {t.product_id for t in plan.settlement_tariffs}
+    tariff_pallets: defaultdict[str, int] = defaultdict(int)
+    for a in plan.assignments:
+        if a.container_id is not None and a.product_id in tariff_products:
+            tariff_pallets[a.container_id] += a.pallets
+    return sum(
+        round(
+            c.container_cost
+            * (c.capacity_pallets - c.pallets)
+            / c.capacity_pallets
+            * tariff_pallets[c.container_id]
+            / c.pallets
+        )
+        for c in plan.containers
+        if c.used and c.capacity_pallets and c.pallets and tariff_pallets[c.container_id]
+    )
+
+
 def _basis_gap(result: MethodResult, parts: list[Part]) -> MethodBasisGap:
     tariffed = [s for _, plan, _ in parts for s in plan.settlements if s.basis != "operational"]
     pallets = sum(s.sea_pallets + s.air_pallets for s in tariffed)
@@ -293,6 +312,8 @@ def _basis_gap(result: MethodResult, parts: list[Part]) -> MethodBasisGap:
         tariff_sea_pallets=sum(s.sea_pallets for s in tariffed),
         settlement_cost_gap_per_tariff_pallet=round(cost_gap / pallets) if pallets else None,
         empty_slot_cost=sum(empty_slot_cost(plan) for _, plan, _ in parts),
+        tariff_settlement_savings=sum(s.savings for s in tariffed),
+        tariff_empty_slot_cost=sum(tariff_empty_slot_cost(plan) for _, plan, _ in parts),
     )
 
 
@@ -360,14 +381,69 @@ def _cost_gap_phrase(gap: MethodBasisGap) -> str:
     )
 
 
+def _savings_verdict(opt: MethodBasisGap, fcfs: MethodBasisGap) -> str:
+    diff = opt.operational_savings - fcfs.operational_savings
+    if diff > 0:
+        return f"최적화가 {diff:,}원 더 아낀다"
+    if diff < 0:
+        return f"선착순이 {-diff:,}원 더 아낀다"
+    return "두 방법이 같다"
+
+
+def _tariff_share_phrase(opt: MethodBasisGap, fcfs: MethodBasisGap) -> str:
+    d_tariff = fcfs.tariff_settlement_savings - opt.tariff_settlement_savings
+    d_sea = fcfs.tariff_sea_pallets - opt.tariff_sea_pallets
+    if d_tariff > 0 and d_sea > 0:
+        return (
+            f"선착순은 정산표 화주 해상 파렛트가 {d_sea}개 더 많아"
+            f"({fcfs.tariff_sea_pallets} vs {opt.tariff_sea_pallets}) 정산표 몫 정산 절감이 "
+            f"{d_tariff:,}원 늘지만, "
+        )
+    return (
+        f"정산표 화주 정산 절감은 선착순 {fcfs.tariff_settlement_savings:,}원, 최적화 "
+        f"{opt.tariff_settlement_savings:,}원이고, "
+    )
+
+
+def _rest_phrase(opt: MethodBasisGap, fcfs: MethodBasisGap) -> str:
+    d_total = fcfs.settlement_savings - opt.settlement_savings
+    d_rest = d_total - (fcfs.tariff_settlement_savings - opt.tariff_settlement_savings)
+    if d_rest > 0:
+        return (
+            f"나머지 {d_rest:,}원은 정산표 밖 품목(운영비 정산)·고정 배정 차이에서 선착순이 "
+            "더 아낀 몫이다. "
+        )
+    if d_rest < 0:
+        return (
+            f"정산표 밖 품목(운영비 정산)·고정 배정 차이에서는 최적화가 {-d_rest:,}원 더 아낀다. "
+        )
+    return ""
+
+
+def _empty_slot_phrase(opt: MethodBasisGap, fcfs: MethodBasisGap) -> str:
+    diff = fcfs.tariff_empty_slot_cost - opt.tariff_empty_slot_cost
+    if diff > 0:
+        compare = f"선착순이 {diff:,}원 크고"
+    elif diff < 0:
+        compare = f"최적화가 {-diff:,}원 크고"
+    else:
+        compare = "같고"
+    return (
+        f"쓴 컨테이너 빈칸 비용(컨테이너 비용 × 빈 파렛트 ÷ 용량)은 선착순 "
+        f"{fcfs.empty_slot_cost:,}원, 최적화 {opt.empty_slot_cost:,}원이다. 그중 정산표 품목 "
+        f"파렛트 몫(빈칸 비용 × 정산표 품목 파렛트 ÷ 실린 파렛트)은 선착순 "
+        f"{fcfs.tariff_empty_slot_cost:,}원, 최적화 {opt.tariff_empty_slot_cost:,}원으로 "
+        f"{compare} 이 몫은 정산 단가에 잡히지 않는다. "
+    )
+
+
 def settlement_fcfs_explanation(scenario: Scenario, plan: Plan, gaps: list[MethodBasisGap]) -> str:
     by = {g.method: g for g in gaps}
     opt, fcfs = by["optimizer"], by["fcfs"]
     tail = (
         f"화주 정산액 − 운영비(음수면 플랫폼이 떠안는 몫)는 선착순 {_cost_gap_phrase(fcfs)}, "
         f"최적화 {_cost_gap_phrase(opt)}이다. 운영비 기준 절감은 최적화 {opt.operational_savings:,}원, "
-        f"선착순 {fcfs.operational_savings:,}원으로 최적화가 "
-        f"{opt.operational_savings - fcfs.operational_savings:,}원 더 아낀다"
+        f"선착순 {fcfs.operational_savings:,}원으로 {_savings_verdict(opt, fcfs)}"
     )
     if fcfs.settlement_savings <= opt.settlement_savings:
         return (
@@ -379,12 +455,9 @@ def settlement_fcfs_explanation(scenario: Scenario, plan: Plan, gaps: list[Metho
     return (
         f"정산 기준 절감은 선착순 {fcfs.settlement_savings:,}원이 최적화 "
         f"{opt.settlement_savings:,}원보다 {fcfs.settlement_savings - opt.settlement_savings:,}원 "
-        f"크다. 정산표는 {unit}으로 매겨 컨테이너가 얼마나 찼는지 보지 않는다. 선착순은 정산표 "
-        f"화주 해상 파렛트가 {fcfs.tariff_sea_pallets - opt.tariff_sea_pallets}개 더 많아"
-        f"({fcfs.tariff_sea_pallets} vs {opt.tariff_sea_pallets}) 정산 절감이 늘지만, 쓴 컨테이너 "
-        f"빈칸 비용(컨테이너 비용 × 빈 파렛트 ÷ 용량)이 {fcfs.empty_slot_cost:,}원으로 최적화 "
-        f"{opt.empty_slot_cost:,}원보다 {fcfs.empty_slot_cost - opt.empty_slot_cost:,}원 크고 "
-        f"이 비용은 정산 단가에 잡히지 않는다. {tail}"
+        f"크다. 정산표는 {unit}으로 매겨 컨테이너가 얼마나 찼는지 보지 않는다. "
+        f"{_tariff_share_phrase(opt, fcfs)}{_empty_slot_phrase(opt, fcfs)}{_rest_phrase(opt, fcfs)}"
+        f"{tail}"
     )
 
 

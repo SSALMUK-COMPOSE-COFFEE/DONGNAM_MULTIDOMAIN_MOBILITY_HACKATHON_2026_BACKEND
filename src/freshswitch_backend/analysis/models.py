@@ -172,6 +172,8 @@ class MethodBasisGap(BaseModel):
     tariff_sea_pallets: int
     settlement_cost_gap_per_tariff_pallet: int | None
     empty_slot_cost: int
+    tariff_settlement_savings: int = 0
+    tariff_empty_slot_cost: int = 0
 
 
 class BenchmarkResult(BaseModel):

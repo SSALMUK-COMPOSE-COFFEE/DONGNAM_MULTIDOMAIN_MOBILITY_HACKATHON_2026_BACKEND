@@ -12,7 +12,7 @@ from freshswitch_backend.analysis import (
 from freshswitch_backend.analysis.benchmark import compare_methods, violations
 from freshswitch_backend.analysis.params import SPEC_BY_KEY, anchor_value, scaled
 from freshswitch_backend.data.loader import get_scenario
-from freshswitch_backend.optimize import solve_plan
+from freshswitch_backend.optimize import AIR, solve_plan
 from freshswitch_backend.planning.service import build_plan
 
 
@@ -317,6 +317,34 @@ def test_benchmark_explains_settlement_vs_operational_basis(scenario, bench):
     ):
         assert f"{number:,}원" in text
     assert "딸기" in text
+
+
+def test_benchmark_tariff_empty_slot_share(bench):
+    gaps = {g.method: g for g in bench.basis_gaps}
+    opt, fcfs = gaps["optimizer"], gaps["fcfs"]
+    assert fcfs.tariff_empty_slot_cost == 9_513_000
+    assert opt.tariff_empty_slot_cost == 1_359_000
+    assert fcfs.tariff_settlement_savings - opt.tariff_settlement_savings == 498_000
+    text = bench.settlement_fcfs_explanation
+    for phrase in ("498,000원", "(19 vs 17)", "9,513,000원", "1,359,000원", "8,154,000원"):
+        assert phrase in text
+    assert "최적화가 7,832,517원 더 아낀다" in text
+    assert "나머지" not in text
+
+
+def test_benchmark_explanation_splits_fixed_plan_gap(scenario):
+    plan = build_plan(scenario, fixed={"lot-sangju-gr-1": AIR}).plan
+    text = benchmark(scenario, plan).settlement_fcfs_explanation
+    assert "6,583,577원 크다" in text
+    assert "정산표 몫 정산 절감이 498,000원" in text
+    assert "나머지 6,085,577원" in text
+
+
+def test_benchmark_explanation_tail_follows_sign(scenario):
+    plan = build_plan(scenario, fixed={"lot-jinju-sb-1": AIR, "lot-sangju-gr-1": AIR}).plan
+    text = benchmark(scenario, plan).settlement_fcfs_explanation
+    assert "-2,154,542원 더 아낀다" not in text
+    assert "선착순이 2,154,542원 더 아낀다" in text
 
 
 def test_benchmark_endpoint_carries_basis_fields(client):
