@@ -275,7 +275,7 @@ def test_shipper_view_anonymizes_other_shippers(
     assert len(others) == 4 and all(p["lat"] is None and p["lon"] is None for p in others)
     names = [s["name"] for s in body["scenario"]["shippers"]]
     assert names[0] == "진주 딸기 수출농가 A"
-    assert names[1:] == ["화주 A", "화주 B", "화주 C", "화주 D"]
+    assert names[1:] == ["다른 화주 1", "다른 화주 2", "다른 화주 3", "다른 화주 4"]
     assert sum(c["pallets"] for c in body["plan"]["containers"]) > 0
 
     listed = shipper_client.get("/api/saas/shipper/plans").json()

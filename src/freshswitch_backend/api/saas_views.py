@@ -124,13 +124,11 @@ class PlatformSettlement(BaseModel):
     shippers: list[PlatformShipperShare]
 
 
+OTHER_SHIPPER_LABEL = "다른 화주"
+
+
 def _label(index: int) -> str:
-    letters = ""
-    index += 1
-    while index:
-        index, rest = divmod(index - 1, 26)
-        letters = chr(ord("A") + rest) + letters
-    return letters
+    return str(index + 1)
 
 
 def _first_voyage(session: PlanSession) -> tuple[str | None, datetime | None]:
@@ -255,17 +253,17 @@ class Anonymizer:
             tokens[sid] = f"anon-{label}"
             shipper = names.get(sid)
             if shipper is not None:
-                tokens[shipper.name] = f"화주 {label}"
+                tokens[shipper.name] = f"{OTHER_SHIPPER_LABEL} {label}"
                 short = short_name(shipper.name)
                 if len(short) >= 2 and short not in own_shorts:
-                    tokens.setdefault(short, f"화주 {label}")
+                    tokens.setdefault(short, f"{OTHER_SHIPPER_LABEL} {label}")
                 ph = packhouses.get(shipper.packhouse_id)
                 if shipper.packhouse_id not in own_packhouses:
                     anon_ph = f"anon-ph-{label}"
                     tokens[shipper.packhouse_id] = anon_ph
                     self.hidden_packhouses.add(anon_ph)
                     if ph is not None:
-                        tokens[ph.name] = f"화주 {label} 선과장"
+                        tokens[ph.name] = f"{OTHER_SHIPPER_LABEL} {label} 선과장"
             count = 0
             for lot in scenario.lots:
                 if lot.shipper_id == sid:
