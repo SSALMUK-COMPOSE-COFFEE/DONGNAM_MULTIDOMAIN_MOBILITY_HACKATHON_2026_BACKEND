@@ -61,10 +61,12 @@ uv run --with pyserial python scripts/arduino/bridge.py --port /dev/ttyACM0 \
 SaaS 스택은 로그인 없는 판독을 받지 않는다. 조직에 등록한 기기의 토큰을 `X-Device-Token`으로
 보내야 하고, 어느 컨테이너·계획에 들어갈지는 서버 바인딩이 정한다.
 
-1. 플랫폼(또는 포워더)으로 로그인해 기기를 등록한다. 응답의 `device_token`은 이때 한 번만 나온다.
+1. 계획을 만든 플랫폼 조직으로 로그인해 기기를 등록한다. 계획·바인딩·판독이 모두 같은 조직에 있어야
+   하므로 등록과 바인딩은 계획 소유 조직(플랫폼) 세션으로만 한다. 포워더 세션은 플랫폼 계획에 바인딩할
+   수 없다(404). 응답의 `device_token`은 이때 한 번만 나온다.
    데모(sandbox) 조직은 기기 id가 `demo-`로 시작해야 하고, 실제 조직은 `demo-`·`sim-`을 쓸 수 없다.
    - `POST /test/api/saas/devices` `{"device_id": "demo-arduino-01"}` → `{"device_token": "..."}`
-2. 같은 세션으로 기기를 계획 컨테이너에 바인딩한다.
+2. 같은 플랫폼 세션으로 기기를 계획 컨테이너에 바인딩한다. `plan_id`는 그 플랫폼 조직이 만든 계획이어야 한다.
    - `POST /test/api/coldchain/bindings` `{"device_id": "demo-arduino-01", "container_id": "CA-01", "plan_id": "<계획 id>", "stage": "terminal"}`
 3. 브리지를 토큰과 함께 돌린다. `--container`·`--plan-id`는 생략한다(주면 바인딩과 같아야 한다).
 
