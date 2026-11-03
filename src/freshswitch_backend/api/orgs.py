@@ -48,6 +48,11 @@ class ForwarderAssignRequest(BaseModel):
 class ForwarderAssignment(BaseModel):
     plan_id: str
     forwarder: ForwarderRef
+    before_shipper_confirmation: bool = False
+
+
+AWAITING_SHIPPERS = "pending_shipper_confirmation"
+ASSIGN_BEFORE_CONFIRMATION = "화주 확인이 끝난 뒤 배정할 수 있습니다"
 
 
 @router.get("/orgs")
@@ -68,14 +73,15 @@ def list_orgs(
     return [OrgSummary(org_id=oid, org_type=kind, org_name=name) for oid, kind, name in rows]
 
 
-def _lock_own_plan(db: Session, plan_id: str, org_id: str) -> None:
+def _lock_own_plan(db: Session, plan_id: str, org_id: str) -> str:
     found = db.scalar(
-        select(PlanRow.plan_id)
+        select(PlanRow.status)
         .where(PlanRow.plan_id == plan_id, PlanRow.org_id == org_id)
         .with_for_update()
     )
     if found is None:
         raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")
+    return found
 
 
 @router.put("/platform/plans/{plan_id}/forwarder")
@@ -83,7 +89,7 @@ def assign_forwarder(
     plan_id: str, body: ForwarderAssignRequest, principal: PlatformPrincipal
 ) -> ForwarderAssignment:
     with database.begin() as db:
-        _lock_own_plan(db, plan_id, principal.org_id)
+        plan_status = _lock_own_plan(db, plan_id, principal.org_id)
         forwarder = db.get(OrganizationRow, body.forwarder_org_id)
         platform = db.get(OrganizationRow, principal.org_id)
         if (
@@ -93,6 +99,9 @@ def assign_forwarder(
             or forwarder.sandbox != platform.sandbox
         ):
             raise HTTPException(status_code=422, detail="포워더 조직이 아닙니다")
+        awaiting = plan_status == AWAITING_SHIPPERS
+        if awaiting and not platform.sandbox:
+            raise HTTPException(status_code=409, detail=ASSIGN_BEFORE_CONFIRMATION)
         db.execute(delete(PlanForwarderRow).where(PlanForwarderRow.plan_id == plan_id))
         db.add(
             PlanForwarderRow(
@@ -102,7 +111,9 @@ def assign_forwarder(
             )
         )
         return ForwarderAssignment(
-            plan_id=plan_id, forwarder=ForwarderRef(org_id=forwarder.id, org_name=forwarder.name)
+            plan_id=plan_id,
+            forwarder=ForwarderRef(org_id=forwarder.id, org_name=forwarder.name),
+            before_shipper_confirmation=awaiting,
         )
 
 

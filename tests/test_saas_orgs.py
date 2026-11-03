@@ -106,6 +106,7 @@ def test_assign_reassign_and_unassign(platform: TestClient) -> None:
     assert first.json() == {
         "plan_id": plan_id,
         "forwarder": {"org_id": DONGNAM, "org_name": "동남 콜드체인 포워딩"},
+        "before_shipper_confirmation": False,
     }
     assert _assigned(plan_id) == [DONGNAM]
 
