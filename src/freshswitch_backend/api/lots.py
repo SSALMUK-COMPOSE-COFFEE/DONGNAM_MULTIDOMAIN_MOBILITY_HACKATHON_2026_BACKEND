@@ -2,18 +2,29 @@ from datetime import date
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import delete, select
 
-from freshswitch_backend.api.auth import current_org_id
+from freshswitch_backend.api.auth import OptionalPrincipal, current_org_id
 from freshswitch_backend.api.intake import DEMO_SCOPE, IntakeScope, Scope, intake_error, register
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import Scenario
 from freshswitch_backend.intake.models import FieldError, IntakePreview, IntakeRequest
 from freshswitch_backend.intake.service import IntakeError, resolve_names
 from freshswitch_backend.lots import LotFilter, LotPatch, LotStatus, RegisteredLot, lot_store
+from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.tables import LotRow
 
 router = APIRouter(prefix="/lots", tags=["lots"])
 
 OrgId = Annotated[str, Depends(current_org_id)]
+LOCKED_STATUSES = frozenset({"planned", "shipped"})
+LOT_NOT_FOUND = "등록된 로트를 찾을 수 없습니다"
+LOT_LOCKED = "계획에 들어간 출하는 수정·삭제할 수 없습니다"
+LOCKED_STATUS_FORBIDDEN = "화주는 등록·취소 상태로만 바꿀 수 있습니다"
+
+
+class LotLocked(Exception):
+    pass
 
 
 def _lot(lot_id: str, org_id: str) -> RegisteredLot:
@@ -119,21 +130,59 @@ def _validate_patch(
     return values
 
 
-@router.patch("/{lot_id}")
-def update_lot(lot_id: str, patch: LotPatch, scope: Scope, org_id: OrgId) -> RegisteredLot:
-    extra = () if scope is DEMO_SCOPE else (scope,)
+def update_locked_lot(
+    lot_id: str, patch: LotPatch, scope: IntakeScope, org_id: str
+) -> RegisteredLot:
+    if patch.status in LOCKED_STATUSES:
+        raise HTTPException(status_code=422, detail=LOCKED_STATUS_FORBIDDEN)
+
+    def change(lot: RegisteredLot) -> dict[str, Any]:
+        if lot.status in LOCKED_STATUSES:
+            raise LotLocked(lot.id)
+        return _validate_patch(lot, patch, scope)
+
     try:
-        updated = lot_store.update(
-            lot_id, lambda lot: _validate_patch(lot, patch, *extra), org_id=org_id
-        )
+        updated = lot_store.update(lot_id, change, org_id=org_id)
+    except LotLocked as exc:
+        raise HTTPException(status_code=409, detail=LOT_LOCKED) from exc
     except IntakeError as exc:
         raise intake_error(exc) from exc
     if updated is None:
-        raise HTTPException(status_code=404, detail="등록된 로트를 찾을 수 없습니다")
+        raise HTTPException(status_code=404, detail=LOT_NOT_FOUND)
+    return updated
+
+
+def delete_unlocked_lot(lot_id: str, org_id: str) -> None:
+    with database.begin() as db:
+        owned = (LotRow.id == lot_id) & (LotRow.shipper_org_id == org_id)
+        removed = db.execute(
+            delete(LotRow).where(owned, LotRow.status.not_in(LOCKED_STATUSES))
+        ).rowcount
+        if removed:
+            return
+        exists = db.scalar(select(LotRow.id).where(owned))
+    if exists is not None:
+        raise HTTPException(status_code=409, detail=LOT_LOCKED)
+    raise HTTPException(status_code=404, detail=LOT_NOT_FOUND)
+
+
+@router.patch("/{lot_id}")
+def update_lot(lot_id: str, patch: LotPatch, scope: Scope, org_id: OrgId) -> RegisteredLot:
+    if scope is not DEMO_SCOPE:
+        return update_locked_lot(lot_id, patch, scope, org_id)
+    try:
+        updated = lot_store.update(lot_id, lambda lot: _validate_patch(lot, patch), org_id=org_id)
+    except IntakeError as exc:
+        raise intake_error(exc) from exc
+    if updated is None:
+        raise HTTPException(status_code=404, detail=LOT_NOT_FOUND)
     return updated
 
 
 @router.delete("/{lot_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_lot(lot_id: str, org_id: OrgId) -> None:
+def delete_lot(lot_id: str, org_id: OrgId, principal: OptionalPrincipal) -> None:
+    if principal is not None:
+        delete_unlocked_lot(lot_id, org_id)
+        return
     if not lot_store.delete(lot_id, org_id=org_id):
-        raise HTTPException(status_code=404, detail="등록된 로트를 찾을 수 없습니다")
+        raise HTTPException(status_code=404, detail=LOT_NOT_FOUND)

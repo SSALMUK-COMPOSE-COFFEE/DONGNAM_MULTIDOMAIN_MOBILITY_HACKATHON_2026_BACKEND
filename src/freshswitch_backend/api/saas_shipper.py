@@ -3,11 +3,11 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import delete, select
+from sqlalchemy import select
 
 from freshswitch_backend.api.auth import Principal, require_role
-from freshswitch_backend.api.intake import IntakeScope, intake_error, register
-from freshswitch_backend.api.lots import _validate_patch
+from freshswitch_backend.api.intake import IntakeScope, register
+from freshswitch_backend.api.lots import delete_unlocked_lot, update_locked_lot
 from freshswitch_backend.api.saas_access import (
     PlanAccess,
     org_shipper_ids,
@@ -26,10 +26,9 @@ from freshswitch_backend.api.saas_views import (
 )
 from freshswitch_backend.execution.models import ConfirmRequest, RequestResultBody
 from freshswitch_backend.intake.models import IntakePreview, IntakeRequest
-from freshswitch_backend.intake.service import IntakeError
 from freshswitch_backend.lots import LotFilter, LotPatch, LotStatus, RegisteredLot, lot_store
 from freshswitch_backend.persistence import database
-from freshswitch_backend.persistence.tables import LotRow, PlanRow
+from freshswitch_backend.persistence.tables import PlanRow
 from freshswitch_backend.planning.store import (
     OrderInputError,
     PlanSession,
@@ -40,13 +39,6 @@ from freshswitch_backend.planning.store import (
 router = APIRouter(prefix="/saas/shipper", tags=["saas-shipper"])
 
 ShipperPrincipal = Annotated[Principal, Depends(require_role("shipper"))]
-LOCKED_STATUSES = frozenset({"planned", "shipped"})
-LOT_NOT_FOUND = "등록된 로트를 찾을 수 없습니다"
-LOT_LOCKED = "계획에 들어간 출하는 수정·삭제할 수 없습니다"
-
-
-class LotLocked(Exception):
-    pass
 
 
 class ShipperDecision(BaseModel):
@@ -103,41 +95,14 @@ def create_lot(body: IntakeRequest, principal: ShipperPrincipal) -> IntakePrevie
 
 @router.patch("/lots/{lot_id}")
 def update_lot(lot_id: str, patch: LotPatch, principal: ShipperPrincipal) -> RegisteredLot:
-    if patch.status in LOCKED_STATUSES:
-        raise HTTPException(status_code=422, detail="화주는 등록·취소 상태로만 바꿀 수 있습니다")
     fields = patch.model_fields_set - {"shipper"}
     cleaned = LotPatch(**{name: getattr(patch, name) for name in fields})
-    scope = _scope(principal)
-
-    def change(lot: RegisteredLot) -> dict[str, Any]:
-        if lot.status in LOCKED_STATUSES:
-            raise LotLocked(lot.id)
-        return _validate_patch(lot, cleaned, scope)
-
-    try:
-        updated = lot_store.update(lot_id, change, org_id=principal.org_id)
-    except LotLocked as exc:
-        raise HTTPException(status_code=409, detail=LOT_LOCKED) from exc
-    except IntakeError as exc:
-        raise intake_error(exc) from exc
-    if updated is None:
-        raise HTTPException(status_code=404, detail=LOT_NOT_FOUND)
-    return updated
+    return update_locked_lot(lot_id, cleaned, _scope(principal), principal.org_id)
 
 
 @router.delete("/lots/{lot_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_lot(lot_id: str, principal: ShipperPrincipal) -> None:
-    with database.begin() as db:
-        owned = (LotRow.id == lot_id) & (LotRow.shipper_org_id == principal.org_id)
-        removed = db.execute(
-            delete(LotRow).where(owned, LotRow.status.not_in(LOCKED_STATUSES))
-        ).rowcount
-        if removed:
-            return
-        exists = db.scalar(select(LotRow.id).where(owned))
-    if exists is not None:
-        raise HTTPException(status_code=409, detail=LOT_LOCKED)
-    raise HTTPException(status_code=404, detail=LOT_NOT_FOUND)
+    delete_unlocked_lot(lot_id, principal.org_id)
 
 
 def _sessions(principal: Principal) -> list[PlanSession]:
