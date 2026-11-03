@@ -21,3 +21,10 @@ def test_shipper_plan_detail_holds_only_own_collection(
     else:
         assert plan["total_collection_route"] == own_cost["operational"]["collection"]
         assert plan["total_collection_route"] < full["total_collection_route"]
+
+
+def test_alert_stream_disables_proxy_buffering(client: TestClient) -> None:
+    stream = client.get("/api/coldchain/alerts/stream", params={"since": 0, "timeout": 0})
+    assert stream.status_code == 200
+    assert stream.headers["cache-control"] == "no-cache, no-transform"
+    assert stream.headers["x-accel-buffering"] == "no"

@@ -273,7 +273,11 @@ async def stream_alerts(
             yield ": keepalive\n\n"
             await asyncio.sleep(1)
 
-    return StreamingResponse(events(), media_type="text/event-stream")
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/simulate/presets")
