@@ -11,6 +11,7 @@ import httpx
 from pydantic import BaseModel
 
 from freshswitch_backend.config import get_settings
+from freshswitch_backend.integrations.errors import public_error
 from freshswitch_backend.integrations.mof_snapshot import SNAPSHOT_ROOT
 from freshswitch_backend.integrations.mof_vessel import ERROR_MESSAGES, parse_kst_datetime
 
@@ -269,9 +270,9 @@ LIVE_ERRORS = (MissingUlsanKey, UlsanApiError, httpx.HTTPError, TimeoutError, OS
 
 
 def _reason(exc: BaseException) -> str:
-    if isinstance(exc, TimeoutError):
-        return "울산항 선박위치 API 응답 시간 초과"
-    return str(exc) or type(exc).__name__
+    if isinstance(exc, MissingUlsanKey):
+        return "울산항 선박위치 API 키가 설정되지 않았습니다"
+    return public_error(exc, "울산항 선박위치 API")
 
 
 class PositionProvider:

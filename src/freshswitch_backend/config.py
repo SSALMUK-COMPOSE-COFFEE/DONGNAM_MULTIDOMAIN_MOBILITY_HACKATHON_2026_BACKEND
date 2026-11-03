@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     offline_mode: bool = False
     replan_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
     explain_timeout_seconds: float = Field(default=8.0, gt=0, le=10)
+    demo_reset_token: SecretStr = SecretStr("")
 
 
 @lru_cache

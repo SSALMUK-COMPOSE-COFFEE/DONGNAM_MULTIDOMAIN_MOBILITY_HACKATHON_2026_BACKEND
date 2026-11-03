@@ -34,6 +34,23 @@ def shipper_error(ctx: ExplainContext, shipper: ShipperImpact, text: str) -> str
         return "다른 화주의 금액 또는 입력에 없는 금액"
     own = render_template(ctx.model_copy(update={"shippers": [shipper]})).shipper_messages[0]
     facts = own.message.split("조정되었습니다.", 1)[-1].strip()
+    normalize = lambda value: " ".join(value.split())
+    if normalize(text) == normalize(own.message):
+        return None
+    prefixes = (
+        "",
+        "안녕하세요.",
+        f"{shipper.shipper_name}님,",
+        f"안녕하세요, {shipper.shipper_name}님.",
+        f"안녕하세요. {shipper.shipper_name}님,",
+    )
+    suffixes = ("", "감사합니다.", "확인 부탁드립니다.", "확인해 주세요.")
+    if not any(
+        normalize(text) == normalize(f"{prefix} {facts} {suffix}")
+        for prefix in prefixes
+        for suffix in suffixes
+    ):
+        return "검증된 사실과 허용된 인사 외의 내용"
     cost_fact = facts.split("다.", 1)[0] + "다."
     if cost_fact not in text:
         return "검증된 변경 전후 비용·증감 문구 누락"

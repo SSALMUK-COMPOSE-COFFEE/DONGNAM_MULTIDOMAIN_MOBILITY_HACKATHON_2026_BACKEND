@@ -149,7 +149,7 @@ def test_repeated_poor_arrivals_shift_strawberry_to_air(client: TestClient) -> N
     assert shippers["sh-pohang"]["savings_change"] == 0
 
 
-def test_arrival_hook_is_idempotent_and_reads_outage(client: TestClient) -> None:
+def test_arrival_hook_is_idempotent_and_reads_outage(client: TestClient, reset_admin_headers) -> None:
     plan_id = client.post("/api/plans", json={}).json()["plan_id"]
     run = client.post(
         "/api/coldchain/simulate",
@@ -191,7 +191,7 @@ def test_arrival_hook_is_idempotent_and_reads_outage(client: TestClient) -> None
     assert last["so2_in_container"] is True
     table = client.get("/api/quality/loss-rates").json()
     assert _cell(table)["origins"] == {"seed": 3, "arrival": 1}
-    client.post("/api/demo/reset")
+    client.post("/api/demo/reset", headers=reset_admin_headers)
     assert client.get("/api/quality/observations").json()["count"] == 6
 
 

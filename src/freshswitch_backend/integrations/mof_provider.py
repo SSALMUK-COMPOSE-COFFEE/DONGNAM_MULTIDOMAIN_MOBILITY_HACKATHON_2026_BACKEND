@@ -6,6 +6,7 @@ from typing import Any, Literal
 import httpx
 from pydantic import BaseModel
 
+from freshswitch_backend.integrations.errors import public_error
 from freshswitch_backend.integrations.mof_snapshot import (
     SnapshotMissing,
     SnapshotStore,
@@ -54,9 +55,9 @@ class MovementFeed(BaseModel):
 
 
 def _reason(exc: BaseException) -> str:
-    if isinstance(exc, TimeoutError):
-        return "해수부 API 응답 시간 초과"
-    return str(exc) or type(exc).__name__
+    if isinstance(exc, MissingServiceKey):
+        return "해수부 API 키가 설정되지 않았습니다"
+    return public_error(exc, "해수부 API")
 
 
 class MovementProvider:

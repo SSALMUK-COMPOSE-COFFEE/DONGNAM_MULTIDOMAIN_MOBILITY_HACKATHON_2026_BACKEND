@@ -34,7 +34,7 @@ def _load_seed() -> tuple[str, list[SeedObservation]]:
 
 def _container_outage(plan_id: str, container_id: str) -> float | None:
     try:
-        record = coldchain_store.get_record(container_id)
+        record = coldchain_store.get_record(container_id, plan_id)
         if record.plan_id != plan_id:
             return None
         return coldchain_store.state(container_id, plan_id, points=2).outage.cumulative_minutes
@@ -48,6 +48,7 @@ class QualityHistory:
         self._lock = threading.RLock()
         self._observations: list[Observation] = []
         self._arrival_keys: dict[str, str] = {}
+        self._arrival_revisions: dict[str, int] = {}
         self.seed_label, self._seed = _load_seed()
         self.reset()
 
@@ -100,6 +101,7 @@ class QualityHistory:
                 [self._from_input(s, "seed", s.id, scenario) for s in self._seed] if seed else []
             )
             self._arrival_keys.clear()
+            self._arrival_revisions.clear()
             return cleared, len(self._observations)
 
     def observations(self) -> list[Observation]:
@@ -111,6 +113,9 @@ class QualityHistory:
         while len(self._observations) > MAX_OBSERVATIONS:
             dropped = self._observations.pop(0)
             self._arrival_keys = {k: v for k, v in self._arrival_keys.items() if v != dropped.id}
+            self._arrival_revisions = {
+                k: v for k, v in self._arrival_revisions.items() if k in self._arrival_keys
+            }
 
     def add(self, body: ObservationIn) -> Observation:
         observation = self._from_input(
@@ -162,6 +167,9 @@ class QualityHistory:
         now = plan_store.clock()
         key = f"{plan_id}:{result.lot_id}"
         with self._lock:
+            if session.inspection_revision < self._arrival_revisions.get(key, -1):
+                return next(o for o in self._observations if o.id == self._arrival_keys[key])
+            self._arrival_revisions[key] = session.inspection_revision
             obs_id = self._arrival_keys.get(key) or f"arr-{uuid.uuid4().hex[:12]}"
             observation = Observation(
                 id=obs_id,

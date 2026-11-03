@@ -79,7 +79,12 @@ async def busan_movements(
     direction: Literal["I", "O"] | None = None,
     demo: bool = False,
 ) -> MovementFeed:
-    day = datetime.strptime(date_str, "%Y%m%d").date() if date_str else datetime.now(KST).date()
+    try:
+        day = datetime.strptime(date_str, "%Y%m%d").date() if date_str else datetime.now(KST).date()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422, detail="date는 실제 존재하는 YYYYMMDD 날짜여야 합니다"
+        ) from exc
     return await load_busan_feed(factory, day, day, direction, demo=demo)
 
 

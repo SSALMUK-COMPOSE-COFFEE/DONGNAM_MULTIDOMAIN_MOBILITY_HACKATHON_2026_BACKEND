@@ -80,6 +80,7 @@ class Alert(BaseModel):
     seq: int = 0
     key: str
     container_id: str
+    plan_id: str | None = None
     level: AlertLevel
     kind: AlertKind
     title: str

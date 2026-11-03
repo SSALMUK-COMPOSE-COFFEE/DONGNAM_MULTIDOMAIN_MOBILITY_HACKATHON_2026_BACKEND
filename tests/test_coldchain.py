@@ -298,12 +298,12 @@ def test_settlement_preview(client: TestClient) -> None:
     assert settlement["inspections"] == []
 
 
-def test_reset_container_and_demo_reset(client: TestClient) -> None:
+def test_reset_container_and_demo_reset(client: TestClient, reset_admin_headers) -> None:
     client.post("/api/coldchain/simulate", json={"preset": "normal"})
     assert client.delete("/api/coldchain/containers/CA-01").status_code == 204
     assert client.get("/api/coldchain/containers").json() == []
     client.post("/api/coldchain/simulate", json={"preset": "normal"})
-    body = client.post("/api/demo/reset").json()
+    body = client.post("/api/demo/reset", headers=reset_admin_headers).json()
     assert body["cleared_coldchain_containers"] == 1
 
 
