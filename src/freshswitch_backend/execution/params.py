@@ -15,6 +15,11 @@ class ExecutionParams(BaseModel):
         "시간",
         "가정: 화주 확인 뒤 포워더가 선사·터미널·항공사에 요청을 넣고 회신을 받는 시간",
     )
+    shipper_response_hours: Quantity = _q(
+        2,
+        "시간",
+        "가정: 실행 지시가 만들어진 뒤 화주가 내용을 보고 확정·거절하는 데 필요한 최소 시간",
+    )
     booking_amendment_lead_hours: Quantity = _q(
         24,
         "시간",

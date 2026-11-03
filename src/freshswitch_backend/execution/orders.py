@@ -198,6 +198,60 @@ def _ca_setting(ctx: _Ctx, lot_ids: list[str]) -> str:
     return "; ".join(texts)
 
 
+def _add_cy_entry(
+    requests: _RequestBuilder,
+    ctx: _Ctx,
+    cid: str,
+    before: dict[str, int],
+    after: dict[str, int],
+    routes_before_by_lot: dict[str, tuple[str, str, datetime, datetime]],
+    routes_after_by_lot: dict[str, tuple[str, str, datetime, datetime]],
+    deadline: datetime,
+) -> None:
+    if not after:
+        return
+    new_etas = sorted(
+        {
+            (routes_after_by_lot[x][3], routes_after_by_lot[x][1])
+            for x in after
+            if x in routes_after_by_lot
+        }
+    )
+    old_etas = sorted(
+        {
+            (routes_before_by_lot[x][3], routes_before_by_lot[x][1])
+            for x in before
+            if x in routes_before_by_lot
+        }
+    )
+    if not new_etas or (before and new_etas == old_etas):
+        return
+    voyage = ctx.model_after.voyages[ctx.model_after.containers[cid].voyage_id]
+    pallets_before = sum(before.values())
+    pallets_after = sum(after.values())
+    arrivals = ", ".join(f"{truck} {fmt(eta)}" for eta, truck in new_etas)
+    previous = ", ".join(f"{truck} {fmt(eta)}" for eta, truck in old_etas) if old_etas else "없음"
+    requests.add(
+        kind="cy_entry",
+        counterparty_role="terminal",
+        counterparty=voyage.terminal,
+        channel=TERMINAL_CHANNEL,
+        deadline=deadline,
+        text=(
+            f"[CY 반입 예약 변경] {voyage.terminal} {voyage.vessel_name}({voyage.id}) "
+            f"{cid} 반입분 {pallets_before}→{pallets_after}파렛트. 트럭 도착 예정: "
+            f"{arrivals} (이전: {previous}). 반입 마감 {fmt(voyage.cy_cutoff)}."
+        ),
+        voyage_id=voyage.id,
+        container_id=cid,
+        lot_ids=sorted(set(before) | set(after)),
+        pallets_before=pallets_before,
+        pallets_after=pallets_after,
+        lot_pallets_before=dict(before),
+        lot_pallets_after=dict(after),
+    )
+
+
 def build_order(
     *,
     plan_id: str,
@@ -258,12 +312,25 @@ def build_order(
         for lot_id in affected_lots
         if lot_id in routes_after_by_lot and routes_after_by_lot[lot_id][0] in affected_voyages
     ]
+    gated_cutoffs = [
+        voyages_before[v].cy_cutoff
+        for v in affected_voyages
+        if v in voyages_before and voyages_before[v].cy_cutoff <= now
+    ]
+    dispatch_bound = True
     if departures:
         dispatch = min(departures)
         dispatch_basis = (
             f"집하 트럭 최종 출발 {fmt(dispatch)} "
             f"(CY 마감 {fmt(cy_cutoff)} − 집하 리드 "
             f"{(cy_cutoff - dispatch).total_seconds() / 3600:.1f}시간)"
+        )
+    elif gated_cutoffs:
+        dispatch = cy_cutoff
+        dispatch_bound = False
+        dispatch_basis = (
+            f"집하 경로 없음, CY 반입 마감 {fmt(min(gated_cutoffs))}이 지나 컨테이너가 이미 "
+            "터미널에 반입됨 → 집하 출발 기한 없음"
         )
     else:
         dispatch = cy_cutoff - timedelta(hours=p.fallback_pickup_lead_hours.value)
@@ -356,41 +423,32 @@ def build_order(
                 ),
                 **common,
             )
-        if after:
-            new_etas = sorted(
-                {
-                    (routes_after_by_lot[x][3], routes_after_by_lot[x][1])
-                    for x in after
-                    if x in routes_after_by_lot
-                }
+        _add_cy_entry(
+            requests,
+            ctx,
+            cid,
+            before,
+            after,
+            routes_before_by_lot,
+            routes_after_by_lot,
+            booking_deadline,
+        )
+    changed_ids = {cid for cid, _, _ in changed}
+    for cid in container_ids:
+        if cid in changed_ids:
+            continue
+        composition = _composition(alternative.plan, cid)
+        if composition:
+            _add_cy_entry(
+                requests,
+                ctx,
+                cid,
+                composition,
+                composition,
+                routes_before_by_lot,
+                routes_after_by_lot,
+                booking_deadline,
             )
-            old_etas = sorted(
-                {
-                    (routes_before_by_lot[x][3], routes_before_by_lot[x][1])
-                    for x in before
-                    if x in routes_before_by_lot
-                }
-            )
-            if new_etas and (not before or new_etas != old_etas):
-                arrivals = ", ".join(f"{truck} {fmt(eta)}" for eta, truck in new_etas)
-                previous = (
-                    ", ".join(f"{truck} {fmt(eta)}" for eta, truck in old_etas)
-                    if old_etas
-                    else "없음"
-                )
-                requests.add(
-                    kind="cy_entry",
-                    counterparty_role="terminal",
-                    counterparty=voyage.terminal,
-                    channel=TERMINAL_CHANNEL,
-                    deadline=booking_deadline,
-                    text=(
-                        f"[CY 반입 예약 변경] {voyage.terminal} {voyage.vessel_name}({voyage.id}) "
-                        f"{cid} 반입분 {pallets_before}→{pallets_after}파렛트. 트럭 도착 예정: "
-                        f"{arrivals} (이전: {previous}). 반입 마감 {fmt(voyage.cy_cutoff)}."
-                    ),
-                    **common,
-                )
     for voyage_id in sorted(rescheduled):
         voyage = voyages_after[voyage_id]
         extra = CostModel.terminal_extra_days(voyage)
@@ -473,14 +531,37 @@ def build_order(
                 ),
             )
 
+    processing = timedelta(hours=p.forwarder_processing_hours.value)
+    shipper_floor = now + timedelta(hours=p.shipper_response_hours.value)
+    forwarder_floor = shipper_floor + processing
+    floored = False
+    for request in requests.items:
+        if request.deadline < forwarder_floor:
+            for label in ("회신 기한 ", "취소 기한 "):
+                request.text = request.text.replace(
+                    label + fmt(request.deadline), label + fmt(forwarder_floor)
+                )
+            request.deadline = forwarder_floor
+            floored = True
     request_deadlines = [r.deadline for r in requests.items]
-    forwarder = min([dispatch, *request_deadlines])
-    shipper_deadline = forwarder - timedelta(hours=p.forwarder_processing_hours.value)
+    candidates = [dispatch, *request_deadlines] if dispatch_bound else request_deadlines
+    forwarder = min(candidates, default=forwarder_floor)
+    if forwarder < forwarder_floor:
+        forwarder = forwarder_floor
+        floored = True
+    shipper_deadline = forwarder - processing
     basis = (
         f"화주 확인 = 포워더 확정 기한 − 포워더 처리 {p.forwarder_processing_hours.value:g}시간(가정). "
         f"포워더 확정 = min(집하 출발 기한, 제3자 요청 회신 기한). {dispatch_basis}. "
         f"선사 부킹 변경 회신 = CY 마감 − {p.booking_amendment_lead_hours.value:g}시간(가정)"
     )
+    if floored:
+        basis += (
+            f". 계산한 기한이 이미 지났거나 너무 가까워 하한을 적용: 화주 확인 ≥ 지시 생성 "
+            f"{fmt(now)} + 화주 응답 {p.shipper_response_hours.value:g}시간(가정), "
+            f"포워더 확정·제3자 회신 ≥ 화주 확인 하한 + 포워더 처리 "
+            f"{p.forwarder_processing_hours.value:g}시간"
+        )
 
     initiator = None
     if event_lot:
@@ -538,6 +619,7 @@ def build_order(
         for ready in pulled_dates:
             harvest = day_start(ready) - timedelta(hours=p.harvest_notice_hours.value)
             deadline = min(deadline, harvest)
+        deadline = max(deadline, shipper_floor)
         lot_ids = sorted(
             {m.lot_id for m in moved_by_shipper.get(sid, [])}
             | {
