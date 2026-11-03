@@ -245,7 +245,7 @@ def read_params() -> dict[str, Quantity]:
 def bind(body: BindingRequest, org_id: OrgId, principal: OptionalPrincipal) -> Binding:
     _device_org(body.device_id, org_id, principal)
     try:
-        return coldchain_store.bind(body, org_id)
+        return coldchain_store.bind(body, org_id, plan_required=True)
     except (NotFound, ColdchainError) as exc:
         raise _http(exc) from exc
 

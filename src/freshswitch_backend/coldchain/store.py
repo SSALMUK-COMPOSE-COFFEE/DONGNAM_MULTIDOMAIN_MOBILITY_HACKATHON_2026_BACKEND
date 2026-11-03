@@ -554,11 +554,15 @@ class ColdchainStore:
         if cutoff is not None:
             db.execute(delete(ContainerRow).where(ContainerRow.seq <= cutoff, scope))
 
-    def bind(self, body: BindingRequest, org_id: str = DEMO_ORG) -> Binding:
+    def bind(
+        self, body: BindingRequest, org_id: str = DEMO_ORG, *, plan_required: bool = False
+    ) -> Binding:
         with self._lock, self._db.begin() as db:
             if _device_owner(db, body.device_id) not in (DEMO_ORG, org_id):
                 raise DeviceDenied(_foreign_device(body.device_id))
             plan_id = self._resolve_plan(db, body.container_id, body.plan_id, org_id)
+            if plan_id is None and plan_required and org_id != DEMO_ORG:
+                raise ColdchainError("계획을 지정하세요")
             self.require_plan(plan_id, body.container_id, org_id)
             binding = Binding(
                 device_id=body.device_id,

@@ -5,12 +5,16 @@ import pytest
 from fastapi.testclient import TestClient
 from saas_fixtures import demo_org_type
 
+from freshswitch_backend.coldchain.devices import token_hash
 from freshswitch_backend.config import get_settings
 from freshswitch_backend.data.loader import load_scenarios
 from freshswitch_backend.domain.ids import ID_MAX_LENGTH, id_error
 from freshswitch_backend.intake.models import Resolved
 from freshswitch_backend.intake.service import _lot_id
 from freshswitch_backend.main import create_app
+from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.tables import DeviceRow
+from freshswitch_backend.planning.store import store
 
 CSRF = {"X-Requested-With": "freshswitch"}
 BAD_IDS = ["x/y", "demo-a/b", "demo a", " ", "-lead", ".lead", "a" * (ID_MAX_LENGTH + 1), "부산"]
@@ -97,18 +101,10 @@ def test_coldchain3_device_id_rule(saas, bad: str) -> None:
     platform = _platform(saas)
     created = platform.post("/api/saas/devices", json={"device_id": bad}, headers=CSRF)
     assert created.status_code == 422, created.text
-    bound = platform.post(
-        "/api/coldchain/bindings", json={"device_id": bad, "container_id": "CA-01"}, headers=CSRF
-    )
-    assert bound.status_code == 422, bound.text
 
 
 @pytest.mark.parametrize("bad", ["x/y", "x y", "=1+1"])
-def test_coldchain3_reading_and_simulation_device_id_rule(client: TestClient, bad: str) -> None:
-    reading = {"device_id": bad, "container_id": "CA-01", "temp_c": 1.0, "power_on": True}
-    assert client.post("/api/coldchain/readings", json=reading).status_code == 422
-    bound = client.post("/api/coldchain/bindings", json={"device_id": bad, "container_id": "CA-01"})
-    assert bound.status_code == 422
+def test_coldchain3_simulation_device_id_rule(client: TestClient, bad: str) -> None:
     simulated = client.post("/api/coldchain/simulate", json={"device_id": bad})
     assert simulated.status_code == 422
 
@@ -118,4 +114,30 @@ def test_coldchain3_valid_device_can_be_deleted(saas) -> None:
     created = platform.post("/api/saas/devices", json={"device_id": "demo-a.b_c"}, headers=CSRF)
     assert created.status_code == 201, created.text
     deleted = platform.delete("/api/saas/devices/demo-a.b_c", headers=CSRF)
+    assert deleted.status_code == 204, deleted.text
+
+
+def test_coldchain3_legacy_device_id_keeps_working(saas) -> None:
+    legacy = "TK:0001"
+    token = "legacy-token-tk-0001"
+    with database.begin() as db:
+        db.add(DeviceRow(device_id=legacy, org_id="freshswitch", token_hash=token_hash(token)))
+    scenario = load_scenarios()["default"]
+    plan_id = store.create(scenario, org_id="freshswitch").plan_id
+    platform = _platform(saas)
+    bound = platform.post(
+        "/api/coldchain/bindings",
+        json={"device_id": legacy, "container_id": "CA-01", "plan_id": plan_id},
+        headers=CSRF,
+    )
+    assert bound.status_code == 201, bound.text
+    device = TestClient(saas, base_url="https://testserver")
+    reading = device.post(
+        "/api/coldchain/readings",
+        json={"device_id": legacy, "temp_c": 1.0, "power_on": True},
+        headers={"X-Device-Token": token},
+    )
+    assert reading.status_code == 200, reading.text
+    assert reading.json()["accepted"] == 1
+    deleted = platform.delete(f"/api/saas/devices/{legacy}", headers=CSRF)
     assert deleted.status_code == 204, deleted.text

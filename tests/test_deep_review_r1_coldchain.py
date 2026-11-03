@@ -94,3 +94,19 @@ def test_coldchain1_token_reading_of_deleted_plan_binding_is_rejected(saas) -> N
     )
     assert again.status_code == 200, again.text
     assert _count(platform, second) == before + 1
+
+
+def test_coldchain_saas_binding_without_plan_is_rejected(saas) -> None:
+    platform = _login(saas, PLATFORM)
+    created = platform.post("/api/saas/devices", json={"device_id": "demo-np1"}, headers=CSRF)
+    assert created.status_code == 201, created.text
+    bound = platform.post(
+        "/api/coldchain/bindings",
+        json={"device_id": "demo-np1", "container_id": "CA-77"},
+        headers=CSRF,
+    )
+    assert bound.status_code == 422, bound.text
+    assert bound.json()["detail"] == "계획을 지정하세요"
+    listed = platform.get("/api/coldchain/bindings")
+    assert listed.status_code == 200, listed.text
+    assert all(item["device_id"] != "demo-np1" for item in listed.json())
