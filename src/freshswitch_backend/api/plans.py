@@ -2,9 +2,13 @@ from datetime import timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
+from freshswitch_backend.api.computation import (
+    compute_replan,
+    explanation_budget,
+    request_deadline,
+)
 from freshswitch_backend.api.vessels import (
     VesselClientFactory,
     fetch_busan_movements,
@@ -127,20 +131,26 @@ async def post_event(
     body: EventRequest,
     llm: Annotated[bool | None, Query()] = None,
 ) -> ReplanResponse:
+    deadline = request_deadline()
     session = _session(plan_id)
     replayed = _replayed(plan_id, body.idempotency_key, "events", body)
     if replayed is not None:
         return replayed
-    result = await run_in_threadpool(
+    result = await compute_replan(
         replan,
         session.scenario,
         session.plan,
         body.event,
         air_locked=session.air_locked_lot_ids,
+        deadline=deadline,
     )
     annotate_cancellations(result, session.scenario, session.plan)
     result.explanation = await explain_replan(
-        session.scenario, session.plan, result, use_llm=llm_enabled(llm)
+        session.scenario,
+        session.plan,
+        result,
+        use_llm=llm_enabled(llm),
+        timeout_s=explanation_budget(deadline),
     )
     pending = store.add_pending(session, result)
     response = ReplanResponse(

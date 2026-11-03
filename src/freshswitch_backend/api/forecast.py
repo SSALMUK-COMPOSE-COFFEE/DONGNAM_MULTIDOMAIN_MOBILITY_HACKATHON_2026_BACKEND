@@ -2,9 +2,13 @@ from datetime import date
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
+from freshswitch_backend.api.computation import (
+    compute_replan,
+    explanation_budget,
+    request_deadline,
+)
 from freshswitch_backend.api.vessels import (
     UlsanClientFactory,
     load_ulsan_congestion,
@@ -88,6 +92,7 @@ async def delay_forecast(
     body: ForecastOptions | None = None,
     llm: Annotated[bool | None, Query()] = None,
 ) -> DelayForecastResponse:
+    deadline = request_deadline()
     session = store.get(plan_id)
     if session is None:
         raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")
@@ -105,16 +110,21 @@ async def delay_forecast(
     where: dict[str, str] = {}
     air: list[str] = []
     if event is not None:
-        result = await run_in_threadpool(
+        result = await compute_replan(
             replan,
             session.scenario,
             session.plan,
             event,
             air_locked=session.air_locked_lot_ids,
+            deadline=deadline,
         )
         annotate_cancellations(result, session.scenario, session.plan)
         result.explanation = await explain_replan(
-            session.scenario, session.plan, result, use_llm=llm_enabled(llm)
+            session.scenario,
+            session.plan,
+            result,
+            use_llm=llm_enabled(llm),
+            timeout_s=explanation_budget(deadline),
         )
         pending = store.add_pending(session, result)
         replan_response = DelayForecastReplan(
