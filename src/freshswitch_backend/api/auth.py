@@ -23,7 +23,12 @@ from sqlalchemy.orm import Session
 
 from freshswitch_backend.config import Settings, get_settings
 from freshswitch_backend.persistence import database
-from freshswitch_backend.persistence.orgs import AlreadyMember, InvalidInvitation, redeem_invitation
+from freshswitch_backend.persistence.orgs import (
+    AlreadyMember,
+    InvalidInvitation,
+    redeem_invitation,
+    usable_invitation,
+)
 from freshswitch_backend.persistence.passwords import hash_password, verify_password
 from freshswitch_backend.persistence.seed import demo_orgs, is_demo_email
 from freshswitch_backend.persistence.tables import (
@@ -42,6 +47,7 @@ LAST_SEEN_INTERVAL = timedelta(minutes=1)
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 INVALID_LOGIN = "이메일 또는 비밀번호가 올바르지 않습니다"
 TOO_MANY_REQUESTS = "요청이 너무 많습니다. 잠시 후 다시 시도하세요"
+SIGNUP_UNAVAILABLE = "가입할 수 없습니다. 입력한 정보를 확인하거나 로그인하세요"
 LOGIN_LOCKED = "로그인 실패가 반복되어 잠시 막혔습니다. 잠시 후 다시 시도하세요"
 LOGIN_ROUTE = "login"
 LOGIN_FAILURE_THRESHOLD = 5
@@ -71,7 +77,7 @@ class RateRule:
 
 AUTH_RATE_RULES: dict[str, RateRule] = {
     "demo-login": RateRule(per_client=60, window_seconds=60),
-    "signup": RateRule(per_client=30, window_seconds=600),
+    "signup": RateRule(per_client=30, window_seconds=3600),
     LOGIN_ROUTE: RateRule(per_client=30, window_seconds=300),
 }
 
@@ -666,9 +672,14 @@ def signup(body: SignupRequest, request: Request, response: Response) -> Me:
     password_hash = hash_password(body.password)
     try:
         with database.begin() as db:
+            if body.invite_code is not None:
+                try:
+                    usable_invitation(db, body.invite_code, _now())
+                except InvalidInvitation as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
             exists = db.scalar(select(UserRow.id).where(func.lower(UserRow.email) == body.email))
             if exists is not None:
-                raise HTTPException(status_code=409, detail="이미 가입된 이메일입니다")
+                raise HTTPException(status_code=409, detail=SIGNUP_UNAVAILABLE)
             user = UserRow(
                 id=f"user-{uuid.uuid4().hex}",
                 email=body.email,
@@ -694,7 +705,7 @@ def signup(body: SignupRequest, request: Request, response: Response) -> Me:
             db.flush()
             return _start_session(db, request, response, user)
     except IntegrityError as exc:
-        raise HTTPException(status_code=409, detail="이미 가입된 이메일입니다") from exc
+        raise HTTPException(status_code=409, detail=SIGNUP_UNAVAILABLE) from exc
 
 
 @router.post("/login")

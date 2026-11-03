@@ -79,9 +79,9 @@ def create_invitation(
     return row, code
 
 
-def redeem_invitation(
-    db: Session, code: str, user_id: str, now: datetime | None = None
-) -> OrgInvitationRow:
+def usable_invitation(
+    db: Session, code: str, now: datetime | None = None
+) -> tuple[OrgInvitationRow, OrganizationRow]:
     moment = now or datetime.now(UTC)
     invitation = db.scalar(
         select(OrgInvitationRow)
@@ -93,6 +93,14 @@ def redeem_invitation(
     org = db.get(OrganizationRow, invitation.org_id)
     if org is None or org.sandbox or org.type == "demo":
         raise InvalidInvitation(INVALID_INVITATION)
+    return invitation, org
+
+
+def redeem_invitation(
+    db: Session, code: str, user_id: str, now: datetime | None = None
+) -> OrgInvitationRow:
+    moment = now or datetime.now(UTC)
+    invitation, org = usable_invitation(db, code, moment)
     inserted = db.scalar(
         insert(MembershipRow)
         .values(user_id=user_id, org_id=org.id, role=invitation.role, created_at=moment)
