@@ -2,14 +2,21 @@ import json
 
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import PLATFORM_ORG_ID, SAAS_CSRF, SHIPPER_ORG_ID, login_client
+from saas_fixtures import (
+    OTHER_SHIPPER_ORG_ID,
+    PLATFORM_ORG_ID,
+    SAAS_CSRF,
+    SHIPPER_ORG_ID,
+    login_client,
+)
 
 from freshswitch_backend import observability, saas_readiness
 from freshswitch_backend.api import health
 from freshswitch_backend.config import get_settings
 from freshswitch_backend.main import create_app
 from freshswitch_backend.persistence import database
-from freshswitch_backend.persistence.tables import OrganizationRow
+from freshswitch_backend.persistence.seed import seed_lots
+from freshswitch_backend.persistence.tables import LotRow, OrganizationRow
 
 CONTAMINATION = "/api/ops/demo-contamination"
 
@@ -86,6 +93,8 @@ def test_contamination_rejects_anonymous_and_sessions_in_saas_mode(
 
 
 def test_fresh_seed_is_clean(client: TestClient, demo_tenants, reset_admin_headers) -> None:
+    with database.begin() as db:
+        seed_lots(db)
     report = client.get(CONTAMINATION, headers=reset_admin_headers).json()
     assert report["contaminated"] is False
     assert report["seed_completed"] is True
@@ -235,9 +244,6 @@ def test_template_fallback_check() -> None:
 def test_seeded_registered_lots_are_baseline_but_new_or_planned_lots_drift(
     client: TestClient, demo_tenants, reset_admin_headers
 ) -> None:
-    from freshswitch_backend.persistence.seed import seed_lots
-    from freshswitch_backend.persistence.tables import LotRow
-
     with database.begin() as db:
         assert seed_lots(db) > 0
     report = client.get(CONTAMINATION, headers=reset_admin_headers).json()
@@ -251,3 +257,41 @@ def test_seeded_registered_lots_are_baseline_but_new_or_planned_lots_drift(
     shipper = next(o for o in report["orgs"] if o["org_id"] == SHIPPER_ORG_ID)
     assert report["contaminated"] is True
     assert shipper["drift"] == {"lots": 1}
+
+
+def _seed_lot(org_id: str) -> LotRow:
+    with database.begin() as db:
+        lot = db.query(LotRow).filter(LotRow.shipper_org_id == org_id).order_by(LotRow.id).first()
+        db.expunge(lot)
+    return lot
+
+
+def test_tenants_without_seed_lots_report_missing_seed_lots(
+    client: TestClient, demo_tenants, reset_admin_headers
+) -> None:
+    report = client.get(CONTAMINATION, headers=reset_admin_headers).json()
+    shipper = next(o for o in report["orgs"] if o["org_id"] == SHIPPER_ORG_ID)
+    assert report["contaminated"] is True
+    assert shipper["drift"]["missing_seed_lots"] > 0
+    assert "lots" not in shipper["drift"]
+
+
+def test_changed_or_deleted_seed_lots_drift(
+    client: TestClient, demo_tenants, reset_admin_headers
+) -> None:
+    with database.begin() as db:
+        assert seed_lots(db) > 0
+    changed, deleted = _seed_lot(SHIPPER_ORG_ID), _seed_lot(OTHER_SHIPPER_ORG_ID)
+    jinju, sancheong = login_client(SHIPPER_ORG_ID), login_client(OTHER_SHIPPER_ORG_ID)
+
+    patched = jinju.patch(f"/api/saas/shipper/lots/{changed.id}", json={"pallets": 1})
+    removed = sancheong.delete(f"/api/saas/shipper/lots/{deleted.id}")
+
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["status"] == "registered"
+    assert removed.status_code == 204, removed.text
+    report = client.get(CONTAMINATION, headers=reset_admin_headers).json()
+    drift = {o["org_id"]: o["drift"] for o in report["orgs"]}
+    assert report["contaminated"] is True
+    assert drift[SHIPPER_ORG_ID] == {"lots": 1}
+    assert drift[OTHER_SHIPPER_ORG_ID] == {"missing_seed_lots": 1}

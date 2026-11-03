@@ -33,7 +33,25 @@ def test_kma_snapshot_is_listed_as_external_snapshot_with_source(tmp_path, monke
     assert load_snapshot(tmp_path / relative) == snapshot
 
 
-def test_repository_ships_no_kma_snapshot_until_one_is_fetched():
-    assert load_snapshot() is None
+def test_no_kma_snapshot_is_listed_or_loaded_until_one_is_fetched(tmp_path, monkeypatch):
+    relative = KMA_SNAPSHOT_PATH.relative_to(provenance.DATA_ROOT)
+    monkeypatch.setattr(provenance, "DATA_ROOT", tmp_path)
+
+    assert load_snapshot(tmp_path / relative) is None
     paths = {asset["path"] for asset in provenance.asset_inventory()}
-    assert KMA_SNAPSHOT_PATH.relative_to(provenance.DATA_ROOT).as_posix() not in paths
+    assert relative.as_posix() not in paths
+
+
+def test_repository_kma_snapshot_is_listed_only_as_a_fetched_external_snapshot():
+    relative = KMA_SNAPSHOT_PATH.relative_to(provenance.DATA_ROOT).as_posix()
+    assets = {asset["path"]: asset for asset in provenance.asset_inventory()}
+    snapshot = load_snapshot()
+
+    if snapshot is None:
+        assert relative not in assets
+        return
+    asset = assets[relative]
+    assert asset["kind"] == "external_snapshot"
+    assert asset["verification_status"] == "not_independently_verified"
+    assert asset["metadata"]["source_url"] == [FORECAST_DATASET_URL, WARNING_DATASET_URL]
+    assert datetime.fromisoformat(asset["metadata"]["fetched_at"]) == snapshot.fetched_at

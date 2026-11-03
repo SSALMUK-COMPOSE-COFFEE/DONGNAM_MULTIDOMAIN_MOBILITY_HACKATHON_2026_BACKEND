@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from freshswitch_backend.data.loader import get_scenario, load_scenarios
+from freshswitch_backend.domain.models import Scenario
 from freshswitch_backend.persistence.database import Database, database
 from freshswitch_backend.persistence.orgs import insert_demo_org
 from freshswitch_backend.persistence.passwords import hash_password
@@ -231,16 +232,10 @@ def _drop_other_scenario_lots(db: Session, scenario_id: str, owner_orgs: set[str
     )
 
 
-def seed_lots(db: Session, scenario_id: str = SCENARIO_ID, now: datetime | None = None) -> int:
-    scenario = get_scenario(scenario_id)
-    if scenario is None:
-        raise SeedError(f"시나리오를 찾을 수 없습니다: {scenario_id}")
-    owners = _sandbox_profile_orgs(db)
-    _drop_other_scenario_lots(db, scenario.id, set(owners.values()))
+def _seed_lot_values(db: Session, scenario: Scenario, owners: dict[str, str]) -> list[dict]:
     blocked = _real_plan_lot_ids(db)
     packhouses = {s.id: s.packhouse_id for s in scenario.shippers}
-    stamp = now or datetime.now(UTC)
-    values = [
+    return [
         {
             "id": lot.id,
             "scenario_id": scenario.id,
@@ -255,11 +250,29 @@ def seed_lots(db: Session, scenario_id: str = SCENARIO_ID, now: datetime | None 
             "packhouse": packhouses.get(lot.shipper_id),
             "source": lot.source,
             "status": "registered",
-            "created_at": stamp,
-            "updated_at": stamp,
         }
         for lot in scenario.lots
         if lot.shipper_id in owners and lot.id not in blocked
+    ]
+
+
+def seed_lot_baseline(db: Session, scenario_id: str = SCENARIO_ID) -> list[dict]:
+    scenario = get_scenario(scenario_id)
+    if scenario is None:
+        return []
+    return _seed_lot_values(db, scenario, _sandbox_profile_orgs(db))
+
+
+def seed_lots(db: Session, scenario_id: str = SCENARIO_ID, now: datetime | None = None) -> int:
+    scenario = get_scenario(scenario_id)
+    if scenario is None:
+        raise SeedError(f"시나리오를 찾을 수 없습니다: {scenario_id}")
+    owners = _sandbox_profile_orgs(db)
+    _drop_other_scenario_lots(db, scenario.id, set(owners.values()))
+    stamp = now or datetime.now(UTC)
+    values = [
+        {**value, "created_at": stamp, "updated_at": stamp}
+        for value in _seed_lot_values(db, scenario, owners)
     ]
     if not values:
         return 0

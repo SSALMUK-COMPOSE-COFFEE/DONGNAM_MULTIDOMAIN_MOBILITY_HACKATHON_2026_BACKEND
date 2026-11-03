@@ -3,13 +3,18 @@ from typing import Any
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from freshswitch_backend.api.access import require_demo_reset
 from freshswitch_backend.data.loader import load_scenarios
 from freshswitch_backend.persistence import database
-from freshswitch_backend.persistence.seed import DemoOrg, demo_orgs
+from freshswitch_backend.persistence.seed import (
+    SCENARIO_ID,
+    DemoOrg,
+    demo_orgs,
+    seed_lot_baseline,
+)
 from freshswitch_backend.persistence.tables import (
     DEMO_ORG,
     BindingRow,
@@ -31,7 +36,20 @@ router = APIRouter(prefix="/ops", tags=["ops"])
 
 SEEDED_SCOPES = ("demo", "sandbox")
 SEED_ORIGIN = "seed"
-SEED_LOT_STATUS = "registered"
+SEED_LOT_FIELDS = (
+    "scenario_id",
+    "shipper_id",
+    "shipper_org_id",
+    "product_id",
+    "pallets",
+    "ready_date",
+    "destination",
+    "sell_by_date",
+    "sell_window",
+    "packhouse",
+    "source",
+    "status",
+)
 
 
 class OrgDrift(BaseModel):
@@ -81,6 +99,7 @@ def _baseline(seed: DemoOrg | None) -> dict[str, int]:
     counts = dict.fromkeys(
         (
             "lots",
+            "missing_seed_lots",
             "plans",
             "orders",
             "forwarder_assignments",
@@ -113,15 +132,33 @@ def _seed_lot_ids() -> set[str]:
     return {lot.id for scenario in load_scenarios().values() for lot in scenario.lots}
 
 
+def _seeded_scenario(rows: list[Any]) -> str:
+    seeded = _seed_lot_ids()
+    present = Counter(row.scenario_id for row in rows if row.id in seeded)
+    return present.most_common(1)[0][0] if present else SCENARIO_ID
+
+
+def _lot_counts(db: Session, ids: list[str]) -> tuple[Counter, Counter]:
+    columns = [getattr(LotRow, name) for name in ("id", *SEED_LOT_FIELDS)]
+    rows = db.execute(select(*columns).where(LotRow.shipper_org_id.in_(ids))).all()
+    seed = {value["id"]: value for value in seed_lot_baseline(db, _seeded_scenario(rows))}
+    changed: Counter = Counter()
+    for row in rows:
+        expected = seed.get(row.id)
+        if expected is None or any(
+            expected[name] != getattr(row, name) for name in SEED_LOT_FIELDS
+        ):
+            changed[row.shipper_org_id] += 1
+    present = {row.id for row in rows}
+    missing = Counter(v["shipper_org_id"] for lot_id, v in seed.items() if lot_id not in present)
+    return changed, missing
+
+
 def _counts(db: Session, ids: list[str]) -> dict[str, Counter]:
+    changed, missing = _lot_counts(db, ids)
     return {
-        "lots": _grouped(
-            db,
-            LotRow.shipper_org_id,
-            ids,
-            None,
-            ~and_(LotRow.id.in_(_seed_lot_ids()), LotRow.status == SEED_LOT_STATUS),
-        ),
+        "lots": changed,
+        "missing_seed_lots": missing,
         "plans": _grouped(db, PlanRow.org_id, ids),
         "orders": _grouped(
             db, PlanRow.org_id, ids, (OrderRow, OrderRow.plan_id == PlanRow.plan_id)
