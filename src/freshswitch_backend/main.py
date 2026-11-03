@@ -4,6 +4,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -19,6 +21,22 @@ logger = logging.getLogger(__name__)
 
 async def _replan_error(_: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+def _encodable(value: object) -> object:
+    if isinstance(value, str):
+        return value.encode("utf-8", "backslashreplace").decode("utf-8")
+    if isinstance(value, list):
+        return [_encodable(item) for item in value]
+    if isinstance(value, dict):
+        return {_encodable(key): _encodable(item) for key, item in value.items()}
+    return value
+
+
+async def _validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422, content={"detail": _encodable(jsonable_encoder(exc.errors()))}
+    )
 
 
 def _startup() -> None:
@@ -58,6 +76,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(RequestAuditMiddleware)
     app.include_router(api_router, prefix=prefix)
     app.add_exception_handler(ReplanError, _replan_error)
+    app.add_exception_handler(RequestValidationError, _validation_error)
     return app
 
 

@@ -139,6 +139,20 @@ def _normalize_email(value: str) -> str:
     return email
 
 
+UNSTORABLE_TEXT = "NUL 문자나 인코딩할 수 없는 문자는 사용할 수 없습니다"
+
+
+def _storable(value: object) -> object:
+    if isinstance(value, str):
+        if "\x00" in value:
+            raise ValueError(UNSTORABLE_TEXT)
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError(UNSTORABLE_TEXT) from exc
+    return value
+
+
 class SignupRequest(BaseModel):
     email: str = Field(max_length=320)
     password: str = Field(min_length=8, max_length=128)
@@ -146,6 +160,11 @@ class SignupRequest(BaseModel):
     org_name: str | None = Field(default=None, min_length=1, max_length=200)
     org_type: SignupOrgType | None = None
     invite_code: str | None = Field(default=None, min_length=1, max_length=100)
+
+    @field_validator("email", "password", "name", "org_name", mode="before")
+    @classmethod
+    def _storable(cls, value: object) -> object:
+        return _storable(value)
 
     @field_validator("email")
     @classmethod
@@ -177,6 +196,11 @@ class LoginRequest(BaseModel):
     email: str = Field(max_length=320)
     password: str = Field(max_length=128)
 
+    @field_validator("email", "password", mode="before")
+    @classmethod
+    def _storable(cls, value: object) -> object:
+        return _storable(value)
+
     @field_validator("email")
     @classmethod
     def _email(cls, value: str) -> str:
@@ -186,6 +210,11 @@ class LoginRequest(BaseModel):
 class DemoLoginRequest(BaseModel):
     org_type: OrgType
     org_id: str | None = Field(default=None, max_length=64)
+
+    @field_validator("org_id", mode="before")
+    @classmethod
+    def _storable(cls, value: object) -> object:
+        return _storable(value)
 
 
 class ActiveOrgRequest(BaseModel):
