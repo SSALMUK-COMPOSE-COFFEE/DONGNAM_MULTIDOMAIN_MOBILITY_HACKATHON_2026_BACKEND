@@ -7,6 +7,7 @@ from sqlalchemy import select
 from freshswitch_backend.api.auth import Principal, require_role
 from freshswitch_backend.api.saas_access import forwarder_assigned, plan_for
 from freshswitch_backend.api.saas_views import (
+    ForwarderOrder,
     PlanListItem,
     forwarder_order_view,
     forwarders_of,
@@ -58,7 +59,7 @@ def read_plan(plan_id: str, principal: ForwarderPrincipal) -> dict[str, Any]:
 
 
 @router.get("/plans/{plan_id}/orders")
-def list_orders(plan_id: str, principal: ForwarderPrincipal) -> list[dict[str, Any]]:
+def list_orders(plan_id: str, principal: ForwarderPrincipal) -> list[ForwarderOrder]:
     access = plan_for(plan_id, principal)
     return [forwarder_order_view(o) for o in store.orders(plan_id, org_id=access.owner_org_id)]
 
@@ -66,7 +67,7 @@ def list_orders(plan_id: str, principal: ForwarderPrincipal) -> list[dict[str, A
 @router.post("/plans/{plan_id}/orders/{order_id}/confirm")
 def confirm_order(
     plan_id: str, order_id: str, body: ForwarderDecision, principal: ForwarderPrincipal
-) -> dict[str, Any]:
+) -> ForwarderOrder:
     access = plan_for(plan_id, principal)
     request = ConfirmRequest(actor="forwarder", accept=body.accept, note=body.note)
     try:

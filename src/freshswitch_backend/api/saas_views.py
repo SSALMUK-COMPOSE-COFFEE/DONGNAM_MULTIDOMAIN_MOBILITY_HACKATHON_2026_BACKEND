@@ -7,12 +7,13 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from freshswitch_backend.domain.models import Scenario
-from freshswitch_backend.execution.models import ExecutionOrder
+from freshswitch_backend.execution.models import ExecutionOrder, ShipperConfirmation
 from freshswitch_backend.execution.orders import short_name
 from freshswitch_backend.execution.quality import QualitySettlement, adjusted_settlements
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.tables import OrganizationRow, PlanForwarderRow
 from freshswitch_backend.planning.store import PlanSession
+from freshswitch_backend.replan.models import CancellationCharge, CancellationTransfer
 
 MONEY_TOTALS = (
     "total_baseline_cost",
@@ -33,6 +34,32 @@ CONFIRMATION_MONEY = (
     "net_cost_delta",
 )
 CANCELLATION_MONEY = ("container_cost", "share_per_pallet_before", "share_per_pallet_after", "fee")
+
+
+class ForwarderShipperConfirmation(ShipperConfirmation):
+    cost_before: int | None = None
+    cost_after: int | None = None
+    cost_delta: int | None = None
+    cancellation_adjustment: int | None = None
+    net_cost_delta: int | None = None
+
+
+class ForwarderCancellationTransfer(CancellationTransfer):
+    share_increase: int | None = None
+    amount: int | None = None
+
+
+class ForwarderCancellation(CancellationCharge):
+    container_cost: int | None = None
+    share_per_pallet_before: int | None = None
+    share_per_pallet_after: int | None = None
+    fee: int | None = None
+    transfers: list[ForwarderCancellationTransfer]
+
+
+class ForwarderOrder(ExecutionOrder):
+    shipper_confirmations: list[ForwarderShipperConfirmation]
+    cancellation: ForwarderCancellation | None = None
 
 
 class ForwarderRef(BaseModel):
@@ -316,7 +343,7 @@ def without_settlement(session: PlanSession) -> dict[str, Any]:
     return payload
 
 
-def forwarder_order_view(order: ExecutionOrder) -> dict[str, Any]:
+def forwarder_order_view(order: ExecutionOrder) -> ForwarderOrder:
     payload = order.model_dump(mode="json")
     for confirmation in payload["shipper_confirmations"]:
         for name in CONFIRMATION_MONEY:
@@ -329,4 +356,4 @@ def forwarder_order_view(order: ExecutionOrder) -> dict[str, Any]:
             {**transfer, "share_increase": None, "amount": None}
             for transfer in cancellation["transfers"]
         ]
-    return payload
+    return ForwarderOrder.model_validate(payload)
