@@ -4,6 +4,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from freshswitch_backend.domain.ids import ID_MAX_LENGTH, EntityId
+from freshswitch_backend.domain.inputs import FiniteFloat, StorableStr
 from freshswitch_backend.domain.models import KstDatetime, Quantity
 from freshswitch_backend.routing.models import GateStatus
 
@@ -53,12 +54,12 @@ def reading_window_error(ts: datetime | None, now: datetime, sandbox: bool = Fal
 
 class ReadingIn(BaseModel):
     device_id: EntityId = Field(min_length=1, max_length=ID_MAX_LENGTH)
-    container_id: str | None = Field(default=None, min_length=1, max_length=100)
-    plan_id: str | None = None
+    container_id: StorableStr | None = Field(default=None, min_length=1, max_length=100)
+    plan_id: StorableStr | None = None
     ts: KstDatetime | None = None
-    temp_c: float = Field(ge=-40, le=80)
+    temp_c: FiniteFloat = Field(ge=-40, le=80)
     power_on: bool
-    humidity_pct: float | None = Field(default=None, ge=0, le=100)
+    humidity_pct: FiniteFloat | None = Field(default=None, ge=0, le=100)
     door_open: bool | None = None
     stage: Stage | None = None
 
@@ -75,8 +76,8 @@ class Reading(BaseModel):
 
 class BindingRequest(BaseModel):
     device_id: EntityId = Field(min_length=1, max_length=ID_MAX_LENGTH)
-    container_id: str = Field(min_length=1, max_length=100)
-    plan_id: str | None = None
+    container_id: StorableStr = Field(min_length=1, max_length=100)
+    plan_id: StorableStr | None = None
     stage: Stage | None = None
 
 
@@ -121,7 +122,7 @@ class ColdchainAction(BaseModel):
 
 
 class ActionUpdateBody(BaseModel):
-    note: str | None = Field(default=None, max_length=500)
+    note: StorableStr | None = Field(default=None, max_length=500)
 
 
 class ResidualRisk(BaseModel):

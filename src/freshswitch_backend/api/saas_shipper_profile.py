@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from freshswitch_backend.api.auth import Principal, require_role
 from freshswitch_backend.data.loader import get_scenario
+from freshswitch_backend.domain.inputs import StorableStr
 from freshswitch_backend.domain.models import Product
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.tables import (
@@ -30,8 +31,12 @@ LON_RANGE = (124.0, 132.0)
 router = APIRouter(prefix="/saas/shipper", tags=["saas-shipper-profile"])
 
 ShipperPrincipal = Annotated[Principal, Depends(require_role("shipper"))]
-Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
-Region = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+Name = Annotated[
+    StorableStr, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)
+]
+Region = Annotated[
+    StorableStr, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)
+]
 Lat = Annotated[float, Field(ge=LAT_RANGE[0], le=LAT_RANGE[1])]
 Lon = Annotated[float, Field(ge=LON_RANGE[0], le=LON_RANGE[1])]
 
@@ -56,7 +61,7 @@ class PackhouseCreate(BaseModel):
     region: Region
     lat: Lat
     lon: Lon
-    product_ids: list[str] = Field(default_factory=list, max_length=20)
+    product_ids: list[StorableStr] = Field(default_factory=list, max_length=20)
 
 
 class PackhousePatch(BaseModel):
@@ -76,8 +81,8 @@ class ShipperProfileOut(BaseModel):
 
 class ShipperProfilePatch(BaseModel):
     name: Name | None = None
-    packhouse_id: str | None = Field(default=None, min_length=1, max_length=100)
-    product_ids: list[str] | None = Field(default=None, max_length=20)
+    packhouse_id: StorableStr | None = Field(default=None, min_length=1, max_length=100)
+    product_ids: list[StorableStr] | None = Field(default=None, max_length=20)
 
 
 class ShipperProfileView(BaseModel):

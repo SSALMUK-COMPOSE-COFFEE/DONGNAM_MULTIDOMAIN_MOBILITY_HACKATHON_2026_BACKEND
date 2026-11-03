@@ -3,6 +3,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from freshswitch_backend.domain.inputs import Note, StorableStr
 from freshswitch_backend.replan.models import AlternativeId, CancellationCharge, Event
 
 OrderStatus = Literal[
@@ -141,14 +142,14 @@ class ExecutionOrder(BaseModel):
 
 class ConfirmRequest(BaseModel):
     actor: Literal["shipper", "forwarder"]
-    shipper_id: str | None = None
+    shipper_id: StorableStr | None = None
     accept: bool
-    note: str | None = None
+    note: Note | None = None
 
 
 class RequestResultBody(BaseModel):
     accepted: bool
-    note: str | None = None
+    note: Note | None = None
 
 
 class ReplanCandidate(BaseModel):

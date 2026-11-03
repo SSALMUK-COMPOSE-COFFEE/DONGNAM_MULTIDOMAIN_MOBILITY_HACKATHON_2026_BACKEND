@@ -22,6 +22,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from freshswitch_backend.config import Settings, get_settings
+from freshswitch_backend.domain.inputs import storable
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.orgs import (
     AlreadyMember,
@@ -277,20 +278,6 @@ def _normalize_email(value: str) -> str:
     return email
 
 
-UNSTORABLE_TEXT = "NUL 문자나 인코딩할 수 없는 문자는 사용할 수 없습니다"
-
-
-def _storable(value: object) -> object:
-    if isinstance(value, str):
-        if "\x00" in value:
-            raise ValueError(UNSTORABLE_TEXT)
-        try:
-            value.encode("utf-8")
-        except UnicodeEncodeError as exc:
-            raise ValueError(UNSTORABLE_TEXT) from exc
-    return value
-
-
 class SignupRequest(BaseModel):
     email: str = Field(max_length=320)
     password: str = Field(min_length=8, max_length=128)
@@ -302,7 +289,7 @@ class SignupRequest(BaseModel):
     @field_validator("email", "password", "name", "org_name", mode="before")
     @classmethod
     def _storable(cls, value: object) -> object:
-        return _storable(value)
+        return storable(value)
 
     @field_validator("email")
     @classmethod
@@ -337,7 +324,7 @@ class LoginRequest(BaseModel):
     @field_validator("email", "password", mode="before")
     @classmethod
     def _storable(cls, value: object) -> object:
-        return _storable(value)
+        return storable(value)
 
     @field_validator("email")
     @classmethod
@@ -352,7 +339,7 @@ class DemoLoginRequest(BaseModel):
     @field_validator("org_id", mode="before")
     @classmethod
     def _storable(cls, value: object) -> object:
-        return _storable(value)
+        return storable(value)
 
 
 class ActiveOrgRequest(BaseModel):

@@ -32,6 +32,7 @@ from freshswitch_backend.api.saas_views import (
     plan_item,
     platform_settlement,
 )
+from freshswitch_backend.domain.inputs import StorableStr
 from freshswitch_backend.domain.models import Plan, Scenario
 from freshswitch_backend.intake.tenants import load_catalog
 from freshswitch_backend.lots import ANY_ORG, LotStatus, LotUnavailable, RegisteredLot
@@ -75,7 +76,7 @@ class PlanPreview(BaseModel):
 def list_lots(
     principal: PlatformPrincipal,
     status: LotStatus | None = None,
-    scenario_id: str | None = None,
+    scenario_id: Annotated[StorableStr | None, Query(max_length=100)] = None,
     limit: Annotated[int, Query(ge=1, le=1000)] = 200,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[PlatformLot]:

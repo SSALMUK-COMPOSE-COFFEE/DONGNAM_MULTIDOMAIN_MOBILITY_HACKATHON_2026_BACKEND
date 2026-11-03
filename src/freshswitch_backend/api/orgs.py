@@ -7,6 +7,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, aliased
 
 from freshswitch_backend.api.auth import AuthPrincipal, Principal, require_role
+from freshswitch_backend.domain.inputs import StorableStr
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.orgs import create_invitation, same_sandbox
 from freshswitch_backend.persistence.tables import (
@@ -43,7 +44,7 @@ class ForwarderRef(BaseModel):
 
 
 class ForwarderAssignRequest(BaseModel):
-    forwarder_org_id: str = Field(min_length=1, max_length=64)
+    forwarder_org_id: StorableStr = Field(min_length=1, max_length=64)
 
 
 class ForwarderAssignment(BaseModel):

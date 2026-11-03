@@ -29,6 +29,7 @@ from freshswitch_backend.api.saas_views import (
     shipper_settlements,
 )
 from freshswitch_backend.data.loader import get_scenario
+from freshswitch_backend.domain.inputs import Note, StorableStr
 from freshswitch_backend.domain.models import Scenario
 from freshswitch_backend.execution.card import EnteredNumbers
 from freshswitch_backend.execution.models import (
@@ -72,8 +73,8 @@ class ShipperLot(RegisteredLot):
 
 class ShipperDecision(BaseModel):
     accept: bool
-    note: str | None = None
-    shipper_id: str | None = None
+    note: Note | None = None
+    shipper_id: StorableStr | None = None
 
 
 def _scope(principal: Principal) -> IntakeScope:

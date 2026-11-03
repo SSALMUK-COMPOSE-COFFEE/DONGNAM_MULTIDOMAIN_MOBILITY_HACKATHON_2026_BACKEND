@@ -24,6 +24,7 @@ from freshswitch_backend.api.plans import (
     replan_inputs,
 )
 from freshswitch_backend.api.saas_access import PlanAccess, plan_for
+from freshswitch_backend.domain.inputs import StorableStr
 from freshswitch_backend.domain.models import Lot
 from freshswitch_backend.execution.cancellation import annotate_cancellations
 from freshswitch_backend.execution.models import OrderStatus
@@ -72,9 +73,9 @@ NO_REPLAN = "먼저 변경 요청으로 3안을 계산하세요"
 
 class ChangeRequestCreate(BaseModel):
     type: ChangeType
-    lot_id: str = Field(min_length=1, max_length=120)
+    lot_id: StorableStr = Field(min_length=1, max_length=120)
     new_pallets: int | None = Field(default=None, gt=0)
-    reason: str | None = Field(default=None, max_length=500)
+    reason: StorableStr | None = Field(default=None, max_length=500)
 
     @model_validator(mode="after")
     def _pallets(self) -> "ChangeRequestCreate":

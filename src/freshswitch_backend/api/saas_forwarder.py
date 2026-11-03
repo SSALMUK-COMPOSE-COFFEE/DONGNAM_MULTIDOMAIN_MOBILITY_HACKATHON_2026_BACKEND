@@ -15,6 +15,7 @@ from freshswitch_backend.api.saas_views import (
     without_settlement,
 )
 from freshswitch_backend.coldchain.power_plan import power_plan
+from freshswitch_backend.domain.inputs import Note
 from freshswitch_backend.domain.models import Scenario
 from freshswitch_backend.execution.card import (
     ContainerExecution,
@@ -51,7 +52,7 @@ ForwarderPrincipal = Annotated[Principal, Depends(require_role("forwarder"))]
 
 class ForwarderDecision(BaseModel):
     accept: bool
-    note: str | None = None
+    note: Note | None = None
 
 
 def _order_view(

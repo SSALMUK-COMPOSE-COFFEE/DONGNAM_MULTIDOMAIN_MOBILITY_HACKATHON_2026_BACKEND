@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 
 from freshswitch_backend.coldchain.models import Binding
 from freshswitch_backend.domain.ids import check_id
+from freshswitch_backend.domain.inputs import StorableStr
 from freshswitch_backend.persistence import Database, database
 from freshswitch_backend.persistence.tables import DEMO_ORG, BindingRow, DeviceRow
 
@@ -37,7 +38,7 @@ def device_prefix_error(device_id: str, sandbox: bool) -> str | None:
 
 class DeviceRequest(BaseModel):
     device_id: str = Field(min_length=1, max_length=100)
-    name: str | None = Field(default=None, max_length=200)
+    name: StorableStr | None = Field(default=None, max_length=200)
 
     @field_validator("device_id")
     @classmethod
