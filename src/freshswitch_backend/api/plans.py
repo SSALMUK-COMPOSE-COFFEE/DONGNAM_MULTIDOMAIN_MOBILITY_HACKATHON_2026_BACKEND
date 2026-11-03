@@ -480,7 +480,7 @@ def confirm_order(
             "화주는 화주 화면, 포워더는 배정된 포워더 화면에서 확정합니다",
         )
     try:
-        return store.confirm(plan_id, order_id, body, org_id=org_id)
+        return without_saas_basis(store.confirm(plan_id, order_id, body, org_id=org_id))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="실행 지시를 찾을 수 없습니다") from exc
     except OrderInputError as exc:
@@ -506,7 +506,9 @@ def answer_request(
             "선사·터미널·항공사 회신은 배정된 포워더 화면에서 기록합니다",
         )
     try:
-        return store.answer_request(plan_id, order_id, request_id, body, org_id=org_id)
+        return without_saas_basis(
+            store.answer_request(plan_id, order_id, request_id, body, org_id=org_id)
+        )
     except KeyError as exc:
         raise HTTPException(
             status_code=404, detail="실행 지시 또는 요청을 찾을 수 없습니다"

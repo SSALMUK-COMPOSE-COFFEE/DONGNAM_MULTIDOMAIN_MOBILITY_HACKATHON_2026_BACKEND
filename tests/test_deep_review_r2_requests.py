@@ -103,6 +103,32 @@ def test_engine4_demo_orders_have_no_snapshot_key(client: TestClient) -> None:
     assert orders[-1]["requests"][0]["text"].startswith("[부킹 변경 요청]")
 
 
+def test_engine4_demo_confirm_and_answer_have_no_snapshot_key(client: TestClient) -> None:
+    plan_id = client.post("/api/plans", json={"scenario_id": "default"}).json()["plan_id"]
+    _apply(client, plan_id, REDUCE, "pull_forward")
+    order = client.get(f"/api/plans/{plan_id}/orders").json()[-1]
+    base = f"/api/plans/{plan_id}/orders/{order['order_id']}"
+    assert order["shipper_confirmations"]
+    responses = [
+        client.post(
+            f"{base}/confirm",
+            json={"actor": "shipper", "shipper_id": c["shipper_id"], "accept": True},
+        )
+        for c in order["shipper_confirmations"]
+    ]
+    responses.append(client.post(f"{base}/confirm", json={"actor": "forwarder", "accept": True}))
+    amendment = next(r for r in order["requests"] if r["kind"] == "booking_amendment")
+    responses.append(
+        client.post(f"{base}/requests/{amendment['request_id']}", json={"accepted": True})
+    )
+    for response in responses:
+        assert response.status_code == 200, response.text
+        assert "saas_basis" not in response.text
+    current = client.get(f"/api/plans/{plan_id}/orders").json()
+    shown = next(o for o in current if o["order_id"] == order["order_id"])
+    assert responses[-1].json()["requests"] == shown["requests"]
+
+
 def test_engine5_cancelled_lot_weighs_product_net_kg(client: TestClient) -> None:
     scenario = _default()
     products = [
