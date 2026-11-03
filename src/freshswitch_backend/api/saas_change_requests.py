@@ -1,4 +1,7 @@
+import threading
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Annotated, Literal
 
@@ -279,6 +282,24 @@ def _insert(
     return row
 
 
+_claims: set[tuple[str, str]] = set()
+_claims_lock = threading.Lock()
+
+
+@contextmanager
+def _claim(plan_id: str, lot_id: str) -> Iterator[None]:
+    key = (plan_id, lot_id)
+    with _claims_lock:
+        if key in _claims:
+            raise HTTPException(status_code=409, detail=ALREADY_OPEN)
+        _claims.add(key)
+    try:
+        yield
+    finally:
+        with _claims_lock:
+            _claims.discard(key)
+
+
 @router.post(
     "/shipper/plans/{plan_id}/change-requests",
     status_code=status.HTTP_201_CREATED,
@@ -289,29 +310,30 @@ async def create_change_request(
 ) -> ShipperChangeRequest:
     access = await run_in_threadpool(plan_for, plan_id, principal)
     session = access.session
-    lot = await run_in_threadpool(_own_lot, access, body.lot_id, principal.org_id)
-    assigned = next(a for a in session.plan.assignments if a.lot_id == lot.id)
-    if body.type == "air_switch" and assigned.mode == "air":
-        raise HTTPException(status_code=409, detail=ALREADY_AIR)
-    event = to_event(body.type, lot.id, body.new_pallets)
-    apply_event(session.scenario, event)
-    estimate = None
-    if body.type != "air_switch":
-        inputs = await run_in_threadpool(replan_inputs, session, access.owner_org_id)
-        result = await compute_replan(
-            replan,
-            session.scenario,
-            session.plan,
-            event,
-            air_locked=session.air_locked_lot_ids,
-            routes=session.routes,
-            now=store.clock(),
-            deadline=request_deadline(),
-            **inputs,
-        )
-        annotate_cancellations(result, session.scenario, session.plan)
-        estimate = _estimate(result)
-    row = await run_in_threadpool(_insert, access, principal, lot, body, estimate)
+    with _claim(session.plan_id, body.lot_id):
+        lot = await run_in_threadpool(_own_lot, access, body.lot_id, principal.org_id)
+        assigned = next(a for a in session.plan.assignments if a.lot_id == lot.id)
+        if body.type == "air_switch" and assigned.mode == "air":
+            raise HTTPException(status_code=409, detail=ALREADY_AIR)
+        event = to_event(body.type, lot.id, body.new_pallets)
+        apply_event(session.scenario, event)
+        estimate = None
+        if body.type != "air_switch":
+            inputs = await run_in_threadpool(replan_inputs, session, access.owner_org_id)
+            result = await compute_replan(
+                replan,
+                session.scenario,
+                session.plan,
+                event,
+                air_locked=session.air_locked_lot_ids,
+                routes=session.routes,
+                now=store.clock(),
+                deadline=request_deadline(),
+                **inputs,
+            )
+            annotate_cancellations(result, session.scenario, session.plan)
+            estimate = _estimate(result)
+        row = await run_in_threadpool(_insert, access, principal, lot, body, estimate)
     return _shipper_view(row)
 
 

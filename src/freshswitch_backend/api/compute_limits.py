@@ -31,7 +31,12 @@ REPLAN_ROUTE = "replan"
 REPLAN_ORG_ROUTE = "replan-org"
 REPLAN_RATE = RateRule(per_client=30, window_seconds=60)
 REPLAN_ORG_RATE = RateRule(per_client=240, window_seconds=60)
+ANALYSIS_ROUTE = "analysis"
+ANALYSIS_ORG_ROUTE = "analysis-org"
+ANALYSIS_RATE = RateRule(per_client=30, window_seconds=60)
+ANALYSIS_ORG_RATE = RateRule(per_client=240, window_seconds=60)
 COMPUTE_SLOTS = 2
+ANALYSIS_SLOTS = 2
 COMPUTE_WAIT_SECONDS = 2.0
 PREVIEW_DEADLINE_SECONDS = 15.0
 PREVIEW_CACHE_SECONDS = 30.0
@@ -104,12 +109,24 @@ class ComputeGate:
 
 
 gate = ComputeGate()
+analysis_gate = ComputeGate(slots=ANALYSIS_SLOTS)
 
 
 @contextmanager
 def compute_slot() -> Iterator[None]:
     with gate.slot():
         yield
+
+
+@contextmanager
+def analysis_slot() -> Iterator[None]:
+    with analysis_gate.slot():
+        yield
+
+
+def run_analysis(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    with analysis_slot():
+        return fn(*args, **kwargs)
 
 
 def run_bounded(fn: Callable[..., Any], *args: Any, deadline: float, **kwargs: Any) -> Any:
@@ -199,6 +216,16 @@ def replan_limiter(request: Request) -> SlidingWindowLimiter:
     )
 
 
+def analysis_limiter(request: Request) -> SlidingWindowLimiter:
+    return _app_state(
+        request,
+        "analysis_limiter",
+        lambda: SlidingWindowLimiter(
+            {ANALYSIS_ROUTE: ANALYSIS_RATE, ANALYSIS_ORG_ROUTE: ANALYSIS_ORG_RATE}
+        ),
+    )
+
+
 def _check_rate(
     limiter: SlidingWindowLimiter,
     routes: tuple[str, str],
@@ -229,3 +256,9 @@ def replan_rate(request: Request, principal: OptionalPrincipal) -> None:
     if principal is None or not app_settings(request).saas_mode:
         return
     check_replan_rate(request, principal)
+
+
+def analysis_rate(request: Request, principal: OptionalPrincipal) -> None:
+    if principal is None or not app_settings(request).saas_mode:
+        return
+    _check_rate(analysis_limiter(request), (ANALYSIS_ROUTE, ANALYSIS_ORG_ROUTE), request, principal)

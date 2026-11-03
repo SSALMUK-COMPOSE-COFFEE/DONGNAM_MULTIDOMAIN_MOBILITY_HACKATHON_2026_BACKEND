@@ -6,6 +6,7 @@ from fastapi.security import HTTPAuthorizationCredentials
 
 from freshswitch_backend.api.access import bearer, require_demo_reset
 from freshswitch_backend.api.auth import OptionalPrincipal, Principal, app_settings
+from freshswitch_backend.api.compute_limits import analysis_rate, run_analysis
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import Scenario
 from freshswitch_backend.persistence.orgs import org_sandbox
@@ -174,11 +175,13 @@ def reset(target: Target, seed: Annotated[bool, Query()] = True) -> ResetResult:
     return ResetResult(cleared=cleared, seeded=seeded)
 
 
-@router.get("/impact")
+@router.get("/impact", dependencies=[Depends(analysis_rate)])
 async def impact(
     scope: ImpactScope, scenario_id: Annotated[str, Query()] = "default"
 ) -> ImpactResult:
     scenario = _scenario(scenario_id)
     table = await run_in_threadpool(learned_table, scenario, quality_history, scope)
     cells = [c for c in table.cells if c.observations]
-    return await run_in_threadpool(learning_impact, scenario, table.adjustments, cells)
+    return await run_in_threadpool(
+        run_analysis, learning_impact, scenario, table.adjustments, cells
+    )

@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, model_validator
 
 from freshswitch_backend.api.auth import Principal, require_role
+from freshswitch_backend.api.compute_limits import compute_slot, replan_rate
 from freshswitch_backend.api.saas_access import org_shipper_ids, plan_for
 from freshswitch_backend.api.saas_views import replan_pending
 from freshswitch_backend.notifications import notify_plan_confirmation
@@ -158,19 +159,22 @@ def auto_accept_confirmation(plan_id: str, principal: PlatformPrincipal) -> Plan
         raise HTTPException(status_code=404, detail=PLAN_NOT_FOUND) from exc
 
 
-@router.post("/platform/plans/{plan_id}/confirmation/recompute")
+@router.post(
+    "/platform/plans/{plan_id}/confirmation/recompute", dependencies=[Depends(replan_rate)]
+)
 def recompute_without_rejected(
     plan_id: str, body: RecomputeRequest, principal: PlatformPrincipal
 ) -> RecomputeResult:
     if body.auto_accept:
         require_sandbox(principal)
     try:
-        session, pending = store.recompute_without(
-            plan_id,
-            principal.org_id,
-            shipper_ids=body.shipper_ids or None,
-            auto_accept=body.auto_accept,
-        )
+        with compute_slot():
+            session, pending = store.recompute_without(
+                plan_id,
+                principal.org_id,
+                shipper_ids=body.shipper_ids or None,
+                auto_accept=body.auto_accept,
+            )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=PLAN_NOT_FOUND) from exc
     except OrderInputError as exc:

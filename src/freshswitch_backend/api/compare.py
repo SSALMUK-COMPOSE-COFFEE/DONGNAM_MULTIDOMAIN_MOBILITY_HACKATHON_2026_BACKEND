@@ -1,8 +1,9 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from freshswitch_backend.api.analysis import plan_session
 from freshswitch_backend.api.auth import OptionalPrincipal, Principal
+from freshswitch_backend.api.compute_limits import analysis_rate, analysis_slot
 from freshswitch_backend.api.saas_access import plan_for
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import Plan, Scenario
@@ -45,10 +46,11 @@ def _source(body: AirSeaRequest, principal: Principal | None) -> tuple[Scenario,
     scenario = get_scenario(body.scenario_id)
     if scenario is None:
         raise HTTPException(status_code=404, detail="시나리오를 찾을 수 없습니다")
-    return scenario, build_plan(scenario).plan
+    with analysis_slot():
+        return scenario, build_plan(scenario).plan
 
 
-@router.post("/air-vs-sea")
+@router.post("/air-vs-sea", dependencies=[Depends(analysis_rate)])
 def air_vs_sea(body: AirSeaRequest, principal: OptionalPrincipal) -> AirSeaComparison:
     scenario, plan = _source(body, principal)
     try:

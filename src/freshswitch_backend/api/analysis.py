@@ -21,6 +21,7 @@ from freshswitch_backend.analysis import (
 )
 from freshswitch_backend.analysis.business import MAX_VARIABLE_COST_PER_PALLET
 from freshswitch_backend.api.auth import OptionalPrincipal
+from freshswitch_backend.api.compute_limits import analysis_rate, analysis_slot
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import Scenario
 from freshswitch_backend.persistence.tables import DEMO_ORG
@@ -121,36 +122,46 @@ def _source(scenario_id: str, plan_id: str | None, org_id: str) -> Scenario:
     return _scenario(scenario_id)
 
 
-@router.post("/sensitivity")
+ANALYSIS_LIMITS = [Depends(analysis_rate)]
+
+
+@router.post("/sensitivity", dependencies=ANALYSIS_LIMITS)
 def run_sensitivity(body: SensitivityRequest, org_id: PlatformOrg) -> SensitivityResult:
     if body.plan_id is not None:
         session = plan_session(body.plan_id, org_id)
-        return sensitivity(session.scenario, plan_id=body.plan_id)
-    return sensitivity(_scenario(body.scenario_id))
+        with analysis_slot():
+            return sensitivity(session.scenario, plan_id=body.plan_id)
+    scenario = _scenario(body.scenario_id)
+    with analysis_slot():
+        return sensitivity(scenario)
 
 
-@router.post("/fuel-shock")
+@router.post("/fuel-shock", dependencies=ANALYSIS_LIMITS)
 def run_fuel_shock(body: FuelShockRequest, org_id: PlatformOrg) -> FuelShockResult:
     scenario = _source(body.scenario_id, body.plan_id, org_id)
-    return fuel_shock(
-        scenario,
-        surcharges=body.values(),
-        baseline_surcharge=body.baseline_surcharge,
-        find_thresholds=body.find_thresholds,
-        threshold_max=body.threshold_max,
-        plan_id=body.plan_id,
-    )
+    with analysis_slot():
+        return fuel_shock(
+            scenario,
+            surcharges=body.values(),
+            baseline_surcharge=body.baseline_surcharge,
+            find_thresholds=body.find_thresholds,
+            threshold_max=body.threshold_max,
+            plan_id=body.plan_id,
+        )
 
 
-@router.post("/benchmark")
+@router.post("/benchmark", dependencies=ANALYSIS_LIMITS)
 def run_benchmark(body: BenchmarkRequest, org_id: PlatformOrg) -> BenchmarkResult:
     if body.plan_id is not None:
         session = plan_session(body.plan_id, org_id)
-        return benchmark(session.scenario, session.plan, session.air_locked_lot_ids)
-    return benchmark(_scenario(body.scenario_id))
+        with analysis_slot():
+            return benchmark(session.scenario, session.plan, session.air_locked_lot_ids)
+    scenario = _scenario(body.scenario_id)
+    with analysis_slot():
+        return benchmark(scenario)
 
 
-@router.get("/business")
+@router.get("/business", dependencies=ANALYSIS_LIMITS)
 def run_business(
     org_id: PlatformOrg,
     scenario_id: str = "default",
@@ -159,15 +170,12 @@ def run_business(
     ops_cost_per_voyage: int = Query(DEFAULT_OPS_COST_PER_VOYAGE, ge=0),
     variable_cost_per_pallet: int = Query(0, ge=0, le=MAX_VARIABLE_COST_PER_PALLET),
 ) -> BusinessResult:
-    return business(
-        _source(scenario_id, plan_id, org_id),
-        forwarder_share,
-        ops_cost_per_voyage,
-        variable_cost_per_pallet,
-    )
+    scenario = _source(scenario_id, plan_id, org_id)
+    with analysis_slot():
+        return business(scenario, forwarder_share, ops_cost_per_voyage, variable_cost_per_pallet)
 
 
-@router.get("/business/matrix")
+@router.get("/business/matrix", dependencies=ANALYSIS_LIMITS)
 def run_business_matrix(
     org_id: PlatformOrg,
     scenario_id: str = "default",
@@ -176,9 +184,9 @@ def run_business_matrix(
     grape_rule: Literal["usage_fee", "performance", "solo_baseline"] = "usage_fee",
     variable_cost_per_pallet: int = Query(0, ge=0, le=MAX_VARIABLE_COST_PER_PALLET),
 ) -> BusinessMatrix:
-    result = business_matrix(
-        _source(scenario_id, plan_id, org_id), base_fee_mode, grape_rule, variable_cost_per_pallet
-    )
+    scenario = _source(scenario_id, plan_id, org_id)
+    with analysis_slot():
+        result = business_matrix(scenario, base_fee_mode, grape_rule, variable_cost_per_pallet)
     if result is None:
         raise HTTPException(
             status_code=422, detail="시즌 물량 품목(딸기·포도)이 없는 시나리오입니다"

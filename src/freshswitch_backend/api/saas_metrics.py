@@ -26,6 +26,7 @@ from freshswitch_backend.analysis.business import (
 from freshswitch_backend.analysis.emissions import EmissionResult, avoided_emissions
 from freshswitch_backend.analysis.models import Assumption, VoyageEconomics
 from freshswitch_backend.api.auth import Principal, require_role
+from freshswitch_backend.api.compute_limits import analysis_rate, analysis_slot
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import KST, Plan, Scenario
 from freshswitch_backend.execution.quality import adjusted_settlements
@@ -500,7 +501,7 @@ def platform_business(
     )
 
 
-@router.get("/business/years")
+@router.get("/business/years", dependencies=[Depends(analysis_rate)])
 def platform_business_years(
     principal: PlatformPrincipal,
     scenario_id: str = "default",
@@ -519,18 +520,19 @@ def platform_business_years(
         raise HTTPException(status_code=404, detail="시나리오를 찾을 수 없습니다")
     if subsidies is not None and any(v < 0 for v in subsidies):
         raise HTTPException(status_code=422, detail="지원금은 0 이상이어야 합니다")
-    result = business_years(
-        scenario,
-        years=years,
-        fee_rate=fee_rate,
-        base_fee_per_pallet=base_fee_per_pallet,
-        base_fee_from_year=base_fee_from_year,
-        sensitivity_share=sensitivity_forwarder_share,
-        fixed_cost=fixed_cost,
-        mvp_cash_fixed_cost=mvp_cash_fixed_cost,
-        subsidies=subsidies,
-        volume_scale=volume_scale,
-    )
+    with analysis_slot():
+        result = business_years(
+            scenario,
+            years=years,
+            fee_rate=fee_rate,
+            base_fee_per_pallet=base_fee_per_pallet,
+            base_fee_from_year=base_fee_from_year,
+            sensitivity_share=sensitivity_forwarder_share,
+            fixed_cost=fixed_cost,
+            mvp_cash_fixed_cost=mvp_cash_fixed_cost,
+            subsidies=subsidies,
+            volume_scale=volume_scale,
+        )
     if result is None:
         raise HTTPException(
             status_code=422, detail="시즌 물량 품목(딸기·포도)이 없는 시나리오입니다"

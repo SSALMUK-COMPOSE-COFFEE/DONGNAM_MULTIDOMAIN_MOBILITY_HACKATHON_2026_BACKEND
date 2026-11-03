@@ -1,13 +1,18 @@
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 from saas_fixtures import PLATFORM_ORG_ID, login_client
 from sqlalchemy import func, select
 from test_add_lot import _plan_with_spare
-from test_change_requests import PLATFORM, _plan, _request
+from test_change_requests import PLATFORM, POHANG_LOT, REDUCE, _open_rows, _plan, _request
 
-from freshswitch_backend.api import compute_limits
+from freshswitch_backend.api import compute_limits, saas_change_requests
 from freshswitch_backend.api.auth import Principal, RateRule
+from freshswitch_backend.api.saas_change_requests import ALREADY_OPEN
 from freshswitch_backend.config import get_settings
 from freshswitch_backend.main import create_app
 from freshswitch_backend.persistence import database
@@ -20,6 +25,13 @@ EVENT = {"event": {"type": "reduce", "lot_id": "lot-jinju-sb-1", "new_pallets": 
 def gate(monkeypatch) -> compute_limits.ComputeGate:
     fresh = compute_limits.ComputeGate(slots=1, wait_seconds=0.05)
     monkeypatch.setattr(compute_limits, "gate", fresh)
+    return fresh
+
+
+@pytest.fixture
+def analysis_gate(monkeypatch) -> compute_limits.ComputeGate:
+    fresh = compute_limits.ComputeGate(slots=1, wait_seconds=0.05)
+    monkeypatch.setattr(compute_limits, "analysis_gate", fresh)
     return fresh
 
 
@@ -144,3 +156,121 @@ def test_replan_rate_is_off_for_anonymous_demo(client, monkeypatch) -> None:
 def test_default_replan_rates_are_generous() -> None:
     assert compute_limits.REPLAN_RATE.per_client >= 20
     assert compute_limits.REPLAN_ORG_RATE.per_client >= compute_limits.PREVIEW_ORG_RATE.per_client
+
+
+ANALYSIS_CALLS = [
+    ("post", "/api/analysis/sensitivity", {}),
+    ("post", "/api/analysis/fuel-shock", {}),
+    ("post", "/api/analysis/benchmark", {}),
+    ("get", "/api/analysis/business", None),
+    ("get", "/api/analysis/business/matrix", None),
+    ("get", "/api/quality/impact", None),
+    ("post", "/api/compare/air-vs-sea", {"lot_id": "lot-jinju-sb-1"}),
+]
+
+
+def _call(client: TestClient, method: str, path: str, body: dict | None):
+    if method == "get":
+        return client.get(path)
+    return client.post(path, json=body)
+
+
+@pytest.mark.parametrize(("method", "path", "body"), ANALYSIS_CALLS)
+def test_analysis_needs_analysis_slot(client, analysis_gate, method, path, body) -> None:
+    with analysis_gate.slot():
+        _busy(_call(client, method, path, body))
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [ANALYSIS_CALLS[0], ANALYSIS_CALLS[3], ANALYSIS_CALLS[5], ANALYSIS_CALLS[6]],
+)
+def test_analysis_runs_after_slot_frees(client, analysis_gate, method, path, body) -> None:
+    with analysis_gate.slot():
+        _busy(_call(client, method, path, body))
+    assert _call(client, method, path, body).status_code == 200
+
+
+def test_air_vs_sea_with_plan_needs_no_slot(client, analysis_gate) -> None:
+    plan_id = _demo_plan(client)
+    body = {"plan_id": plan_id, "lot_id": "lot-jinju-sb-1"}
+    with analysis_gate.slot():
+        assert client.post("/api/compare/air-vs-sea", json=body).status_code == 200
+
+
+def test_business_years_needs_analysis_slot(platform_client, analysis_gate) -> None:
+    path = "/api/saas/platform/business/years"
+    with analysis_gate.slot():
+        _busy(platform_client.get(path))
+    assert platform_client.get(path).status_code == 200
+
+
+def test_recompute_needs_compute_slot(platform_client, saas_login, gate) -> None:
+    plan_id = _plan(platform_client, saas_login)
+    path = f"/api/saas/platform/plans/{plan_id}/confirmation/recompute"
+    with gate.slot():
+        _busy(platform_client.post(path, json={}))
+    assert platform_client.post(path, json={}).status_code != 503
+
+
+def test_analysis_gate_does_not_block_replans(client, analysis_gate) -> None:
+    plan_id = _demo_plan(client)
+    with analysis_gate.slot():
+        assert client.post(f"/api/plans/{plan_id}/events", json=EVENT).status_code == 200
+
+
+def test_analysis_rate_limit_per_visitor(saas_app, monkeypatch) -> None:
+    monkeypatch.setattr(compute_limits, "ANALYSIS_RATE", RateRule(per_client=1, window_seconds=60))
+    platform = login_client(PLATFORM_ORG_ID, saas_app)
+    assert platform.get("/api/analysis/business").status_code == 200
+    limited = platform.get("/api/analysis/business/matrix")
+    assert limited.status_code == 429
+    assert int(limited.headers["Retry-After"]) >= 1
+    assert platform.get("/api/quality/impact").status_code == 429
+    assert platform.get("/api/saas/platform/business/years").status_code == 429
+    lot = {"lot_id": "lot-jinju-sb-1"}
+    assert platform.post("/api/compare/air-vs-sea", json=lot).status_code == 429
+
+
+def test_recompute_shares_replan_rate(saas_app, monkeypatch) -> None:
+    monkeypatch.setattr(compute_limits, "REPLAN_RATE", RateRule(per_client=1, window_seconds=60))
+    platform = login_client(PLATFORM_ORG_ID, saas_app)
+    path = "/api/saas/platform/plans/missing/confirmation/recompute"
+    assert platform.post(path, json={}).status_code == 404
+    assert platform.post(path, json={}).status_code == 429
+
+
+def test_analysis_rate_is_off_for_anonymous_demo(client, monkeypatch) -> None:
+    monkeypatch.setattr(compute_limits, "ANALYSIS_RATE", RateRule(per_client=1, window_seconds=60))
+    codes = [client.get("/api/analysis/business").status_code for _ in range(3)]
+    assert codes == [200, 200, 200]
+
+
+def test_default_analysis_rates_are_generous() -> None:
+    assert compute_limits.ANALYSIS_RATE.per_client >= 20
+    assert compute_limits.ANALYSIS_ORG_RATE.per_client >= compute_limits.ANALYSIS_RATE.per_client
+    assert compute_limits.ANALYSIS_SLOTS >= 1
+
+
+def test_concurrent_duplicate_change_requests_solve_once(
+    platform_client, saas_login, monkeypatch
+) -> None:
+    plan_id = _plan(platform_client, saas_login)
+    shipper = saas_login("shipper-pohang")
+    calls = []
+    lock = threading.Lock()
+    real = saas_change_requests.replan
+
+    def slow_replan(*args, **kwargs):
+        with lock:
+            calls.append(1)
+        time.sleep(0.3)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(saas_change_requests, "replan", slow_replan)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        responses = list(pool.map(lambda _: _request(shipper, plan_id, REDUCE), range(3)))
+    assert sorted(r.status_code for r in responses) == [201, 409, 409]
+    assert all(r.json()["detail"] == ALREADY_OPEN for r in responses if r.status_code == 409)
+    assert len(_open_rows(plan_id, POHANG_LOT)) == 1
+    assert len(calls) == 1
