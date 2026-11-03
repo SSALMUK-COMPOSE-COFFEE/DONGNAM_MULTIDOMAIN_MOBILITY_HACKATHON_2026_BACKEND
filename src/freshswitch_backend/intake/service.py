@@ -1,7 +1,7 @@
 from collections import defaultdict
 from datetime import timedelta
 
-from freshswitch_backend.domain.models import Lot, Plan, Scenario
+from freshswitch_backend.domain.models import Lot, Plan, Product, Scenario
 from freshswitch_backend.intake.models import (
     AirHint,
     FeasibilityHints,
@@ -10,6 +10,7 @@ from freshswitch_backend.intake.models import (
     IntakeRequest,
     Resolved,
     SeaHint,
+    SeasonCheck,
 )
 from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.optimize.feasibility import air_rejection, products_compatible, sea_option
@@ -21,6 +22,12 @@ SO2_WARNING = (
     "SO2 처리 품목은 딸기 등 비처리 품목과 같은 컨테이너에 실을 수 없어 별도 CA 컨테이너가 "
     "필요합니다(WFLO, 제안서 나-1)"
 )
+
+SEASON_SOURCE = "가정(공식 품목별 수출 시기 자료 확인 필요)"
+EXPORT_SEASONS: dict[str, tuple[str, tuple[str, ...], tuple[int, ...]]] = {
+    "strawberry": ("딸기", ("strawberry", "딸기"), (11, 12, 1, 2, 3, 4, 5)),
+    "grape": ("포도", ("grape", "포도", "머스캣"), (10, 11, 12, 1, 2, 3)),
+}
 
 
 class IntakeError(ValueError):
@@ -190,6 +197,27 @@ def preview_lot(
     )
 
 
+def season_check(product: Product, lot: Lot) -> SeasonCheck | None:
+    text = f"{product.id} {product.name}".lower()
+    for label, keys, months in EXPORT_SEASONS.values():
+        if any(key in text for key in keys):
+            return SeasonCheck(
+                product_id=product.id,
+                label=label,
+                months=list(months),
+                in_season=lot.ready_date.month in months,
+                source=SEASON_SOURCE,
+            )
+    return None
+
+
+def _season_warning(season: SeasonCheck, lot: Lot) -> str:
+    return (
+        f"{season.label} 수출 시기({season.months[0]}~{season.months[-1]}월) 밖의 출하일입니다"
+        f"({lot.ready_date.isoformat()}). 등록은 그대로 됩니다(출처: {season.source})"
+    )
+
+
 def _hints(scenario: Scenario, lot: Lot, plan: Plan | None) -> FeasibilityHints:
     model = CostModel(scenario)
     product = model.product(lot)
@@ -197,6 +225,9 @@ def _hints(scenario: Scenario, lot: Lot, plan: Plan | None) -> FeasibilityHints:
     products = {p.id: p for p in scenario.products}
     options: list[SeaHint] = []
     warnings: list[str] = []
+    season = season_check(product, lot)
+    if season is not None and not season.in_season:
+        warnings.append(_season_warning(season, lot))
     if product.so2_treated:
         warnings.append(SO2_WARNING)
     for container in sorted(scenario.containers, key=lambda c: (model.voyage_of(c).etd, c.id)):
@@ -266,4 +297,5 @@ def _hints(scenario: Scenario, lot: Lot, plan: Plan | None) -> FeasibilityHints:
             reason=air_reason,
         ),
         warnings=warnings,
+        season=season,
     )

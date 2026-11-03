@@ -58,12 +58,21 @@ class AirHint(BaseModel):
     reason: str | None = None
 
 
+class SeasonCheck(BaseModel):
+    product_id: str
+    label: str
+    months: list[int]
+    in_season: bool
+    source: str
+
+
 class FeasibilityHints(BaseModel):
     based_on: str
     sea_options: list[SeaHint]
     earliest_feasible: SeaHint | None
     air: AirHint
     warnings: list[str]
+    season: SeasonCheck | None = None
 
 
 class IntakePreview(BaseModel):
