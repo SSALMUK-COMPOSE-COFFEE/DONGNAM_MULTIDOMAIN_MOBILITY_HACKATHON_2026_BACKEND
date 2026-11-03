@@ -222,7 +222,9 @@ def test_genset_line_does_not_repeat_reason(client: TestClient) -> None:
 def test_missing_pallet_kg_stays_assumed_after_round_trip() -> None:
     scenario = _scenario()
     products = [
-        Product.model_validate({k: v for k, v in p.model_dump().items() if k != "pallet_kg"})
+        Product.model_validate(
+            {k: v for k, v in p.model_dump().items() if k not in ("pallet_kg", "pallet_kg_assumed")}
+        )
         for p in scenario.products
     ]
     scenario = scenario.model_copy(update={"products": products})
@@ -232,3 +234,6 @@ def test_missing_pallet_kg_stays_assumed_after_round_trip() -> None:
     net = next(item for item in weight.items if item.name == "화물 순중량")
     assert net.assumed is True
     assert net.kg == 13 * 415
+    assert all(p.pallet_kg == 415 and p.pallet_kg_assumed for p in loaded.products)
+    explicit = Product.model_validate(_scenario().products[0].model_dump(mode="json"))
+    assert explicit.pallet_kg_assumed is False

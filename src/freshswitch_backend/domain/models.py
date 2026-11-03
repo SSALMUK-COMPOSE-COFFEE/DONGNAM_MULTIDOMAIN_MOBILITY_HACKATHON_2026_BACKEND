@@ -29,11 +29,22 @@ class Product(Sourced):
     co2_pct: float | None = None
     shelf_life_days: int
     so2_treated: bool = False
-    pallet_kg: float | None = None
+    pallet_kg: float = DEFAULT_PALLET_KG
+    pallet_kg_assumed: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _mark_default_pallet_kg(cls, data: object) -> object:
+        if not isinstance(data, dict) or "pallet_kg_assumed" in data:
+            return data
+        if data.get("pallet_kg") is None:
+            rest = {k: v for k, v in data.items() if k != "pallet_kg"}
+            return {**rest, "pallet_kg_assumed": True}
+        return data
 
     @property
     def net_pallet_kg(self) -> float:
-        return self.pallet_kg if self.pallet_kg is not None else DEFAULT_PALLET_KG
+        return self.pallet_kg
 
 
 class Packhouse(Sourced):

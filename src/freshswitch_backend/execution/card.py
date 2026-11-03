@@ -405,7 +405,7 @@ def build_execution_card(
             lot = lots.get(a.lot_id)
             product = products.get(lot.product_id) if lot else None
             net += a.pallets * (product.net_pallet_kg if product else DEFAULT_PALLET_KG)
-            if product is None or product.pallet_kg is None:
+            if product is None or product.pallet_kg_assumed:
                 net_assumed = True
         pallets = sum(a.pallets for a in assignments)
         found = [products[pid] for pid in load.product_ids if pid in products]
