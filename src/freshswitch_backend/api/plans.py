@@ -238,7 +238,7 @@ def _base_scenario(scenario_id: str) -> Scenario:
     return scenario
 
 
-def create_tenant_plan(body: CreatePlanRequest, org_id: str) -> PlanSession:
+def tenant_plan_scenario(body: CreatePlanRequest, org_id: str) -> tuple[Scenario, list[str]]:
     if body.lots:
         raise HTTPException(status_code=422, detail=INLINE_LOTS_FORBIDDEN)
     base = _base_scenario(body.scenario_id)
@@ -250,6 +250,11 @@ def create_tenant_plan(body: CreatePlanRequest, org_id: str) -> PlanSession:
         raise HTTPException(status_code=422, detail="계획에 넣을 등록 출하가 없습니다")
     if body.use_learned_loss:
         scenario = with_learned_loss(scenario, scope=learning_scope(org_id))
+    return scenario, registered_ids
+
+
+def create_tenant_plan(body: CreatePlanRequest, org_id: str) -> PlanSession:
+    scenario, registered_ids = tenant_plan_scenario(body, org_id)
     return store.create(scenario, registered_ids, org_id=org_id, lot_org_id=ANY_ORG)
 
 

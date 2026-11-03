@@ -5,7 +5,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from freshswitch_backend.api.auth import Principal, require_role
-from freshswitch_backend.api.plans import CreatePlanRequest, create_tenant_plan
+from freshswitch_backend.api.plans import (
+    CreatePlanRequest,
+    create_tenant_plan,
+    tenant_plan_scenario,
+)
 from freshswitch_backend.api.saas_views import (
     PlanListItem,
     PlatformSettlement,
@@ -13,11 +17,13 @@ from freshswitch_backend.api.saas_views import (
     plan_item,
     platform_settlement,
 )
+from freshswitch_backend.domain.models import Plan, Scenario
 from freshswitch_backend.intake.tenants import load_catalog
 from freshswitch_backend.lots import ANY_ORG, LotStatus, RegisteredLot
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.orgs import same_sandbox
 from freshswitch_backend.persistence.tables import LotRow, OrganizationRow, PlanRow
+from freshswitch_backend.planning.service import VoyagePickup, build_plan
 from freshswitch_backend.planning.store import PlanSession
 
 router = APIRouter(prefix="/saas/platform", tags=["saas-platform"])
@@ -35,6 +41,12 @@ class PlatformPlanRequest(BaseModel):
     use_learned_loss: bool = False
     lot_ids: list[str] = Field(default_factory=list)
     include_registered: bool = False
+
+
+class PlanPreview(BaseModel):
+    scenario: Scenario
+    plan: Plan
+    routes: list[VoyagePickup]
 
 
 @router.get("/lots")
@@ -75,6 +87,14 @@ def list_lots(
 def create_plan(body: PlatformPlanRequest, principal: PlatformPrincipal) -> PlanSession:
     request = CreatePlanRequest(**body.model_dump())
     return create_tenant_plan(request, principal.org_id)
+
+
+@router.post("/plans/preview")
+def preview_plan(body: PlatformPlanRequest, principal: PlatformPrincipal) -> PlanPreview:
+    scenario, _ = tenant_plan_scenario(CreatePlanRequest(**body.model_dump()), principal.org_id)
+    working = scenario.model_copy(deep=True)
+    built = build_plan(working)
+    return PlanPreview(scenario=working, plan=built.plan, routes=built.routes)
 
 
 def _sessions(principal: Principal, limit: int, offset: int) -> list[PlanSession]:
