@@ -1,12 +1,15 @@
 import asyncio
+import csv
+import io
 import json
+import re
 import time
 from collections.abc import AsyncIterator, Iterable
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import select
 
 from freshswitch_backend.api.auth import (
@@ -17,13 +20,23 @@ from freshswitch_backend.api.auth import (
     current_principal,
 )
 from freshswitch_backend.api.saas_access import plan_for
-from freshswitch_backend.coldchain import ColdchainError, DeviceDenied, NotFound, coldchain_store
+from freshswitch_backend.coldchain import (
+    ActionConflict,
+    ColdchainError,
+    DeviceDenied,
+    NotFound,
+    coldchain_store,
+)
 from freshswitch_backend.coldchain.devices import device_store, is_simulator_device
 from freshswitch_backend.coldchain.models import (
+    ActionHandler,
+    ActionUpdateBody,
     AlertFeed,
     Binding,
     BindingRequest,
+    ColdchainAction,
     IngestResult,
+    PowerPlan,
     PresetInfo,
     ReadingIn,
     SettlementPreview,
@@ -32,17 +45,23 @@ from freshswitch_backend.coldchain.models import (
     TwinState,
     TwinSummary,
 )
+from freshswitch_backend.coldchain.power_plan import power_plan
 from freshswitch_backend.coldchain.simulator import PRESETS
+from freshswitch_backend.coldchain.store import ActionTransition
 from freshswitch_backend.domain.models import Quantity
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.orgs import org_sandbox
 from freshswitch_backend.persistence.tables import DEMO_ORG, ShipperProfileRow
+from freshswitch_backend.planning.store import store as plan_store
 
 DEVICE_TOKEN_HEADER = "X-Device-Token"
 STREAM_RECHECK_SECONDS = 5.0
 UNREGISTERED_DEVICE = "등록되지 않은 장치입니다. 조직 기기로 먼저 등록하세요"
 REGISTERED_DEVICE_REQUIRED = "조직에 등록된 장치와 X-Device-Token이 필요합니다"
 SIMULATOR_SANDBOX_ONLY = "시뮬레이터는 데모 세계(sandbox) 조직에서만 쓸 수 있습니다"
+ACTION_ROLE_FORBIDDEN = "콜드체인 조치의 수락·완료는 플랫폼이나 배정된 포워더가 기록합니다"
+CSV_MEDIA = "text/csv; charset=utf-8"
+CSV_RESPONSE = {200: {"content": {"text/csv": {"schema": {"type": "string"}}}}}
 
 router = APIRouter(prefix="/coldchain", tags=["coldchain"])
 OrgId = Annotated[str, Depends(current_org_id)]
@@ -53,6 +72,8 @@ def _http(exc: Exception) -> HTTPException:
         return HTTPException(status_code=404, detail=str(exc))
     if isinstance(exc, DeviceDenied):
         return HTTPException(status_code=403, detail=str(exc))
+    if isinstance(exc, ActionConflict):
+        return HTTPException(status_code=409, detail=str(exc))
     return HTTPException(status_code=422, detail=str(exc))
 
 
@@ -254,6 +275,164 @@ def settlement_preview(
         )
     except (NotFound, ColdchainError) as exc:
         raise _http(exc) from exc
+
+
+def _handler(principal: Principal | None) -> ActionHandler:
+    if principal is None:
+        return ActionHandler(org_type="platform", org_id=DEMO_ORG)
+    if principal.org_type not in ("platform", "forwarder"):
+        raise HTTPException(status_code=403, detail=ACTION_ROLE_FORBIDDEN)
+    return ActionHandler(
+        org_type=principal.org_type, org_id=principal.org_id, user_id=principal.user_id
+    )
+
+
+def _update_action(
+    container_id: str,
+    action_key: str,
+    transition: ActionTransition,
+    scope: ReadScope,
+    principal: Principal | None,
+    body: ActionUpdateBody | None,
+    plan_id: str | None,
+) -> ColdchainAction:
+    handler = _handler(principal)
+    try:
+        return coldchain_store.update_action(
+            container_id,
+            action_key,
+            transition,
+            handler,
+            body.note if body else None,
+            plan_id,
+            scope.org_id,
+        )
+    except (NotFound, ColdchainError) as exc:
+        raise _http(exc) from exc
+
+
+@router.post("/containers/{container_id}/actions/{action_key}/accept")
+def accept_action(
+    container_id: str,
+    action_key: str,
+    scope: Scope,
+    principal: OptionalPrincipal,
+    body: ActionUpdateBody | None = None,
+    plan_id: str | None = None,
+) -> ColdchainAction:
+    return _update_action(container_id, action_key, "accept", scope, principal, body, plan_id)
+
+
+@router.post("/containers/{container_id}/actions/{action_key}/complete")
+def complete_action(
+    container_id: str,
+    action_key: str,
+    scope: Scope,
+    principal: OptionalPrincipal,
+    body: ActionUpdateBody | None = None,
+    plan_id: str | None = None,
+) -> ColdchainAction:
+    return _update_action(container_id, action_key, "complete", scope, principal, body, plan_id)
+
+
+def _require_participation(scope: ReadScope, container_id: str, plan_id: str | None) -> None:
+    if scope.org_type != "shipper":
+        return
+    state = coldchain_store.state(container_id, plan_id, 0, scope.org_id)
+    if not any(lot.shipper_id in scope.shipper_ids for lot in state.loss.lots):
+        raise NotFound(f"센서 기록이 없는 컨테이너입니다: {container_id}")
+
+
+def _csv(container_id: str, kind: str, header: list[str], rows: list[list]) -> Response:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(header)
+    writer.writerows(rows)
+    name = re.sub(r"[^A-Za-z0-9_-]", "_", container_id)
+    return Response(
+        content=buffer.getvalue(),
+        media_type=CSV_MEDIA,
+        headers={"Content-Disposition": f'attachment; filename="{name}-{kind}.csv"'},
+    )
+
+
+def _cell(value: object) -> object:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return value
+
+
+def _export(scope: ReadScope, container_id: str, plan_id: str | None):
+    try:
+        _require_participation(scope, container_id, plan_id)
+        return coldchain_store.export_points(container_id, plan_id, scope.org_id)
+    except (NotFound, ColdchainError) as exc:
+        raise _http(exc) from exc
+
+
+@router.get(
+    "/containers/{container_id}/readings.csv",
+    response_class=Response,
+    responses=CSV_RESPONSE,
+)
+def export_readings(container_id: str, scope: Scope, plan_id: str | None = None) -> Response:
+    readings, history, _ = _export(scope, container_id, plan_id)
+    rows = [
+        [p.ts.isoformat(), "", p.temp_c, p.power_on, p.humidity_pct, p.door_open, "compacted"]
+        for p in history
+    ] + [
+        [r.ts.isoformat(), r.device_id, r.temp_c, r.power_on, r.humidity_pct, r.door_open, "raw"]
+        for r in readings
+    ]
+    header = ["ts", "device_id", "temp_c", "power_on", "humidity_pct", "door_open", "source"]
+    return _csv(container_id, "readings", header, [[_cell(v) for v in row] for row in rows])
+
+
+@router.get(
+    "/containers/{container_id}/outages.csv",
+    response_class=Response,
+    responses=CSV_RESPONSE,
+)
+def export_outages(container_id: str, scope: Scope, plan_id: str | None = None) -> Response:
+    _, _, episodes = _export(scope, container_id, plan_id)
+    rows = [
+        [
+            index,
+            e.start.isoformat(),
+            e.end.isoformat() if e.end else None,
+            round(e.minutes, 1),
+            e.end is None,
+            e.start_temp_c,
+            e.max_temp_c,
+            e.end_temp_c,
+        ]
+        for index, e in enumerate(episodes, start=1)
+    ]
+    header = [
+        "episode",
+        "start",
+        "end",
+        "minutes",
+        "ongoing",
+        "start_temp_c",
+        "max_temp_c",
+        "end_temp_c",
+    ]
+    return _csv(container_id, "outages", header, [[_cell(v) for v in row] for row in rows])
+
+
+@router.get("/plans/{plan_id}/power-plan")
+def read_power_plan(plan_id: str, principal: OptionalPrincipal) -> PowerPlan:
+    if principal is None:
+        session = plan_store.get(plan_id, org_id=DEMO_ORG)
+        if session is None:
+            raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")
+        return power_plan(session)
+    access = plan_for(plan_id, principal)
+    shipper_ids = access.viewer.shipper_ids if access.viewer.org_type == "shipper" else None
+    return power_plan(access.session, shipper_ids=shipper_ids)
 
 
 @router.get("/alerts")

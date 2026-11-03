@@ -1,24 +1,30 @@
 import logging
+import math
 import threading
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from itertools import pairwise
+from typing import Literal
 
 from pydantic import TypeAdapter
 from sqlalchemy import delete, func, select, text, tuple_
 from sqlalchemy.orm import Session
 
 from freshswitch_backend.coldchain.models import (
+    ActionHandler,
     Alert,
     AlertFeed,
     Binding,
     BindingRequest,
+    ColdchainAction,
     IngestRejected,
     IngestResult,
     Reading,
     ReadingIn,
+    ResidualRisk,
     SettlementPreview,
     SettlementPreviewLot,
     SimulationRequest,
@@ -39,6 +45,7 @@ from freshswitch_backend.coldchain.twin import (
     evaluate,
     loss_summary,
 )
+from freshswitch_backend.domain.models import Quantity
 from freshswitch_backend.execution.quality import (
     ArrivalRequest,
     QualityError,
@@ -82,6 +89,153 @@ class NotFound(LookupError):
 
 class DeviceDenied(ColdchainError):
     pass
+
+
+class ActionConflict(ColdchainError):
+    pass
+
+
+ActionTransition = Literal["accept", "complete"]
+HEAT_MARGIN = Quantity(
+    value=1.2,
+    unit="배",
+    source=(
+        "가정: 적정 하한 위 적산 온도(°C·시간)가 적정 범위 중앙을 유지했을 때의 1.2배를 넘으면 "
+        "도착 뒤 유통기한 단축 위험. 손실률 모델은 도착 시점 손실만 계산한다"
+    ),
+)
+SWING_STD_C = Quantity(
+    value=1.0,
+    unit="°C",
+    source="가정: 품온 표준편차가 1°C를 넘으면 결로·호흡 변동 위험. 손실률 모델은 출렁임을 보지 않는다",
+)
+DOOR_OPEN_COUNT = Quantity(
+    value=1,
+    unit="회",
+    source="가정: 문 열림 측정이 한 번이라도 있으면 외기 유입 위험. 손실률 모델은 문 열림을 보지 않는다",
+)
+
+
+@dataclass
+class OutageEpisode:
+    start: datetime
+    end: datetime | None
+    minutes: float
+    start_temp_c: float
+    max_temp_c: float
+    end_temp_c: float | None
+
+
+def _point_gap(prev: TimelinePoint, cur: TimelinePoint) -> float:
+    return max(0.0, (cur.ts - prev.ts).total_seconds() / 60)
+
+
+def outage_episodes(points: list[TimelinePoint], max_gap: float) -> list[OutageEpisode]:
+    episodes: list[OutageEpisode] = []
+    current: OutageEpisode | None = None
+    prev: TimelinePoint | None = None
+    for point in points:
+        if current is not None and prev is not None:
+            current.minutes += min(_point_gap(prev, point), max_gap)
+            current.max_temp_c = max(current.max_temp_c, point.temp_c)
+        if not point.power_on and current is None:
+            current = OutageEpisode(
+                start=point.ts,
+                end=None,
+                minutes=0.0,
+                start_temp_c=point.temp_c,
+                max_temp_c=point.temp_c,
+                end_temp_c=None,
+            )
+            episodes.append(current)
+        elif point.power_on and current is not None:
+            current.end = point.ts
+            current.end_temp_c = point.temp_c
+            current = None
+        prev = point
+    return episodes
+
+
+def residual_risks(
+    points: list[TimelinePoint], band_min_c: float, band_max_c: float, params: ColdchainParams
+) -> list[ResidualRisk]:
+    if not points:
+        return []
+    max_gap = params.max_gap_minutes.value
+    heat = 0.0
+    elapsed = 0.0
+    gap = 0.0
+    crossings = 0
+    for prev, cur in pairwise(points):
+        dt = _point_gap(prev, cur)
+        gap += max(0.0, dt - max_gap)
+        dt = min(dt, max_gap)
+        elapsed += dt
+        heat += (max(0.0, prev.temp_c - band_min_c) + max(0.0, cur.temp_c - band_min_c)) / 2 * dt
+        if prev.temp_c <= band_max_c < cur.temp_c:
+            crossings += 1
+    heat_h = heat / 60
+    middle = max((band_max_c - band_min_c) / 2, 0.5)
+    heat_limit = middle * elapsed / 60 * HEAT_MARGIN.value
+    temps = [p.temp_c for p in points]
+    mean = sum(temps) / len(temps)
+    std = math.sqrt(sum((t - mean) ** 2 for t in temps) / len(temps))
+    risks = [
+        ResidualRisk(
+            kind="heat_accumulation",
+            level="warning" if heat_h > heat_limit else "info",
+            title="적산 온도",
+            value=round(heat_h, 2),
+            unit="°C·시간",
+            threshold=Quantity(
+                value=round(heat_limit, 2), unit="°C·시간", source=HEAT_MARGIN.source
+            ),
+            message=(
+                f"적정 하한({band_min_c:g}°C) 위 적산 {heat_h:.1f}°C·시간, "
+                f"범위 중앙 유지 시 {heat_limit / HEAT_MARGIN.value:.1f}°C·시간. "
+                "도착 뒤 유통기한 단축은 손실률에 들어 있지 않다"
+            ),
+        ),
+        ResidualRisk(
+            kind="temperature_swing",
+            level="warning" if std > SWING_STD_C.value else "info",
+            title="온도 출렁임",
+            value=round(std, 2),
+            unit="°C",
+            threshold=SWING_STD_C,
+            message=(
+                f"품온 표준편차 {std:.2f}°C, 적정 상한 위로 넘어간 횟수 {crossings}회. "
+                "결로·호흡 변동은 손실률에 들어 있지 않다"
+            ),
+        ),
+        ResidualRisk(
+            kind="sensor_gap",
+            level="warning" if gap > 0 else "info",
+            title="측정 공백",
+            value=round(gap, 1),
+            unit="분",
+            threshold=params.max_gap_minutes,
+            message=(
+                f"측정 간격이 {max_gap:g}분을 넘은 공백 {gap:.0f}분. 공백 동안 상태는 "
+                f"{max_gap:g}분까지만 이어 센다"
+            ),
+        ),
+    ]
+    doors = [p.door_open for p in points if p.door_open is not None]
+    if doors:
+        opened = sum(1 for d in doors if d)
+        risks.append(
+            ResidualRisk(
+                kind="door_open",
+                level="warning" if opened >= DOOR_OPEN_COUNT.value else "info",
+                title="문 열림",
+                value=opened,
+                unit="회",
+                threshold=DOOR_OPEN_COUNT,
+                message=f"문 열림 측정 {opened}회. 외기 유입은 손실률에 들어 있지 않다",
+            )
+        )
+    return risks
 
 
 @dataclass
@@ -495,7 +649,11 @@ class ColdchainStore:
             sensor_loss_rate=loss.sensor_loss_rate,
             predicted_loss_rate=loss.predicted_loss_rate,
             delta_krw=loss.delta_krw,
-            open_actions=sum(1 for a in record.alerts.values() if a.action is not None),
+            open_actions=sum(
+                1
+                for a in record.alerts.values()
+                if a.action is not None and a.action.status != "done"
+            ),
         )
 
     def ingest(
@@ -647,6 +805,7 @@ class ColdchainStore:
             )
             ctx, ev = self._evaluate(record, plan_id)
             alerts = list(record.alerts.values())
+            trail = [*record.history, *ev.timeline]
             return TwinState(
                 container_id=container_id,
                 plan_id=ctx.plan_id,
@@ -666,7 +825,59 @@ class ColdchainStore:
                 alerts=alerts,
                 params=dict(self.params),
                 has_data=has_data,
+                residual_risks=residual_risks(trail, ctx.band_min_c, ctx.band_max_c, self.params),
             )
+
+    def update_action(
+        self,
+        container_id: str,
+        action_key: str,
+        transition: ActionTransition,
+        handler: ActionHandler,
+        note: str | None = None,
+        plan_id: str | None = None,
+        org_id: str = DEMO_ORG,
+    ) -> ColdchainAction:
+        with self._lock, self._db.begin() as db:
+            matches = self._matches(db, container_id, plan_id, org_id)
+            if len(matches) > 1:
+                raise ColdchainError(AMBIGUOUS)
+            if not matches:
+                raise NotFound(f"센서 기록이 없는 컨테이너입니다: {container_id}")
+            row = db.scalar(
+                select(AlertRow).where(
+                    AlertRow.record_key == matches[0].record_key, AlertRow.key == action_key
+                )
+            )
+            alert = Alert.model_validate(row.payload) if row is not None else None
+            if alert is None or alert.action is None:
+                raise NotFound(f"조치를 찾을 수 없습니다: {action_key}")
+            action = alert.action
+            target = "accepted" if transition == "accept" else "done"
+            if action.status == target:
+                return action
+            if action.status == "done":
+                raise ActionConflict("이미 완료된 조치입니다")
+            now = self.clock()
+            update: dict = {"status": target, "note": note if note is not None else action.note}
+            if action.accepted_at is None:
+                update |= {"accepted_at": now, "accepted_by": handler}
+            if target == "done":
+                update |= {"done_at": now, "done_by": handler}
+            action = action.model_copy(update=update)
+            row.payload = alert.model_copy(update={"action": action}).model_dump(mode="json")
+            return action
+
+    def export_points(
+        self, container_id: str, plan_id: str | None = None, org_id: str = DEMO_ORG
+    ) -> tuple[list[Reading], list[TimelinePoint], list[OutageEpisode]]:
+        self.require_plan(plan_id, container_id, org_id)
+        with self._lock:
+            record = self.get_record(container_id, plan_id, org_id)
+            _, ev = self._evaluate(record, plan_id)
+        points = [*record.history, *ev.timeline]
+        episodes = outage_episodes(points, self.params.max_gap_minutes.value)
+        return record.sorted_readings(), record.history, episodes
 
     def summaries(self, plan_id: str | None = None, org_id: str = DEMO_ORG) -> list[TwinSummary]:
         with self._lock:

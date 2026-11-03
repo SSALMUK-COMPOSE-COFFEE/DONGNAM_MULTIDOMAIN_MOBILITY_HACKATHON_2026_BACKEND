@@ -4,6 +4,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from freshswitch_backend.domain.models import KstDatetime, Quantity
+from freshswitch_backend.routing.models import GateStatus
 
 TwinStatus = Literal["no_data", "normal", "warning", "critical"]
 AlertLevel = Literal["info", "warning", "critical"]
@@ -17,6 +18,11 @@ ActionKind = Literal[
 ]
 AlertKind = Literal["power_cut", "power_restored", "status_change", "action"]
 CounterpartyRole = Literal["terminal", "trucker", "destination_warehouse", "insurer"]
+ActionStatus = Literal["open", "accepted", "done"]
+HandlerRole = Literal["platform", "forwarder"]
+ResidualRiskKind = Literal["heat_accumulation", "temperature_swing", "door_open", "sensor_gap"]
+RiskLevel = Literal["info", "warning"]
+PowerStage = Literal["trucking", "gate", "plug"]
 
 
 class ReadingIn(BaseModel):
@@ -63,6 +69,12 @@ class RequestDraft(BaseModel):
     text: str
 
 
+class ActionHandler(BaseModel):
+    org_type: HandlerRole
+    org_id: str
+    user_id: str | None = None
+
+
 class ColdchainAction(BaseModel):
     key: str
     kind: ActionKind
@@ -74,6 +86,26 @@ class ColdchainAction(BaseModel):
     lot_ids: list[str] = Field(default_factory=list)
     request: RequestDraft | None = None
     created_at: datetime | None = None
+    status: ActionStatus = "open"
+    note: str | None = None
+    accepted_at: datetime | None = None
+    accepted_by: ActionHandler | None = None
+    done_at: datetime | None = None
+    done_by: ActionHandler | None = None
+
+
+class ActionUpdateBody(BaseModel):
+    note: str | None = Field(default=None, max_length=500)
+
+
+class ResidualRisk(BaseModel):
+    kind: ResidualRiskKind
+    level: RiskLevel
+    title: str
+    value: float
+    unit: str
+    threshold: Quantity
+    message: str
 
 
 class Alert(BaseModel):
@@ -212,6 +244,7 @@ class TwinState(BaseModel):
     alerts: list[Alert]
     params: dict[str, Quantity]
     has_data: bool = True
+    residual_risks: list[ResidualRisk] = Field(default_factory=list)
 
 
 class IngestRejected(BaseModel):
@@ -292,3 +325,49 @@ class SettlementPreview(BaseModel):
     total_refund_change: int
     rule: str
     note: str
+
+
+class PowerSegment(BaseModel):
+    stage: PowerStage
+    start: datetime | None
+    end: datetime | None
+    minutes: float
+    powered: bool
+    basis: str
+
+
+class LotPowerPlan(BaseModel):
+    lot_id: str
+    shipper_id: str
+    container_id: str
+    voyage_id: str
+    truck_id: str | None
+    trip: int | None
+    gate_status: GateStatus | None
+    segments: list[PowerSegment]
+    unpowered_minutes: float
+    threshold_minutes: float
+    exceeds: bool
+
+
+class GensetCandidate(BaseModel):
+    key: str
+    equipment: str
+    voyage_id: str
+    container_ids: list[str]
+    truck_id: str | None
+    trip: int | None
+    lot_ids: list[str]
+    window_start: datetime | None
+    window_end: datetime | None
+    unpowered_minutes: float
+    threshold_minutes: float
+    reason: str
+
+
+class PowerPlan(BaseModel):
+    plan_id: str
+    lots: list[LotPowerPlan]
+    candidates: list[GensetCandidate]
+    params: dict[str, Quantity]
+    rule: str
