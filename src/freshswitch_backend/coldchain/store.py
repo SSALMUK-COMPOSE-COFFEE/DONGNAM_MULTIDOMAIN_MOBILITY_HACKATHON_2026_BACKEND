@@ -435,7 +435,9 @@ class ColdchainStore:
         key = row.record_key
         readings = db.scalars(select(ReadingRow).where(ReadingRow.record_key == key))
         alerts = db.scalars(
-            select(AlertRow).where(AlertRow.record_key == key).order_by(AlertRow.seq)
+            select(AlertRow)
+            .where(AlertRow.record_key == key)
+            .order_by(AlertRow.created_at, AlertRow.seq)
         )
         record = ContainerRecord(
             container_id=row.container_id,
@@ -904,7 +906,11 @@ class ColdchainStore:
             if target == "done":
                 update |= {"done_at": now, "done_by": handler}
             action = action.model_copy(update=update)
-            row.payload = alert.model_copy(update={"action": action}).model_dump(mode="json")
+            seq = db.scalar(ALERT_SEQ.next_value())
+            row.seq = seq
+            row.payload = alert.model_copy(update={"seq": seq, "action": action}).model_dump(
+                mode="json"
+            )
             return action
 
     def export_points(
