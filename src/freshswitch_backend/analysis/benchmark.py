@@ -1,6 +1,7 @@
 import math
 import time
 from collections import defaultdict
+from collections.abc import Iterable
 
 from freshswitch_backend.analysis.common import (
     PROPOSAL_EVENT,
@@ -245,8 +246,11 @@ def _timed(fn):
     return value, round((time.perf_counter() - started) * 1000)
 
 
-def compare_methods(scenario: Scenario) -> list[MethodResult]:
-    optimizer, opt_ms = _timed(lambda: [(scenario, solve_routed(scenario), [])])
+def compare_methods(scenario: Scenario, plan: Plan | None = None) -> list[MethodResult]:
+    if plan is None:
+        optimizer, opt_ms = _timed(lambda: [(scenario, solve_routed(scenario), [])])
+    else:
+        optimizer, opt_ms = [(scenario, plan, [])], plan.solve_ms
     fcfs, fcfs_ms = _timed(lambda: [routed_part(scenario, fcfs_plan(scenario))])
     greedy, greedy_ms = _timed(lambda: [routed_part(scenario, greedy_plan(scenario))])
     solo, solo_ms = _timed(lambda: [routed_part(sub, plan) for sub, plan in solo_plans(scenario)])
@@ -258,11 +262,15 @@ def compare_methods(scenario: Scenario) -> list[MethodResult]:
     ]
 
 
-def replan_benchmark(scenario: Scenario) -> ReplanBenchmark | None:
+def replan_benchmark(
+    scenario: Scenario, plan: Plan | None = None, air_locked: Iterable[str] = ()
+) -> ReplanBenchmark | None:
     if not proposal_event_applies(scenario):
         return None
-    base = solve(scenario)
-    result = replan(scenario, base, PROPOSAL_EVENT, time_limit_s=REPLAN_LIMIT_S)
+    base = plan if plan is not None else solve(scenario)
+    result = replan(
+        scenario, base, PROPOSAL_EVENT, air_locked=air_locked, time_limit_s=REPLAN_LIMIT_S
+    )
     manual = next(a for a in result.alternatives if a.id == "sail_as_is")
     rows = [
         ReplanBenchmarkRow(
@@ -292,10 +300,12 @@ def replan_benchmark(scenario: Scenario) -> ReplanBenchmark | None:
     )
 
 
-def benchmark(scenario: Scenario) -> BenchmarkResult:
+def benchmark(
+    scenario: Scenario, plan: Plan | None = None, air_locked: Iterable[str] = ()
+) -> BenchmarkResult:
     started = time.perf_counter()
-    methods = compare_methods(scenario)
-    replan_part = replan_benchmark(scenario)
+    methods = compare_methods(scenario, plan)
+    replan_part = replan_benchmark(scenario, plan, air_locked)
     return BenchmarkResult(
         scenario_id=scenario.id,
         methods=methods,

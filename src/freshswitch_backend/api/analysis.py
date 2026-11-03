@@ -1,6 +1,6 @@
-from typing import Literal
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, model_validator
 
 from freshswitch_backend.analysis import (
@@ -19,11 +19,34 @@ from freshswitch_backend.analysis import (
     fuel_shock,
     sensitivity,
 )
+from freshswitch_backend.api.auth import OptionalPrincipal
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import Scenario
-from freshswitch_backend.planning.store import store
+from freshswitch_backend.persistence.tables import DEMO_ORG
+from freshswitch_backend.planning.store import PlanSession, store
 
 router = APIRouter(prefix="/analysis", tags=["analysis"])
+
+PLATFORM_ONLY = "금액 분석은 플랫폼 조직만 사용할 수 있습니다"
+PLAN_NOT_FOUND = "계획을 찾을 수 없습니다"
+
+
+def platform_or_demo_org(principal: OptionalPrincipal) -> str:
+    if principal is None:
+        return DEMO_ORG
+    if principal.org_type != "platform":
+        raise HTTPException(status_code=403, detail=PLATFORM_ONLY)
+    return principal.org_id
+
+
+PlatformOrg = Annotated[str, Depends(platform_or_demo_org)]
+
+
+def plan_session(plan_id: str, org_id: str) -> PlanSession:
+    session = store.get(plan_id, org_id=org_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=PLAN_NOT_FOUND)
+    return session
 
 
 class SensitivityRequest(BaseModel):
@@ -33,6 +56,7 @@ class SensitivityRequest(BaseModel):
 
 class BenchmarkRequest(BaseModel):
     scenario_id: str = "default"
+    plan_id: str | None = None
 
 
 MAX_SURCHARGE_POINTS = 41
@@ -90,25 +114,23 @@ def _scenario(scenario_id: str) -> Scenario:
     return scenario
 
 
+def _source(scenario_id: str, plan_id: str | None, org_id: str) -> Scenario:
+    if plan_id is not None:
+        return plan_session(plan_id, org_id).scenario
+    return _scenario(scenario_id)
+
+
 @router.post("/sensitivity")
-def run_sensitivity(body: SensitivityRequest) -> SensitivityResult:
+def run_sensitivity(body: SensitivityRequest, org_id: PlatformOrg) -> SensitivityResult:
     if body.plan_id is not None:
-        session = store.get(body.plan_id)
-        if session is None:
-            raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")
+        session = plan_session(body.plan_id, org_id)
         return sensitivity(session.scenario, plan_id=body.plan_id)
     return sensitivity(_scenario(body.scenario_id))
 
 
 @router.post("/fuel-shock")
-def run_fuel_shock(body: FuelShockRequest) -> FuelShockResult:
-    if body.plan_id is not None:
-        session = store.get(body.plan_id)
-        if session is None:
-            raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")
-        scenario = session.scenario
-    else:
-        scenario = _scenario(body.scenario_id)
+def run_fuel_shock(body: FuelShockRequest, org_id: PlatformOrg) -> FuelShockResult:
+    scenario = _source(body.scenario_id, body.plan_id, org_id)
     return fuel_shock(
         scenario,
         surcharges=body.values(),
@@ -120,31 +142,41 @@ def run_fuel_shock(body: FuelShockRequest) -> FuelShockResult:
 
 
 @router.post("/benchmark")
-def run_benchmark(body: BenchmarkRequest) -> BenchmarkResult:
+def run_benchmark(body: BenchmarkRequest, org_id: PlatformOrg) -> BenchmarkResult:
+    if body.plan_id is not None:
+        session = plan_session(body.plan_id, org_id)
+        return benchmark(session.scenario, session.plan, session.air_locked_lot_ids)
     return benchmark(_scenario(body.scenario_id))
 
 
 @router.get("/business")
 def run_business(
+    org_id: PlatformOrg,
     scenario_id: str = "default",
+    plan_id: str | None = None,
     forwarder_share: float = Query(DEFAULT_FORWARDER_SHARE, ge=0, le=1),
     ops_cost_per_voyage: int = Query(DEFAULT_OPS_COST_PER_VOYAGE, ge=0),
     variable_cost_per_pallet: int = Query(0, ge=0),
 ) -> BusinessResult:
     return business(
-        _scenario(scenario_id), forwarder_share, ops_cost_per_voyage, variable_cost_per_pallet
+        _source(scenario_id, plan_id, org_id),
+        forwarder_share,
+        ops_cost_per_voyage,
+        variable_cost_per_pallet,
     )
 
 
 @router.get("/business/matrix")
 def run_business_matrix(
+    org_id: PlatformOrg,
     scenario_id: str = "default",
+    plan_id: str | None = None,
     base_fee_mode: Literal["deducted", "additive"] = "deducted",
     grape_rule: Literal["usage_fee", "performance", "solo_baseline"] = "usage_fee",
     variable_cost_per_pallet: int = Query(0, ge=0),
 ) -> BusinessMatrix:
     result = business_matrix(
-        _scenario(scenario_id), base_fee_mode, grape_rule, variable_cost_per_pallet
+        _source(scenario_id, plan_id, org_id), base_fee_mode, grape_rule, variable_cost_per_pallet
     )
     if result is None:
         raise HTTPException(

@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
-from freshswitch_backend.api.auth import current_org_id
+from freshswitch_backend.api.analysis import PlatformOrg
 from freshswitch_backend.api.computation import (
     compute_replan,
     explanation_budget,
@@ -91,7 +91,7 @@ def _summary(
 async def delay_forecast(
     plan_id: str,
     factory: Annotated[UlsanClientFactory, Depends(ulsan_client_factory)],
-    org_id: Annotated[str, Depends(current_org_id)],
+    org_id: PlatformOrg,
     body: ForecastOptions | None = None,
     llm: Annotated[bool | None, Query()] = None,
 ) -> DelayForecastResponse:

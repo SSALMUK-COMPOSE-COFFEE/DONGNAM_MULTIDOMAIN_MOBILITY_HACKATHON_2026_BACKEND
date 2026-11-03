@@ -30,6 +30,7 @@ from freshswitch_backend.quality.models import (
 router = APIRouter(prefix="/quality", tags=["quality"])
 
 PLATFORM_ONLY = "품질 관측 원본은 플랫폼 조직만 다룰 수 있습니다"
+IMPACT_PLATFORM_ONLY = "학습 손실률의 금액 영향은 플랫폼 조직만 볼 수 있습니다"
 SANDBOX_WRITE = "데모 플랫폼은 품질 관측을 추가·삭제·초기화할 수 없습니다"
 OTHER_SCOPE = "다른 학습 범위의 품질 관측은 다룰 수 없습니다"
 
@@ -43,6 +44,15 @@ def caller_scope(principal: OptionalPrincipal) -> LearningScope:
 
 
 Scope = Annotated[LearningScope, Depends(caller_scope)]
+
+
+def impact_viewer(principal: OptionalPrincipal) -> LearningScope:
+    if principal is not None and principal.org_type != "platform":
+        raise HTTPException(status_code=403, detail=IMPACT_PLATFORM_ONLY)
+    return _principal_scope(principal)
+
+
+ImpactScope = Annotated[LearningScope, Depends(impact_viewer)]
 
 
 def observation_viewer(request: Request, principal: OptionalPrincipal) -> LearningScope:
@@ -163,7 +173,9 @@ def reset(target: Target, seed: Annotated[bool, Query()] = True) -> ResetResult:
 
 
 @router.get("/impact")
-async def impact(scope: Scope, scenario_id: Annotated[str, Query()] = "default") -> ImpactResult:
+async def impact(
+    scope: ImpactScope, scenario_id: Annotated[str, Query()] = "default"
+) -> ImpactResult:
     scenario = _scenario(scenario_id)
     table = await run_in_threadpool(learned_table, scenario, quality_history, scope)
     cells = [c for c in table.cells if c.observations]
