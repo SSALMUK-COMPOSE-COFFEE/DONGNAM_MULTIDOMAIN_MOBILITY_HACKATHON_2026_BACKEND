@@ -36,6 +36,7 @@ from freshswitch_backend.forecast.service import (
     delay_event,
     forecast_voyages,
     remaining_risks,
+    unreplannable,
     weather_mode,
     weather_use,
 )
@@ -137,6 +138,7 @@ def _summary(
     air: list[str],
     remaining: list[RemainingRisk],
     own: int,
+    event: DelayEvent | None = None,
 ) -> str:
     parts = [
         f"{v.vessel_name}({v.voyage_id}) {v.quantile} 지연 {v.delay_hours:g}시간" for v in voyages
@@ -147,10 +149,15 @@ def _summary(
     if not proposals:
         return f"{head}. 판매기한·신선 유지 기간을 넘는 로트 없음"
     lots = ", ".join(p.lot_id for p in proposals)
-    tail = f" → 재계획 추천안에서 항공 전환: {', '.join(air)}" if air else ""
+    tail = ""
+    if event is not None and event.additional_voyages:
+        tail += f" → 위험 항차 {len(event.voyage_ids)}곳({', '.join(event.voyage_ids)}) 함께 재계획"
+    if air:
+        tail += f" → 재계획 추천안에서 항공 전환: {', '.join(air)}"
     if remaining:
         names = ", ".join(
-            f"{r.vessel_name}({r.voyage_id}) {', '.join(r.at_risk_lot_ids)}" for r in remaining
+            f"{r.vessel_name}({r.voyage_id}) {', '.join(r.at_risk_lot_ids)}({r.reason})"
+            for r in remaining
         )
         tail += f". 이번 재계획에 반영하지 않은 위험 항차: {names} — 따로 재계획 필요"
     return f"{head}. 위험 로트 {lots}{tail}"
@@ -199,8 +206,9 @@ async def delay_forecast(
     voyages = forecast_voyages(
         predictor, session.scenario, session.plan, effective, port, weather_by_voyage=levels
     )
-    event = delay_event(voyages)
-    remaining = remaining_risks(voyages, event)
+    skipped = unreplannable(session.scenario, voyages)
+    event = delay_event(voyages, skip=skipped)
+    remaining = remaining_risks(voyages, event, skipped)
     replan_response = None
     where: dict[str, str] = {}
     air: list[str] = []
@@ -254,5 +262,5 @@ async def delay_forecast(
         air_switch=proposals,
         air_lot_ids=air,
         replan=replan_response,
-        summary=_summary(voyages, proposals, air, remaining, own_count),
+        summary=_summary(voyages, proposals, air, remaining, own_count, event),
     )

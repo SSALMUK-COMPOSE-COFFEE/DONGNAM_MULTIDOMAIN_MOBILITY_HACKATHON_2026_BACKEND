@@ -67,7 +67,7 @@ def _floor_min(dt: datetime) -> datetime:
 def _release_locked(req: PickupRequest) -> PickupRequest:
     turnaround = timedelta(minutes=req.service_minutes)
     free_at: dict[str, datetime] = {}
-    for route in [*req.locked_routes, *req.blocking_routes]:
+    for route in [*req.locked_routes, *req.blocking_routes, *req.reserved_routes]:
         back = route.port_eta + turnaround
         free_at[route.truck_id] = max(back, free_at.get(route.truck_id, back))
     trucks = [
@@ -86,7 +86,7 @@ def _release_locked(req: PickupRequest) -> PickupRequest:
 
 def _merge_locked(req: PickupRequest, routes: list[TruckRoute]) -> list[TruckRoute]:
     last: dict[str, int] = {}
-    for route in req.locked_routes:
+    for route in [*req.locked_routes, *req.reserved_routes]:
         last[route.truck_id] = max(route.trip, last.get(route.truck_id, 0))
     shifted = []
     for route in sorted(routes, key=lambda r: (r.earliest_departure, r.trip)):
@@ -100,7 +100,8 @@ def _merge_locked(req: PickupRequest, routes: list[TruckRoute]) -> list[TruckRou
 
 def solve_pickup(request: PickupRequest, time_limit_s: float = 5.0) -> PickupPlan:
     started = time.perf_counter()
-    req = _release_locked(request) if request.locked_routes or request.blocking_routes else request
+    pinned = request.locked_routes or request.blocking_routes or request.reserved_routes
+    req = _release_locked(request) if pinned else request
     points = [(req.depot.lat, req.depot.lon)] + [(s.lat, s.lon) for s in req.stops]
     n = len(points)
     km = [
@@ -191,10 +192,10 @@ def solve_pickup(request: PickupRequest, time_limit_s: float = 5.0) -> PickupPla
         status = "NO_TRUCKS"
         dropped.extend(req.stops[node - 1].id for node in windows)
 
-    if req.locked_routes:
+    if req.locked_routes or req.reserved_routes:
         routes = _merge_locked(req, routes)
-        if status == "NO_STOPS":
-            status = "OK"
+    if req.locked_routes and status == "NO_STOPS":
+        status = "OK"
     if dropped and status == "OK":
         status = "PARTIAL"
     order = {s.id: i for i, s in enumerate(req.stops)}

@@ -1,5 +1,5 @@
 import math
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from datetime import date, datetime, timedelta
 from typing import Literal
 
@@ -27,7 +27,8 @@ from freshswitch_backend.integrations.kma_forecast import (
 )
 from freshswitch_backend.optimize.costs import CostModel, LotCost, haversine_km
 from freshswitch_backend.optimize.feasibility import air_rejection
-from freshswitch_backend.replan.models import DelayEvent
+from freshswitch_backend.replan.engine import apply_event
+from freshswitch_backend.replan.models import DelayEvent, ReplanError, VoyageDelay
 
 Quantile = Literal["p50", "p90"]
 Preset = Literal["typhoon"]
@@ -43,6 +44,7 @@ PROXY_NOTE = (
     "울산 대기선은 유조선·케미컬선 비중이 커서 부산신항 컨테이너 선석 혼잡과 다를 수 있다"
 )
 PROXY_LABEL = "보정 신호(가정): 울산항 묘박 대기 비율을 부산 항차 혼잡의 대리 지표로 씀"
+NOT_REPLANNED = "이번 재계획에 반영하지 않음"
 
 GIMHAE_LAT = 35.1795
 GIMHAE_LON = 128.9382
@@ -110,6 +112,7 @@ class RemainingRisk(BaseModel):
     delay_hours: float
     at_risk_lot_ids: list[str]
     at_risk_pallets: int
+    reason: str = NOT_REPLANNED
 
 
 class LotRisk(BaseModel):
@@ -400,24 +403,42 @@ def _risky(forecasts: list[VoyageForecast]) -> list[VoyageForecast]:
     return [f for f in forecasts if any(lot.at_risk for lot in f.lots)]
 
 
-def delay_event(forecasts: list[VoyageForecast]) -> DelayEvent | None:
-    risky = _risky(forecasts)
+def _severity(f: VoyageForecast) -> tuple[int, float]:
+    return sum(lot.pallets for lot in f.lots if lot.at_risk), -f.planned_etd.timestamp()
+
+
+def delay_event(forecasts: list[VoyageForecast], skip: Collection[str] = ()) -> DelayEvent | None:
+    risky = [f for f in _risky(forecasts) if f.voyage_id not in skip]
     if not risky:
         return None
-    worst = max(
-        risky,
-        key=lambda f: (
-            sum(lot.pallets for lot in f.lots if lot.at_risk),
-            -f.planned_etd.timestamp(),
-        ),
+    worst = max(risky, key=_severity)
+    others = sorted((f for f in risky if f is not worst), key=lambda f: f.planned_etd)
+    return DelayEvent(
+        voyage_id=worst.voyage_id,
+        new_etd=worst.predicted_etd,
+        additional_voyages=[
+            VoyageDelay(voyage_id=f.voyage_id, new_etd=f.predicted_etd) for f in others
+        ],
+        source="예측",
     )
-    return DelayEvent(voyage_id=worst.voyage_id, new_etd=worst.predicted_etd, source="예측")
+
+
+def unreplannable(scenario: Scenario, forecasts: list[VoyageForecast]) -> dict[str, str]:
+    reasons = {}
+    for f in _risky(forecasts):
+        try:
+            apply_event(scenario, DelayEvent(voyage_id=f.voyage_id, new_etd=f.predicted_etd))
+        except ReplanError as exc:
+            reasons[f.voyage_id] = f"재계획에 넣을 수 없음: {exc}"
+    return reasons
 
 
 def remaining_risks(
-    forecasts: list[VoyageForecast], event: DelayEvent | None
+    forecasts: list[VoyageForecast],
+    event: DelayEvent | None,
+    reasons: Mapping[str, str] | None = None,
 ) -> list[RemainingRisk]:
-    handled = event.voyage_id if event is not None else None
+    handled = set(event.voyage_ids) if event is not None else set()
     return [
         RemainingRisk(
             voyage_id=f.voyage_id,
@@ -427,9 +448,10 @@ def remaining_risks(
             delay_hours=f.delay_hours,
             at_risk_lot_ids=[lot.lot_id for lot in f.lots if lot.at_risk],
             at_risk_pallets=sum(lot.pallets for lot in f.lots if lot.at_risk),
+            reason=(reasons or {}).get(f.voyage_id, NOT_REPLANNED),
         )
         for f in _risky(forecasts)
-        if f.voyage_id != handled
+        if f.voyage_id not in handled
     ]
 
 

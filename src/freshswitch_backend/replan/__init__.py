@@ -23,6 +23,7 @@ from freshswitch_backend.replan.models import (
     ReplanError,
     ReplanResult,
     RouteChange,
+    VoyageDelay,
 )
 
 __all__ = [
@@ -38,6 +39,7 @@ __all__ = [
     "ReplanError",
     "ReplanResult",
     "RouteChange",
+    "VoyageDelay",
     "apply_event",
     "diff_plans",
     "event_time",

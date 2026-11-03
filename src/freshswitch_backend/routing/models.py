@@ -92,6 +92,7 @@ class PickupRequest(BaseModel):
     gate_windows: list[GateWindow] = Field(default_factory=list)
     locked_routes: list[TruckRoute] = Field(default_factory=list)
     blocking_routes: list[TruckRoute] = Field(default_factory=list)
+    reserved_routes: list[TruckRoute] = Field(default_factory=list)
     not_before: datetime | None = None
 
 

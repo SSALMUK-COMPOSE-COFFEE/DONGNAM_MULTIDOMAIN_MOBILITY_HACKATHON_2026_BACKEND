@@ -33,6 +33,7 @@ from freshswitch_backend.replan.models import (
     ReplanResult,
     RouteChange,
     ShipperDelta,
+    VoyageDelay,
 )
 from freshswitch_backend.routing import TruckRoute, locked_routes, route_lot_ids
 
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
 
 UNASSIGNED = "UNASSIGNED"
 DISPATCH_RELEASED = "실행된 배차를 고정하면 실행 가능한 대안이 없어 고정을 풀고 계산했습니다"
+DISPATCH_REUSED = "이미 출발한 배차를 다른 화물에 쓸 수 없음"
 MAX_PULL_FORWARD_DAYS = 2
 SOLVED = ("OPTIMAL", "FEASIBLE")
 LABELS: dict[AlternativeId, str] = {
@@ -194,6 +196,38 @@ def route_changes(
     return changes
 
 
+def _delay_voyage(scenario: Scenario, delay: VoyageDelay) -> Scenario:
+    voyage_id, new_etd, new_cutoff = delay.voyage_id, delay.new_etd, delay.new_cy_cutoff
+    voyage = next((v for v in scenario.voyages if v.id == voyage_id), None)
+    if voyage is None:
+        raise ReplanError(f"항차를 찾을 수 없음: {voyage_id}")
+    base_etd = voyage.original_etd or voyage.etd
+    base_cutoff = voyage.original_cy_cutoff or voyage.cy_cutoff
+    if voyage.original_etd is not None and voyage.original_cy_cutoff is None:
+        base_cutoff = voyage.cy_cutoff + max(base_etd - voyage.etd, timedelta(0))
+    cutoff = new_cutoff or voyage.cy_cutoff
+    if new_cutoff is None and new_etd < base_etd:
+        cutoff = base_cutoff + (new_etd - base_etd)
+    elif new_cutoff is None and voyage.etd < base_etd:
+        cutoff = base_cutoff
+    if cutoff > new_etd:
+        raise ReplanError("선적 마감이 출항 시각보다 늦을 수 없음")
+    original_cutoff = voyage.original_cy_cutoff
+    if original_cutoff is None:
+        original_cutoff = voyage.cy_cutoff if voyage.original_etd is None else base_cutoff
+    changed = voyage.model_copy(
+        update={
+            "etd": new_etd,
+            "cy_cutoff": cutoff,
+            "original_etd": base_etd,
+            "original_cy_cutoff": original_cutoff,
+        }
+    )
+    return scenario.model_copy(
+        update={"voyages": [changed if v.id == voyage_id else v for v in scenario.voyages]}
+    )
+
+
 def apply_event(scenario: Scenario, event: Event) -> Scenario:
     lots = {lot.id: lot for lot in scenario.lots}
     lot_id = getattr(event, "lot_id", None)
@@ -232,35 +266,10 @@ def apply_event(scenario: Scenario, event: Event) -> Scenario:
                     ]
                 }
             )
-        case DelayEvent(voyage_id=voyage_id, new_etd=new_etd, new_cy_cutoff=new_cutoff):
-            voyage = next((v for v in scenario.voyages if v.id == voyage_id), None)
-            if voyage is None:
-                raise ReplanError(f"항차를 찾을 수 없음: {voyage_id}")
-            base_etd = voyage.original_etd or voyage.etd
-            base_cutoff = voyage.original_cy_cutoff or voyage.cy_cutoff
-            if voyage.original_etd is not None and voyage.original_cy_cutoff is None:
-                base_cutoff = voyage.cy_cutoff + max(base_etd - voyage.etd, timedelta(0))
-            cutoff = new_cutoff or voyage.cy_cutoff
-            if new_cutoff is None and new_etd < base_etd:
-                cutoff = base_cutoff + (new_etd - base_etd)
-            elif new_cutoff is None and voyage.etd < base_etd:
-                cutoff = base_cutoff
-            if cutoff > new_etd:
-                raise ReplanError("선적 마감이 출항 시각보다 늦을 수 없음")
-            original_cutoff = voyage.original_cy_cutoff
-            if original_cutoff is None:
-                original_cutoff = voyage.cy_cutoff if voyage.original_etd is None else base_cutoff
-            changed = voyage.model_copy(
-                update={
-                    "etd": new_etd,
-                    "cy_cutoff": cutoff,
-                    "original_etd": base_etd,
-                    "original_cy_cutoff": original_cutoff,
-                }
-            )
-            return scenario.model_copy(
-                update={"voyages": [changed if v.id == voyage_id else v for v in scenario.voyages]}
-            )
+        case DelayEvent():
+            for delay in event.delays():
+                scenario = _delay_voyage(scenario, delay)
+            return scenario
         case AddLotEvent(lot=lot):
             if lot.id in lots:
                 raise ReplanError(f"이미 있는 로트 ID: {lot.id}")
@@ -328,6 +337,7 @@ class _Context:
         before: Scenario | None = None,
         unavailable: Iterable[str] = (),
         pinned: Iterable[tuple[str, str, int]] = (),
+        dispatched_lots: Iterable[str] = (),
     ) -> None:
         self.after = after
         self.current = current
@@ -341,6 +351,7 @@ class _Context:
         self.etd_before = {v.id: v.etd for v in (before or after).voyages}
         self.unavailable = set(unavailable) - set(self.where.values())
         self.pinned = set(pinned)
+        self.dispatched_lots = set(dispatched_lots)
         self.air_locked = set(air_locked) & set(self.lot_ids)
         self.held = held & set(self.lot_ids)
         self.rule_switched: set[str] = set()
@@ -361,15 +372,17 @@ class _Context:
                 return {lot_id}
             case AddLotEvent(lot=lot):
                 return {lot.id}
-            case DelayEvent(voyage_id=voyage_id):
+            case DelayEvent():
+                voyages = set(self.event.voyage_ids)
                 return {
-                    lid for lid, loc in self.where.items() if self.voyage_of.get(loc) == voyage_id
+                    lid for lid, loc in self.where.items() if self.voyage_of.get(loc) in voyages
                 }
         return set()
 
     def _touched_containers(self) -> set[str]:
         if isinstance(self.event, DelayEvent):
-            return {c.id for c in self.after.containers if c.voyage_id == self.event.voyage_id}
+            voyages = set(self.event.voyage_ids)
+            return {c.id for c in self.after.containers if c.voyage_id in voyages}
         return {
             self.where[lid] for lid in self.touched_lots if self.where.get(lid) in self.voyage_of
         }
@@ -536,7 +549,7 @@ def _pulled(ctx: _Context, plan: Plan) -> bool:
     )
 
 
-def _moved_for_next_voyage(ctx: _Context) -> tuple[set[str], set[str]]:
+def _moved_for_next_voyage(ctx: _Context) -> tuple[dict[str, str], set[str], set[str]]:
     if isinstance(ctx.event, AddLotEvent):
         lot = ctx.event.lot
         candidates = [
@@ -545,31 +558,49 @@ def _moved_for_next_voyage(ctx: _Context) -> tuple[set[str], set[str]]:
             if c.id not in ctx.unavailable and sea_option(ctx.model, lot, c, 0)[0] is not None
         ]
         if not candidates:
-            return set(), set()
+            return {}, set(), set()
         first = min(candidates, key=lambda c: ctx.etd[c.voyage_id])
-        return {lot.id}, {first.voyage_id}
+        return {lot.id: first.voyage_id}, {first.voyage_id}, set()
     moved = {
-        lid
+        lid: ctx.voyage_of[ctx.where[lid]]
         for lid in ctx.lot_ids
         if ctx.where.get(lid) in ctx.touched_containers
         and lid not in ctx.air_locked
         and lid not in ctx.rule_switched
         and lid not in ctx.held
     }
-    if isinstance(ctx.event, ReduceEvent):
-        moved.add(ctx.event.lot_id)
-    return moved, ctx.scope_voyages()
+    origin = ctx.voyage_of.get(ctx.where.get(getattr(ctx.event, "lot_id", None)))
+    if isinstance(ctx.event, ReduceEvent) and origin is not None:
+        moved.setdefault(ctx.event.lot_id, origin)
+    kept = set(moved) & ctx.dispatched_lots
+    free = {lid: voyage for lid, voyage in moved.items() if lid not in kept}
+    return free, ctx.scope_voyages(), kept
 
 
-def _next_voyage_reasons(
-    ctx: _Context, plan: Plan, moved: set[str], blocked: set[str]
-) -> list[str]:
+def _next_voyage_blocked(ctx: _Context, moved: dict[str, str]) -> dict[str, set[str]]:
+    etd = ctx.etd_before if isinstance(ctx.event, DelayEvent) else ctx.etd
+    by_origin = {
+        origin: {
+            c.id
+            for c in ctx.after.containers
+            if c.voyage_id == origin or ctx.etd[c.voyage_id] <= etd[origin]
+        }
+        for origin in set(moved.values())
+    }
+    return {lid: by_origin[origin] for lid, origin in moved.items()}
+
+
+def _next_voyage_reasons(ctx: _Context, plan: Plan, blocked: dict[str, set[str]]) -> list[str]:
     lots = {lot.id: lot for lot in ctx.after.lots}
-    later = [c for c in ctx.after.containers if c.id not in blocked and c.id not in ctx.unavailable]
     reasons = []
     for u in plan.unassigned:
-        if u.lot_id not in moved:
+        if u.lot_id not in blocked:
             continue
+        later = [
+            c
+            for c in ctx.after.containers
+            if c.id not in blocked[u.lot_id] and c.id not in ctx.unavailable
+        ]
         if not later:
             reasons.append(f"{u.lot_id}: 이후 항차 없음")
             continue
@@ -579,6 +610,30 @@ def _next_voyage_reasons(
             details.append(f"{container.voyage_id}/{container.id} {reason or '용량·혼적 부족'}")
         reasons.append(f"{u.lot_id}: " + ", ".join(details))
     return reasons
+
+
+def _pinned_conflicts(
+    ctx: _Context, built: PlanWithRoutes, kept: set[str], blocked: dict[str, set[str]]
+) -> tuple[bool, list[str]]:
+    lots = {lot.id: lot for lot in ctx.after.lots}
+    pulls = _pulls(ctx.current)
+    where = locations(built.plan)
+    details = []
+    for lid in sorted(kept):
+        if lid not in lots or ctx.where.get(lid) not in ctx.voyage_of:
+            continue
+        if where.get(lid) != ctx.where[lid]:
+            details.append(f"{lid}: 배차가 실행된 트럭의 배정을 유지할 수 없음")
+            continue
+        container = ctx.model.containers[ctx.where[lid]]
+        _, reason = sea_option(ctx.model, lots[lid], container, pulls.get(lid, 0))
+        if reason:
+            details.append(f"{lid}: {reason}")
+    pinned_in = {where[lid] for lid in ctx.dispatched_lots if where.get(lid) in ctx.voyage_of}
+    crowded = any(
+        u.lot_id in blocked and pinned_in - blocked[u.lot_id] for u in built.plan.unassigned
+    )
+    return bool(details or crowded or _late_pinned(ctx, built.routes)), details
 
 
 def _late_pinned(ctx: _Context, routes: list[VoyagePickup]) -> list[str]:
@@ -662,11 +717,35 @@ def replan(
             released = _replan_with(scenario, current_plan, event, [], **options)
         except PlanningTimeout:
             released = None
+        if released is not None:
+            released = _keep_pinned_next_voyage(released, result)
         if released is not None and released.recommended_id is not None:
             released.warnings.append(DISPATCH_RELEASED)
             result = released
     result.solve_ms = round((time.perf_counter() - started) * 1000)
     return result
+
+
+def _recommend(alternatives: list[Alternative]) -> Alternative | None:
+    feasible = [a for a in alternatives if a.feasible]
+    return min(feasible, key=lambda a: (a.total_cost, PREFERENCE[a.id]), default=None)
+
+
+def _keep_pinned_next_voyage(released: ReplanResult, pinned: ReplanResult) -> ReplanResult:
+    honored = {a.id: a for a in pinned.alternatives if a.id == "next_voyage"}
+    alternatives = [
+        honored.get(a.id, a)
+        for a in released.alternatives
+        if a.id != "next_voyage" or a.id in honored
+    ]
+    best = _recommend(alternatives)
+    return released.model_copy(
+        update={
+            "alternatives": alternatives,
+            "recommended_id": best.id if best else None,
+            "diff": best.diff if best else None,
+        }
+    )
 
 
 def _has_time(deadline: float | None, needed: float) -> bool:
@@ -706,8 +785,18 @@ def _replan_with(
         for f in held_reasons
         if f.reason_code == "dispatch_executed"
     }
+    dispatched_lots = {f.lot_id for f in held_reasons if f.reason_code == "dispatch_executed"}
     ctx = _Context(
-        after, current_plan, event, air_locked, routes, held_lots, scenario, unavailable, pinned
+        after,
+        current_plan,
+        event,
+        air_locked,
+        routes,
+        held_lots,
+        scenario,
+        unavailable,
+        pinned,
+        dispatched_lots,
     )
     with locked_routes(held, not_before=occurred_at):
         return _replan(ctx, held_reasons, occurred_at, started, time_limit_s, deadline)
@@ -758,19 +847,23 @@ def _replan(
         )
     ]
 
-    moved, event_voyages = _moved_for_next_voyage(ctx)
-    if moved and event_voyages:
-        etd = ctx.etd_before if isinstance(event, DelayEvent) else ctx.etd
-        horizon = max(etd[v] for v in event_voyages)
-        blocked = {
-            c.id
-            for c in after.containers
-            if c.voyage_id in event_voyages or ctx.etd[c.voyage_id] <= horizon
-        }
-        forbidden = [(lid, cid) for lid in moved for cid in sorted(blocked)]
+    moved, event_voyages, kept = _moved_for_next_voyage(ctx)
+    if (moved or kept) and event_voyages:
+        blocked = _next_voyage_blocked(ctx, moved)
+        forbidden = [(lid, cid) for lid in moved for cid in sorted(blocked[lid])]
         forbidden += [(lid, AIR) for lid in moved]
         forbidden += ctx.booked_pairs()
         next_fixed = {k: v for k, v in fixed.items() if k not in moved}
+        next_fixed.update(
+            {
+                lid: ctx.where[lid]
+                for lid in ctx.dispatched_lots
+                if lid in ctx.lot_ids
+                and lid not in ctx.air_locked
+                and lid not in ctx.rule_switched
+                and ctx.where.get(lid) not in (None, UNASSIGNED)
+            }
+        )
         next_built, next_ms = _timed(
             lambda: solve_with_routes(
                 after,
@@ -781,6 +874,10 @@ def _replan(
                 deadline=deadline,
             )
         )
+        next_reasons = _next_voyage_reasons(ctx, next_built.plan, blocked)
+        reused, details = _pinned_conflicts(ctx, next_built, kept, blocked)
+        if reused or not moved:
+            next_reasons = [DISPATCH_REUSED, *details, *next_reasons]
         alternatives.append(
             _alternative(
                 ctx,
@@ -788,7 +885,7 @@ def _replan(
                 next_built,
                 next_ms,
                 LABELS["next_voyage"],
-                _next_voyage_reasons(ctx, next_built.plan, moved, blocked),
+                next_reasons,
             )
         )
 
@@ -834,9 +931,8 @@ def _replan(
         )
     )
 
-    feasible = [a for a in alternatives if a.feasible]
     remaining_budget(deadline, time_limit_s)
-    best = min(feasible, key=lambda a: (a.total_cost, PREFERENCE[a.id]), default=None)
+    best = _recommend(alternatives)
     return ReplanResult(
         event=event,
         scope=scope,

@@ -236,7 +236,11 @@ def test_remaining_risk_voyages_are_listed():
     forecasts = [first, second]
     event = delay_event(forecasts)
     assert event is not None and event.voyage_id == first.voyage_id
-    remaining = remaining_risks(forecasts, event)
+    assert event.voyage_ids == [first.voyage_id, "V-OTHER"]
+    assert remaining_risks(forecasts, event) == []
+    single = delay_event(forecasts, skip={"V-OTHER"})
+    remaining = remaining_risks(forecasts, single)
     assert [r.voyage_id for r in remaining] == ["V-OTHER"]
     assert remaining[0].at_risk_lot_ids == [lot.lot_id for lot in first.lots if lot.at_risk]
+    assert remaining[0].reason == "이번 재계획에 반영하지 않음"
     assert remaining_risks(storm, delay_event(storm)) == []

@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from freshswitch_backend.config import Settings, get_settings
 from freshswitch_backend.domain.models import Plan, Scenario
 from freshswitch_backend.explain import (
@@ -23,6 +25,7 @@ from freshswitch_backend.replan.models import (
     ReduceEvent,
     ReplanError,
     ReplanResult,
+    VoyageDelay,
 )
 
 PLACE = {AIR: "항공", UNASSIGNED: "미배정"}
@@ -48,22 +51,29 @@ def event_summary(scenario: Scenario, event: Event) -> str:
             return f"{owner(lot_id)} {lots[lot_id].pallets}파렛트 항공 전환"
         case AddLotEvent(lot=lot):
             return f"{shippers.get(lot.shipper_id, lot.shipper_id)} {lot.pallets}파렛트 신규 출하"
-        case DelayEvent(voyage_id=voyage_id, new_etd=new_etd):
-            voyage = next(v for v in scenario.voyages if v.id == voyage_id)
-            cutoff = f"CY 마감 {_when(voyage.cy_cutoff)} 유지"
-            applied = _cutoff_after(scenario, event)
-            if applied is not None and applied != voyage.cy_cutoff:
-                cutoff = f"CY 마감 {_when(voyage.cy_cutoff)}→{_when(applied)} 변경"
-            return f"{voyage.vessel_name} 출항 {_when(voyage.etd)}→{_when(new_etd)} 변경({cutoff})"
+        case DelayEvent():
+            cutoffs = _cutoffs_after(scenario, event)
+            return ", ".join(_delay_summary(scenario, d, cutoffs) for d in event.delays())
     return "일정 변경"
 
 
-def _cutoff_after(scenario: Scenario, event: DelayEvent):
+def _delay_summary(
+    scenario: Scenario, delay: VoyageDelay, cutoffs: dict[str, datetime | None]
+) -> str:
+    voyage = next(v for v in scenario.voyages if v.id == delay.voyage_id)
+    cutoff = f"CY 마감 {_when(voyage.cy_cutoff)} 유지"
+    applied = cutoffs.get(delay.voyage_id)
+    if applied is not None and applied != voyage.cy_cutoff:
+        cutoff = f"CY 마감 {_when(voyage.cy_cutoff)}→{_when(applied)} 변경"
+    return f"{voyage.vessel_name} 출항 {_when(voyage.etd)}→{_when(delay.new_etd)} 변경({cutoff})"
+
+
+def _cutoffs_after(scenario: Scenario, event: DelayEvent) -> dict[str, datetime | None]:
     try:
         after = apply_event(scenario, event)
     except ReplanError:
-        return event.new_cy_cutoff
-    return next(v.cy_cutoff for v in after.voyages if v.id == event.voyage_id)
+        return {d.voyage_id: d.new_cy_cutoff for d in event.delays()}
+    return {v.id: v.cy_cutoff for v in after.voyages if v.id in event.voyage_ids}
 
 
 def _lot_ids(alt: Alternative) -> set[str]:
@@ -92,7 +102,8 @@ def _involved_containers(current: Plan, event: Event, alt: Alternative) -> set[s
     if lot_id:
         involved.add(where.get(lot_id))
     if isinstance(event, DelayEvent):
-        involved |= {c.container_id for c in alt.diff.containers if c.voyage_id == event.voyage_id}
+        voyages = set(event.voyage_ids)
+        involved |= {c.container_id for c in alt.diff.containers if c.voyage_id in voyages}
     return {c for c in involved if c}
 
 

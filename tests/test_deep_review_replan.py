@@ -9,6 +9,7 @@ from freshswitch_backend.domain.models import KST, Scenario
 from freshswitch_backend.execution.cancellation import annotate_cancellations
 from freshswitch_backend.explain import render_template
 from freshswitch_backend.explain.validation import shipper_error
+from freshswitch_backend.optimize import AIR
 from freshswitch_backend.planning.service import PlanWithRoutes, build_plan
 from freshswitch_backend.planning.store import store
 from freshswitch_backend.replan import (
@@ -25,7 +26,7 @@ from freshswitch_backend.replan import (
     locations,
     replan,
 )
-from freshswitch_backend.replan.engine import DISPATCH_RELEASED
+from freshswitch_backend.replan.engine import DISPATCH_RELEASED, DISPATCH_REUSED
 from freshswitch_backend.replan.explanation import build_explain_context, event_summary
 from freshswitch_backend.replan.models import Alternative
 from freshswitch_backend.routing.scenario import route_lot_ids
@@ -338,6 +339,118 @@ def test_replan7_skips_release_without_time(
     assert result.recommended_id is None
     assert result.warnings == []
     assert {f.reason_code for f in result.fixed_reasons} == {"dispatch_executed"}
+
+
+def _trip_lots(
+    alt: Alternative, truck_id: str, trip: int, voyage_id: str = "V-2611A"
+) -> set[str] | None:
+    return next(
+        (
+            route_lot_ids([route])
+            for vp in alt.routes
+            if vp.voyage_id == voyage_id
+            for route in vp.pickup.routes
+            if (route.truck_id, route.trip) == (truck_id, trip)
+        ),
+        None,
+    )
+
+
+def _pin(built: PlanWithRoutes, truck_id: str) -> ExecutedDispatch:
+    route = next(
+        route
+        for vp in built.routes
+        if vp.voyage_id == "V-2611A"
+        for route in vp.pickup.routes
+        if (route.truck_id, route.trip) == (truck_id, 1)
+    )
+    return ExecutedDispatch(
+        voyage_id="V-2611A", truck_id=truck_id, lot_ids=sorted(route_lot_ids([route]))
+    )
+
+
+def _assert_pins_kept(result, pins: list[ExecutedDispatch]) -> None:
+    for alt in result.alternatives:
+        where = locations(alt.plan)
+        for pin in pins:
+            carried = _trip_lots(alt, pin.truck_id, 1, pin.voyage_id)
+            if all(where.get(lid) in (None, AIR) for lid in pin.lot_ids):
+                assert carried is None or carried <= set(pin.lot_ids), (alt.id, carried)
+                continue
+            assert carried is not None, (alt.id, pin.truck_id)
+            assert carried <= set(pin.lot_ids), (alt.id, pin.truck_id, carried)
+
+
+def test_replan7_next_voyage_keeps_executed_dispatch(
+    scenario: Scenario, built: PlanWithRoutes
+) -> None:
+    pin = _pin(built, "RT-02")
+    assert set(pin.lot_ids) == {"lot-sancheong-sb-1", "lot-jinju-sb-1"}
+    event = ReduceEvent(lot_id="lot-sancheong-sb-1", new_pallets=3, occurred_at=EARLY)
+    result = replan(scenario, built.plan, event, routes=built.routes, dispatched=[pin])
+    _assert_pins_kept(result, [pin])
+    nxt = next(a for a in result.alternatives if a.id == "next_voyage")
+    assert _trip_lots(nxt, "RT-02", 1) == set(pin.lot_ids) or (
+        not nxt.feasible and DISPATCH_REUSED in nxt.infeasible_reasons
+    )
+    assert "lot-pohang-gr-1" not in (_trip_lots(nxt, "RT-02", 1) or set())
+
+
+def test_replan7_next_voyage_infeasible_when_only_pinned_lots_would_move(
+    scenario: Scenario, built: PlanWithRoutes
+) -> None:
+    pins = [_pin(built, "RT-02"), _pin(built, "RT-03")]
+    event = ReduceEvent(lot_id="lot-sancheong-sb-1", new_pallets=3, occurred_at=EARLY)
+    result = replan(scenario, built.plan, event, routes=built.routes, dispatched=pins)
+    _assert_pins_kept(result, pins)
+    nxt = next(a for a in result.alternatives if a.id == "next_voyage")
+    assert not nxt.feasible
+    assert nxt.infeasible_reasons == [DISPATCH_REUSED]
+    assert result.recommended_id is not None
+    assert result.recommended_id != "next_voyage"
+    assert result.warnings == []
+
+
+def test_replan7_air_switch_does_not_reuse_dispatched_trip(
+    scenario: Scenario, built: PlanWithRoutes
+) -> None:
+    pin = _pin(built, "RT-03")
+    event = AirSwitchEvent(lot_id="lot-miryang-sb-1", occurred_at=EARLY)
+    result = replan(scenario, built.plan, event, routes=built.routes, dispatched=[pin])
+    assert result.recommended_id is not None
+    _assert_pins_kept(result, [pin])
+
+
+def test_replan7_release_keeps_pinned_next_voyage(
+    scenario: Scenario, built: PlanWithRoutes
+) -> None:
+    pin = _pin(built, "RT-02")
+    event = DelayEvent(
+        voyage_id="V-2611A", new_etd=datetime(2026, 11, 17, 0, tzinfo=KST), occurred_at=EARLY
+    )
+    result = replan(scenario, built.plan, event, routes=built.routes, dispatched=[pin])
+    assert result.warnings == [DISPATCH_RELEASED]
+    assert result.recommended_id != "next_voyage"
+    nxt = next(a for a in result.alternatives if a.id == "next_voyage")
+    assert not nxt.feasible
+    assert DISPATCH_REUSED in nxt.infeasible_reasons
+    assert _trip_lots(nxt, "RT-02", 1) == set(pin.lot_ids)
+    where = locations(nxt.plan)
+    assert where["lot-jinju-sb-1"] == where["lot-sancheong-sb-1"] == "CA-01"
+
+
+def test_replan7_next_voyage_delay_cannot_keep_pinned_lots_past_sell_by(
+    scenario: Scenario, built: PlanWithRoutes
+) -> None:
+    pins = [_pin(built, "RT-02"), _pin(built, "RT-03")]
+    event = TYPHOON.model_copy(update={"occurred_at": EARLY})
+    result = replan(scenario, built.plan, event, routes=built.routes, dispatched=pins)
+    _assert_pins_kept(result, pins)
+    nxt = next(a for a in result.alternatives if a.id == "next_voyage")
+    assert not nxt.feasible
+    assert DISPATCH_REUSED in nxt.infeasible_reasons
+    assert "lot-jinju-sb-1: 도착일이 판매기한 초과" in nxt.infeasible_reasons
+    assert result.recommended_id == "pull_forward"
 
 
 def test_replan10_cutoff_wording_follows_applied_cutoff(scenario: Scenario) -> None:

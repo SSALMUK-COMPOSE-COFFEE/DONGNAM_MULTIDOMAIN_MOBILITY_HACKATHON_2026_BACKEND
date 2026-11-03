@@ -1,6 +1,6 @@
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from freshswitch_backend.domain.models import KstDatetime, Lot, Plan, Scenario
 from freshswitch_backend.explain.models import Explanation
@@ -9,6 +9,10 @@ from freshswitch_backend.planning.service import VoyagePickup
 
 def _unset(value: object) -> bool:
     return value is None
+
+
+def _empty(value: object) -> bool:
+    return not value
 
 
 class CancelEvent(BaseModel):
@@ -30,13 +34,37 @@ class AirSwitchEvent(BaseModel):
     occurred_at: KstDatetime | None = Field(default=None, exclude_if=_unset)
 
 
+class VoyageDelay(BaseModel):
+    voyage_id: str
+    new_etd: KstDatetime
+    new_cy_cutoff: KstDatetime | None = None
+
+
 class DelayEvent(BaseModel):
     type: Literal["delay"] = "delay"
     voyage_id: str
     new_etd: KstDatetime
     new_cy_cutoff: KstDatetime | None = None
+    additional_voyages: list[VoyageDelay] = Field(default_factory=list, exclude_if=_empty)
     source: Literal["manual", "해수부", "예측"] = "manual"
     occurred_at: KstDatetime | None = Field(default=None, exclude_if=_unset)
+
+    @model_validator(mode="after")
+    def _distinct_voyages(self) -> "DelayEvent":
+        ids = self.voyage_ids
+        if len(set(ids)) != len(ids):
+            raise ValueError("같은 항차를 한 이벤트에 두 번 넣을 수 없음")
+        return self
+
+    @property
+    def voyage_ids(self) -> list[str]:
+        return [d.voyage_id for d in self.delays()]
+
+    def delays(self) -> list[VoyageDelay]:
+        first = VoyageDelay(
+            voyage_id=self.voyage_id, new_etd=self.new_etd, new_cy_cutoff=self.new_cy_cutoff
+        )
+        return [first, *self.additional_voyages]
 
 
 class AddLotEvent(BaseModel):

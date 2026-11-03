@@ -126,7 +126,10 @@ def build_pickup_request(
         blocking = [r for v, trips in context.routes.items() if v != voyage_id for r in trips]
     not_before = options.pop("not_before", context.not_before)
     lots = {lot.id: lot for lot in scenario.lots}
-    locked = _carrying(locked, lots, set(lot_ids) & set(lots))
+    kept = _carrying(locked, lots, set(lot_ids) & set(lots))
+    kept_trips = {(r.truck_id, r.trip) for r in kept}
+    reserved = [r for r in locked if (r.truck_id, r.trip) not in kept_trips]
+    locked = kept
     held = route_lot_ids(locked)
     ports = {p.id: p for p in scenario.ports}
     port = ports[voyage.origin]
@@ -183,6 +186,7 @@ def build_pickup_request(
         incompatible_groups=[(a, b) for a, b in conflicts if a in used and b in used],
         locked_routes=locked,
         blocking_routes=blocking,
+        reserved_routes=reserved,
         not_before=not_before,
         **{"gate_windows": gate_windows(port), **options},
     )
