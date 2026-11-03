@@ -4,7 +4,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, model_validator
 
 from freshswitch_backend.api.auth import Principal, require_role
-from freshswitch_backend.api.saas_access import plan_for
+from freshswitch_backend.api.saas_access import org_shipper_ids, plan_for
+from freshswitch_backend.api.saas_views import replan_pending
 from freshswitch_backend.notifications import notify_plan_confirmation
 from freshswitch_backend.persistence.orgs import org_sandbox
 from freshswitch_backend.planning.store import (
@@ -46,6 +47,11 @@ class ShipperConfirmationView(BaseModel):
     plan_status: SessionStatus
     plan_version: int
     confirmations: list[PlanConfirmation]
+    replan_pending: bool = False
+
+
+class ShipperPlanConfirmation(PlanConfirmation):
+    replan_pending: bool = False
 
 
 class RecomputeRequest(BaseModel):
@@ -74,20 +80,31 @@ def notify_round(session: PlanSession, owner_org_id: str) -> None:
 
 
 def _shipper_view(plan_id: str, principal: Principal) -> ShipperConfirmationView:
-    session = plan_for(plan_id, principal).session
+    access = plan_for(plan_id, principal)
+    session = access.session
+    state = store.confirmation_states([plan_id]).get(plan_id)
     return ShipperConfirmationView(
         plan_id=plan_id,
         plan_status=session.status,
         plan_version=session.version,
         confirmations=store.shipper_confirmations(principal.org_id, plan_id=plan_id),
+        replan_pending=replan_pending(state, access.viewer.shipper_ids),
     )
 
 
 @router.get("/shipper/plan-confirmations")
 def list_shipper_confirmations(
     principal: ShipperPrincipal, status: ConfirmationStatus | None = None
-) -> list[PlanConfirmation]:
-    return store.shipper_confirmations(principal.org_id, status=status)
+) -> list[ShipperPlanConfirmation]:
+    rows = store.shipper_confirmations(principal.org_id, status=status)
+    states = store.confirmation_states(sorted({row.plan_id for row in rows}))
+    own = org_shipper_ids(principal.org_id)
+    return [
+        ShipperPlanConfirmation(
+            **row.model_dump(), replan_pending=replan_pending(states.get(row.plan_id), own)
+        )
+        for row in rows
+    ]
 
 
 @router.get("/shipper/plans/{plan_id}/confirmation")

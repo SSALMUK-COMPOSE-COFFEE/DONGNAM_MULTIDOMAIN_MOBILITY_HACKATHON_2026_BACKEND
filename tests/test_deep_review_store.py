@@ -259,7 +259,7 @@ def test_pending_inspection_of_changed_lot_is_rejected_without_observation(
         f"/api/plans/{plan_id}/settlement/arrival",
         json={"lot_id": "lot-sancheong-sb-1", "inspected_loss_pct": 20},
     )
-    assert response.status_code == 422
+    assert response.status_code == 409
     assert "확정 대기" in response.json()["detail"]
     after = client.get(f"/api/plans/{plan_id}").json()
     assert after["inspection_revision"] == before["inspection_revision"]

@@ -561,6 +561,17 @@ def _snapshot(session: PlanSession) -> _Snapshot:
     )
 
 
+def _unregister(state: _State, gone: set[str]) -> list[str]:
+    registered = state.session.registered_lot_ids
+    state.release |= gone & set(registered)
+    committed = state.committed
+    if any(lot.id in gone for lot in committed.scenario.lots):
+        lots = [lot for lot in committed.scenario.lots if lot.id not in gone]
+        scenario = committed.scenario.model_copy(update={"lots": lots})
+        state.committed = committed.model_copy(update={"scenario": scenario})
+    return [i for i in registered if i not in gone]
+
+
 def _charged(charge: CancellationCharge | None) -> list[CancellationCharge]:
     return [charge] if charge is not None and charge.fee else []
 
@@ -1108,6 +1119,7 @@ class SessionStore:
             event=event,
             now=now,
         )
+        order.cancellation_charges = list(charges)
         if charges:
             _charge_payers(order, charges, ordered, (before.scenario, scenario))
         passed = _deadline_passed(order, now)
@@ -1226,8 +1238,8 @@ class SessionStore:
             and o.status not in ("forwarder_confirmed", "executed")
         }
         dropped = {i for i in session.registered_lot_ids if i in added and i not in kept}
-        registered_ids = [i for i in session.registered_lot_ids if i not in dropped]
-        state.release |= dropped
+        registered_ids = _unregister(state, dropped)
+        snapshot = state.committed
         entry = HistoryEntry(
             seq=len(session.history) + 1,
             replan_id=order.replan_id,
@@ -1473,6 +1485,16 @@ class SessionStore:
                     raise KeyError(plan_id)
                 return _state_of(db, row, PlanSession.model_validate(row.payload))
 
+    def confirmation_states(self, plan_ids: list[str]) -> dict[str, PlanConfirmationState]:
+        if not plan_ids:
+            return {}
+        with self._db.begin() as db:
+            rows = db.scalars(select(PlanRow).where(PlanRow.plan_id.in_(plan_ids)))
+            return {
+                row.plan_id: _state_of(db, row, PlanSession.model_validate(row.payload))
+                for row in rows
+            }
+
     def needing_attention(self, org_id: str, limit: int = 100) -> list[PlanConfirmationState]:
         open_round = (
             select(PlanConfirmationRow.plan_id)
@@ -1655,12 +1677,11 @@ class SessionStore:
                     "committed_version": version,
                     "active_order_id": None,
                     "arrival_inspections": [],
-                    "registered_lot_ids": [i for i in session.registered_lot_ids if i not in gone],
                 }
             )
-            state.session = updated
             state.committed = _snapshot(updated)
-            state.release = gone & set(session.registered_lot_ids)
+            updated.registered_lot_ids = _unregister(state, gone)
+            state.session = updated
             owners, created_by = _stored_owners(row)
             missing = [i for i in updated.registered_lot_ids if i not in owners]
             owners = {**owners, **lot_owners(db, missing, created_by)}

@@ -146,6 +146,7 @@ def plan_month(session: PlanSession) -> str:
 
 
 def org_sessions(org_id: str) -> list[PlanSession]:
+    store.expire_due(PlanRow.org_id == org_id)
     with database.begin() as db:
         rows = db.scalars(
             select(PlanRow).where(PlanRow.org_id == org_id).order_by(PlanRow.seq)

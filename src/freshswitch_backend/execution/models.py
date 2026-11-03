@@ -121,6 +121,7 @@ class ExecutionOrder(BaseModel):
     automatic: list[AutomaticAction]
     requests: list[ExternalRequest]
     cancellation: CancellationCharge | None = None
+    cancellation_charges: list[CancellationCharge] = Field(default_factory=list)
     expired_reason: str | None = None
     rolled_back_to_version: int | None = None
     log: list[OrderLogEntry]

@@ -20,12 +20,15 @@ from freshswitch_backend.api.saas_views import (
     ShipperSettlementRow,
     anonymized_orders,
     anonymized_session,
+    replan_pending,
     shipper_container_numbers,
+    shipper_genset_instructions,
     shipper_lot_ids,
     shipper_order_view,
     shipper_plan_item,
     shipper_settlements,
 )
+from freshswitch_backend.execution.card import EnteredNumbers
 from freshswitch_backend.execution.models import (
     ConfirmRequest,
     ExecutionOrder,
@@ -138,22 +141,41 @@ def _sessions(principal: Principal) -> list[PlanSession]:
 @router.get("/plans")
 def list_plans(principal: ShipperPrincipal) -> list[ShipperPlanItem]:
     mine = lot_store.ids(org_id=principal.org_id)
-    return [shipper_plan_item(session, mine) for session in _sessions(principal)]
+    own = org_shipper_ids(principal.org_id)
+    sessions = _sessions(principal)
+    states = store.confirmation_states([s.plan_id for s in sessions])
+    return [
+        shipper_plan_item(session, mine, replan_pending(states.get(session.plan_id), own))
+        for session in sessions
+    ]
 
 
 @router.get("/plans/{plan_id}")
 def read_plan(plan_id: str, principal: ShipperPrincipal) -> dict[str, Any]:
     access = _access(plan_id, principal)
+    own = access.viewer.shipper_ids
     orders = store.orders(plan_id, org_id=access.owner_org_id)
-    payload = anonymized_session(access.session, access.viewer.shipper_ids, orders)
-    payload["container_numbers"] = [n.model_dump(mode="json") for n in _container_numbers(access)]
+    entered = entered_numbers(plan_id)
+    genset = shipper_genset_instructions(access.session, own, entered)
+    payload = anonymized_session(
+        access.session,
+        own,
+        orders,
+        extra={"genset_instructions": [g.model_dump(mode="json") for g in genset]},
+    )
+    payload["container_numbers"] = [
+        n.model_dump(mode="json") for n in _container_numbers(access, entered)
+    ]
+    state = store.confirmation_states([plan_id]).get(plan_id)
+    payload["replan_pending"] = replan_pending(state, own)
     return payload
 
 
-def _container_numbers(access: PlanAccess) -> list[ShipperContainerNumbers]:
-    return shipper_container_numbers(
-        access.session, access.viewer.shipper_ids, entered_numbers(access.session.plan_id)
-    )
+def _container_numbers(
+    access: PlanAccess, entered: dict[str, EnteredNumbers] | None = None
+) -> list[ShipperContainerNumbers]:
+    numbers = entered_numbers(access.session.plan_id) if entered is None else entered
+    return shipper_container_numbers(access.session, access.viewer.shipper_ids, numbers)
 
 
 @router.get("/plans/{plan_id}/containers")

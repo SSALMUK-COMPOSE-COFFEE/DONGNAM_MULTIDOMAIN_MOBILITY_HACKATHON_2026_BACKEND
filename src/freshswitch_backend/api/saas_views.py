@@ -11,23 +11,30 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from freshswitch_backend.coldchain.models import Alert, ColdchainAction, LossSummary, TwinState
+from freshswitch_backend.coldchain.power_plan import power_plan
 from freshswitch_backend.domain.models import (
     Assignment,
     Scenario,
     SettlementBaselineKind,
     SettlementBillingRule,
 )
-from freshswitch_backend.execution.card import EnteredNumbers, mock_container_no, mock_seal_no
+from freshswitch_backend.execution.card import (
+    EnteredNumbers,
+    GensetInstruction,
+    build_execution_card,
+    mock_container_no,
+    mock_seal_no,
+)
 from freshswitch_backend.execution.models import (
     ExecutionOrder,
     OrderLogEntry,
     ShipperConfirmation,
 )
-from freshswitch_backend.execution.orders import short_name
+from freshswitch_backend.execution.orders import genset_instructions, short_name
 from freshswitch_backend.execution.quality import QualitySettlement, adjusted_settlements
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.tables import LotRow, OrganizationRow, PlanForwarderRow
-from freshswitch_backend.planning.store import PlanSession
+from freshswitch_backend.planning.store import PlanConfirmationState, PlanSession
 from freshswitch_backend.replan.models import (
     AddLotEvent,
     CancellationCharge,
@@ -154,6 +161,7 @@ class ForwarderCancellation(CancellationCharge):
 class ForwarderOrder(ExecutionOrder):
     shipper_confirmations: list[ForwarderShipperConfirmation]
     cancellation: ForwarderCancellation | None = None
+    cancellation_charges: list[ForwarderCancellation] = Field(default_factory=list)
 
 
 class ShipperRouteChange(RouteChange):
@@ -188,6 +196,7 @@ class ShipperPlanItem(BaseModel):
     my_lot_ids: list[str]
     my_pallets: int
     total_pallets: int
+    replan_pending: bool = False
 
 
 class ShipperContainerNumbers(BaseModel):
@@ -418,7 +427,9 @@ def plan_item(session: PlanSession, forwarder: ForwarderRef | None) -> PlanListI
     )
 
 
-def shipper_plan_item(session: PlanSession, my_lot_ids: set[str]) -> ShipperPlanItem:
+def shipper_plan_item(
+    session: PlanSession, my_lot_ids: set[str], replan_pending: bool = False
+) -> ShipperPlanItem:
     vessel, departure = _own_voyage(
         session, (a for a in session.plan.assignments if a.lot_id in my_lot_ids)
     )
@@ -432,6 +443,18 @@ def shipper_plan_item(session: PlanSession, my_lot_ids: set[str]) -> ShipperPlan
         my_lot_ids=mine,
         my_pallets=sum(a.pallets for a in session.plan.assignments if a.lot_id in my_lot_ids),
         total_pallets=total_pallets(session),
+        replan_pending=replan_pending,
+    )
+
+
+def replan_pending(state: PlanConfirmationState | None, own_shipper_ids: Iterable[str]) -> bool:
+    if state is None:
+        return False
+    own = set(own_shipper_ids)
+    if any(c.status == "rejected" and c.shipper_id not in own for c in state.confirmations):
+        return True
+    return any(
+        c.source != "shipper_rejected" or c.shipper_id not in own for c in state.replan_candidates
     )
 
 
@@ -1015,10 +1038,11 @@ def anonymized_session(
     session: PlanSession,
     own_shipper_ids: Iterable[str],
     orders: Iterable[ExecutionOrder] = (),
+    extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     own = set(own_shipper_ids)
     anonymizer = shipper_anonymizer(session, own, orders)
-    payload = session.model_dump(mode="json")
+    payload = {**session.model_dump(mode="json"), **(extra or {})}
     _scope_settlements(payload, own)
     _scope_tariffs(payload, session, own)
     _scope_explanations(payload, own)
@@ -1065,6 +1089,22 @@ def shipper_lot_ids(session: PlanSession, own_shipper_ids: Iterable[str]) -> set
     return {lot.id for lot in session.scenario.lots if lot.shipper_id in own}
 
 
+def shipper_genset_instructions(
+    session: PlanSession,
+    own_shipper_ids: Iterable[str],
+    entered: Mapping[str, EnteredNumbers],
+) -> list[GensetInstruction]:
+    own = set(own_shipper_ids)
+    card = build_execution_card(
+        session.plan_id, session.version, session.scenario, session.plan, entered=dict(entered)
+    )
+    return genset_instructions(
+        power_plan(session, shipper_ids=own).candidates,
+        card,
+        visible_lot_ids=shipper_lot_ids(session, own),
+    )
+
+
 def related_to_shipper(order: ExecutionOrder, own: set[str], my_lots: set[str]) -> bool:
     shippers = {c.shipper_id for c in order.shipper_confirmations} | set(order.notified_shipper_ids)
     return bool(own & shippers) or any(my_lots & set(r.lot_ids) for r in order.requests)
@@ -1100,14 +1140,42 @@ def _order_view(
     payload = trimmed.model_dump(mode="json")
     for action in payload["automatic"]:
         if action["kind"] == SETTLEMENT_ACTION:
-            action["description"] = _own_settlement_text(order.cancellation, own)
+            action["description"] = _own_settlement_text(order_charges(order), own)
     cancellation = payload.get("cancellation")
     if cancellation is not None:
-        if cancellation["payer_shipper_id"] not in own:
-            cancellation["fee"] = None
-            cancellation["consolidator_amount"] = None
-        cancellation["transfers"] = [t for t in cancellation["transfers"] if t["shipper_id"] in own]
+        _scope_charge(cancellation, own)
+    payload["cancellation_charges"] = [
+        _scope_charge(charge, own)
+        for charge in _charges_payload(order)
+        if _charge_concerns(charge, own)
+    ]
     return anonymizer.walk(payload)
+
+
+def _charge_concerns(charge: dict[str, Any], own: set[str]) -> bool:
+    return charge["payer_shipper_id"] in own or any(
+        t["shipper_id"] in own for t in charge["transfers"]
+    )
+
+
+def _scope_charge(charge: dict[str, Any], own: set[str]) -> dict[str, Any]:
+    if charge["payer_shipper_id"] not in own:
+        charge["fee"] = None
+        charge["consolidator_amount"] = None
+    charge["transfers"] = [t for t in charge["transfers"] if t["shipper_id"] in own]
+    return charge
+
+
+def _charges_payload(order: ExecutionOrder) -> list[dict[str, Any]]:
+    return [charge.model_dump(mode="json") for charge in order_charges(order)]
+
+
+def order_charges(order: ExecutionOrder) -> list[CancellationCharge]:
+    if order.cancellation_charges:
+        return order.cancellation_charges
+    if order.cancellation is not None and order.cancellation.fee > 0:
+        return [order.cancellation]
+    return []
 
 
 def shipper_order_view(
@@ -1125,14 +1193,15 @@ def shipper_order_view(
     return _order_view(anonymizer, order, own, my_lots)
 
 
-def _own_settlement_text(charge: CancellationCharge | None, own: set[str]) -> str:
+def _own_settlement_text(charges: Iterable[CancellationCharge], own: set[str]) -> str:
+    charged = [c for c in charges if c.fee > 0]
+    paid = sum(c.fee for c in charged if c.payer_shipper_id in own)
+    received = [t.amount for c in charged for t in c.transfers if t.shipper_id in own]
     parts = [SETTLEMENT_TITLE]
-    if charge is not None and charge.fee > 0:
-        if charge.payer_shipper_id in own:
-            parts.append(f"취소 부담금 {charge.fee:,}원 부담")
-        parts += [
-            f"취소 부담금 {t.amount:,}원 보전" for t in charge.transfers if t.shipper_id in own
-        ]
+    if paid:
+        parts.append(f"취소 부담금 {paid:,}원 부담")
+    if received:
+        parts.append(f"취소 부담금 {sum(received):,}원 보전")
     return ". ".join(parts)
 
 
@@ -1222,13 +1291,19 @@ def forwarder_order_view(order: ExecutionOrder) -> ForwarderOrder:
             confirmation[name] = None
     cancellation = payload.get("cancellation")
     if cancellation is not None:
-        for name in CANCELLATION_MONEY:
-            cancellation[name] = None
-        cancellation["transfers"] = [
-            {**transfer, "share_increase": None, "amount": None}
-            for transfer in cancellation["transfers"]
-        ]
+        _without_charge_money(cancellation)
+    payload["cancellation_charges"] = _charges_payload(order)
+    for charge in payload["cancellation_charges"]:
+        _without_charge_money(charge)
     return ForwarderOrder.model_validate(payload)
+
+
+def _without_charge_money(charge: dict[str, Any]) -> None:
+    for name in CANCELLATION_MONEY:
+        charge[name] = None
+    charge["transfers"] = [
+        {**transfer, "share_increase": None, "amount": None} for transfer in charge["transfers"]
+    ]
 
 
 def _hidden_handler(handler: dict[str, Any] | None) -> dict[str, Any] | None:
