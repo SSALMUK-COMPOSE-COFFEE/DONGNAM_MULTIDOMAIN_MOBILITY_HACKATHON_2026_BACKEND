@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -74,7 +74,10 @@ def read_lot(lot_id: str, org_id: OrgId) -> RegisteredLot:
 
 
 def _validate_patch(
-    lot: RegisteredLot, patch: LotPatch, scope: IntakeScope = DEMO_SCOPE
+    lot: RegisteredLot,
+    patch: LotPatch,
+    scope: IntakeScope = DEMO_SCOPE,
+    recompute_sell_by: bool = False,
 ) -> dict[str, Any]:
     changes = patch.model_dump(exclude_unset=True)
     values: dict[str, Any] = {}
@@ -120,6 +123,16 @@ def _validate_patch(
                 )
             )
     ready = values.get("ready_date", lot.ready_date)
+    if (
+        recompute_sell_by
+        and scenario is not None
+        and changes.get("sell_by_date") is None
+        and ({"ready_date", "product"} & {k for k, v in changes.items() if v is not None})
+    ):
+        product_id = values.get("product_id", lot.product_id)
+        product = next((p for p in scenario.products if p.id == product_id), None)
+        if product is not None:
+            values["sell_by_date"] = ready + timedelta(days=product.shelf_life_days)
     sell_by = values.get("sell_by_date", lot.sell_by_date)
     if sell_by < ready:
         errors.append(
@@ -139,7 +152,7 @@ def update_locked_lot(
     def change(lot: RegisteredLot) -> dict[str, Any]:
         if lot.status in LOCKED_STATUSES:
             raise LotLocked(lot.id)
-        return _validate_patch(lot, patch, scope)
+        return _validate_patch(lot, patch, scope, recompute_sell_by=True)
 
     try:
         updated = lot_store.update(lot_id, change, org_id=org_id)
