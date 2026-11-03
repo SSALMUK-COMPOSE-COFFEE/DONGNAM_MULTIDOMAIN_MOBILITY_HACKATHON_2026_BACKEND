@@ -13,6 +13,7 @@ from freshswitch_backend.api.compute_limits import (
     compute_slot,
     preview_cache,
     preview_deadline,
+    replan_rate,
     run_bounded,
 )
 from freshswitch_backend.api.plans import (
@@ -172,7 +173,7 @@ def _addable(session: PlanSession, body: AddLotRequest, principal: Principal) ->
     return AddLotEvent(lot=lot)
 
 
-@router.post("/plans/{plan_id}/add-lot")
+@router.post("/plans/{plan_id}/add-lot", dependencies=[Depends(replan_rate)])
 async def add_registered_lot(
     plan_id: str,
     body: AddLotRequest,

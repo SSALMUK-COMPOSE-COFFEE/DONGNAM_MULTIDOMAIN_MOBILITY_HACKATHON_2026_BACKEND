@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 
 from freshswitch_backend.api.auth import Principal, require_role
 from freshswitch_backend.api.computation import compute_replan, request_deadline
+from freshswitch_backend.api.compute_limits import replan_rate
 from freshswitch_backend.api.plans import (
     ApplyRequest,
     EventRequest,
@@ -278,7 +279,11 @@ def _insert(
     return row
 
 
-@router.post("/shipper/plans/{plan_id}/change-requests", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/shipper/plans/{plan_id}/change-requests",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(replan_rate)],
+)
 async def create_change_request(
     plan_id: str, body: ChangeRequestCreate, principal: ShipperPrincipal
 ) -> ShipperChangeRequest:
@@ -474,7 +479,7 @@ def read_platform_request(request_id: str, principal: PlatformPrincipal) -> Plat
     return _platform_request(request_id, principal)
 
 
-@router.post("/platform/change-requests/{request_id}/replan")
+@router.post("/platform/change-requests/{request_id}/replan", dependencies=[Depends(replan_rate)])
 async def replan_change_request(
     request_id: str,
     principal: PlatformPrincipal,

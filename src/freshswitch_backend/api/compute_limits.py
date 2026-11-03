@@ -6,7 +6,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Any
 
@@ -14,9 +14,11 @@ from fastapi import HTTPException, Request, status
 
 from freshswitch_backend.api.auth import (
     TOO_MANY_REQUESTS,
+    OptionalPrincipal,
     Principal,
     RateRule,
     SlidingWindowLimiter,
+    app_settings,
     client_address,
 )
 
@@ -25,6 +27,10 @@ PREVIEW_ROUTE = "plan-preview"
 PREVIEW_ORG_ROUTE = "plan-preview-org"
 PREVIEW_RATE = RateRule(per_client=20, window_seconds=60)
 PREVIEW_ORG_RATE = RateRule(per_client=120, window_seconds=60)
+REPLAN_ROUTE = "replan"
+REPLAN_ORG_ROUTE = "replan-org"
+REPLAN_RATE = RateRule(per_client=30, window_seconds=60)
+REPLAN_ORG_RATE = RateRule(per_client=240, window_seconds=60)
 COMPUTE_SLOTS = 2
 COMPUTE_WAIT_SECONDS = 2.0
 PREVIEW_DEADLINE_SECONDS = 15.0
@@ -75,15 +81,22 @@ class ComputeGate:
         finally:
             self._slots.release()
 
-    def run(self, fn: Callable[..., Any], *args: Any, deadline: float, **kwargs: Any) -> Any:
-        left = deadline - time.perf_counter()
-        if left <= 0:
-            raise _unavailable(PREVIEW_TIMEOUT)
-        self._acquire(min(self.wait_seconds, left))
-        future = self._executor.submit(
-            contextvars.copy_context().run, fn, *args, deadline=deadline, **kwargs
-        )
+    def submit(self, fn: Callable[..., Any], *args: Any, deadline: float, **kwargs: Any) -> Future:
+        self._acquire(min(self.wait_seconds, deadline - time.perf_counter()))
+        try:
+            future = self._executor.submit(
+                contextvars.copy_context().run, fn, *args, deadline=deadline, **kwargs
+            )
+        except BaseException:
+            self._slots.release()
+            raise
         future.add_done_callback(lambda _: self._slots.release())
+        return future
+
+    def run(self, fn: Callable[..., Any], *args: Any, deadline: float, **kwargs: Any) -> Any:
+        if deadline - time.perf_counter() <= 0:
+            raise _unavailable(PREVIEW_TIMEOUT)
+        future = self.submit(fn, *args, deadline=deadline, **kwargs)
         try:
             return future.result(timeout=max(deadline - time.perf_counter(), 0.0))
         except TimeoutError as exc:
@@ -176,15 +189,43 @@ def preview_cache(request: Request) -> TtlCache:
     )
 
 
-def check_preview_rate(request: Request, principal: Principal) -> None:
-    limiter = preview_limiter(request)
+def replan_limiter(request: Request) -> SlidingWindowLimiter:
+    return _app_state(
+        request,
+        "replan_limiter",
+        lambda: SlidingWindowLimiter(
+            {REPLAN_ROUTE: REPLAN_RATE, REPLAN_ORG_ROUTE: REPLAN_ORG_RATE}
+        ),
+    )
+
+
+def _check_rate(
+    limiter: SlidingWindowLimiter,
+    routes: tuple[str, str],
+    request: Request,
+    principal: Principal,
+) -> None:
     visitor = f"{principal.org_id}:{principal.user_id}:{client_address(request)}"
-    retry = limiter.hit(PREVIEW_ROUTE, visitor)
+    retry = limiter.hit(routes[0], visitor)
     if retry is None:
-        retry = limiter.hit(PREVIEW_ORG_ROUTE, principal.org_id)
+        retry = limiter.hit(routes[1], principal.org_id)
     if retry is not None:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=TOO_MANY_REQUESTS,
             headers={"Retry-After": str(max(1, math.ceil(retry)))},
         )
+
+
+def check_preview_rate(request: Request, principal: Principal) -> None:
+    _check_rate(preview_limiter(request), (PREVIEW_ROUTE, PREVIEW_ORG_ROUTE), request, principal)
+
+
+def check_replan_rate(request: Request, principal: Principal) -> None:
+    _check_rate(replan_limiter(request), (REPLAN_ROUTE, REPLAN_ORG_ROUTE), request, principal)
+
+
+def replan_rate(request: Request, principal: OptionalPrincipal) -> None:
+    if principal is None or not app_settings(request).saas_mode:
+        return
+    check_replan_rate(request, principal)

@@ -12,6 +12,7 @@ from freshswitch_backend.api.computation import (
     explanation_budget,
     request_deadline,
 )
+from freshswitch_backend.api.compute_limits import replan_rate
 from freshswitch_backend.api.plans import replan_inputs
 from freshswitch_backend.api.vessels import (
     UlsanClientFactory,
@@ -176,7 +177,7 @@ async def _weather(
     return weather_use(options, feed, combine(each)), levels
 
 
-@router.post("/{plan_id}/delay-forecast")
+@router.post("/{plan_id}/delay-forecast", dependencies=[Depends(replan_rate)])
 async def delay_forecast(
     plan_id: str,
     factory: Annotated[UlsanClientFactory, Depends(ulsan_client_factory)],

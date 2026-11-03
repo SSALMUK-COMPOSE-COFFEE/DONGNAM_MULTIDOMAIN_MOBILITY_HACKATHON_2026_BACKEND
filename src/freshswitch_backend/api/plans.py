@@ -12,7 +12,7 @@ from freshswitch_backend.api.computation import (
     explanation_budget,
     request_deadline,
 )
-from freshswitch_backend.api.compute_limits import check_lot_count, compute_slot
+from freshswitch_backend.api.compute_limits import check_lot_count, compute_slot, replan_rate
 from freshswitch_backend.api.intake import intake_today
 from freshswitch_backend.api.vessels import (
     VesselClientFactory,
@@ -379,7 +379,7 @@ def replan_inputs(session: PlanSession, org_id: str) -> dict:
     }
 
 
-@router.post("/{plan_id}/events")
+@router.post("/{plan_id}/events", dependencies=[Depends(replan_rate)])
 async def post_event(
     plan_id: str,
     body: EventRequest,
