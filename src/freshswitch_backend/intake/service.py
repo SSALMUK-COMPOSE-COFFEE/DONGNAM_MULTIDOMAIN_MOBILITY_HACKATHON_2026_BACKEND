@@ -213,11 +213,18 @@ def season_check(product: Product, lot: Lot) -> SeasonCheck | None:
     return None
 
 
-def _season_warning(season: SeasonCheck, lot: Lot) -> str:
+def _season_warning(season: SeasonCheck, lot: Lot, action: str = "등록") -> str:
     return (
         f"{season.label} 수출 시기({season.months[0]}~{season.months[-1]}월) 밖의 출하일입니다"
-        f"({lot.ready_date.isoformat()}). 등록은 그대로 됩니다(출처: {season.source})"
+        f"({lot.ready_date.isoformat()}). {action}은 그대로 됩니다(출처: {season.source})"
     )
+
+
+def season_warnings(product: Product, lot: Lot, action: str = "등록") -> list[str]:
+    season = season_check(product, lot)
+    if season is None or season.in_season:
+        return []
+    return [_season_warning(season, lot, action)]
 
 
 def _hints(

@@ -292,3 +292,43 @@ def test_demo_intake_preview_skips_season_check(client: TestClient) -> None:
         assert response.status_code == 200, response.text
         assert "season" not in response.json()["hints"]
         assert not any("수출 시기" in w for w in response.json()["hints"]["warnings"])
+
+
+def test_out_of_season_patch_returns_warning_without_blocking() -> None:
+    shipper, _ = _onboarded("owner@season-patch.example.com", "시즌 수정 농장")
+    created = shipper.post("/api/saas/shipper/lots", json=_lot())
+    assert created.status_code == 201, created.text
+    lot_id = created.json()["registered"]["id"]
+
+    summer = shipper.patch(f"/api/saas/shipper/lots/{lot_id}", json={"ready_date": "2026-07-01"})
+    assert summer.status_code == 200, summer.text
+    assert summer.json()["ready_date"] == "2026-07-01"
+    expected = (
+        "딸기 수출 시기(11~5월) 밖의 출하일입니다(2026-07-01). 수정은 그대로 됩니다"
+        "(출처: 가정(공식 품목별 수출 시기 자료 확인 필요))"
+    )
+    assert summer.json()["warnings"] == [expected]
+
+    pallets = shipper.patch(f"/api/saas/shipper/lots/{lot_id}", json={"pallets": 4})
+    assert pallets.status_code == 200, pallets.text
+    assert "warnings" not in pallets.json()
+
+    winter = shipper.patch(f"/api/saas/shipper/lots/{lot_id}", json={"ready_date": "2026-12-01"})
+    assert winter.status_code == 200, winter.text
+    assert "warnings" not in winter.json()
+
+    shared = shipper.patch(f"/api/lots/{lot_id}", json={"ready_date": "2026-08-03"})
+    assert shared.status_code == 200, shared.text
+    assert any("딸기 수출 시기(11~5월) 밖" in w for w in shared.json()["warnings"])
+    assert "warnings" not in shipper.get(f"/api/lots/{lot_id}").json()
+
+
+def test_demo_lot_patch_skips_season_check(client: TestClient) -> None:
+    created = client.post("/api/lots", json={**_lot(), "shipper": "sh-jinju"})
+    assert created.status_code == 201, created.text
+    registered = created.json()["registered"]
+
+    response = client.patch(f"/api/lots/{registered['id']}", json={"ready_date": "2026-07-01"})
+    assert response.status_code == 200, response.text
+    assert response.json()["ready_date"] == "2026-07-01"
+    assert set(response.json()) == set(registered)

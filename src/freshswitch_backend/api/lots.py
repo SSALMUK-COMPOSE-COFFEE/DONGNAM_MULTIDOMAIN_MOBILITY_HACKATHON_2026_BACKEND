@@ -9,10 +9,10 @@ from freshswitch_backend.api.intake import DEMO_SCOPE, IntakeScope, Scope, intak
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import Scenario
 from freshswitch_backend.intake.models import FieldError, IntakePreview, IntakeRequest
-from freshswitch_backend.intake.service import IntakeError, resolve_names
+from freshswitch_backend.intake.service import IntakeError, resolve_names, season_warnings
 from freshswitch_backend.lots import LotFilter, LotPatch, LotStatus, RegisteredLot, lot_store
 from freshswitch_backend.persistence import database
-from freshswitch_backend.persistence.tables import LotRow
+from freshswitch_backend.persistence.tables import DEMO_ORG, LotRow
 
 router = APIRouter(prefix="/lots", tags=["lots"])
 
@@ -191,7 +191,19 @@ def update_locked_lot(
         raise intake_error(exc) from exc
     if updated is None:
         raise HTTPException(status_code=404, detail=LOT_NOT_FOUND)
-    return updated
+    return _with_season_warnings(updated, patch, scope)
+
+
+def _with_season_warnings(lot: RegisteredLot, patch: LotPatch, scope: IntakeScope) -> RegisteredLot:
+    if scope.org_id == DEMO_ORG or (patch.ready_date is None and patch.product is None):
+        return lot
+    scenario = scope.scenario(lot.scenario_id)
+    products = scenario.products if scenario is not None else []
+    product = next((p for p in products if p.id == lot.product_id), None)
+    if product is None:
+        return lot
+    warnings = season_warnings(product, lot.to_lot(), "수정")
+    return lot.model_copy(update={"warnings": warnings}) if warnings else lot
 
 
 def delete_unlocked_lot(lot_id: str, org_id: str) -> None:
