@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -15,7 +15,7 @@ from freshswitch_backend.api.computation import (
 from freshswitch_backend.api.compute_limits import check_lot_count, compute_slot
 from freshswitch_backend.api.vessels import (
     VesselClientFactory,
-    fetch_busan_movements,
+    fetch_busan_sourced,
     vessel_client_factory,
 )
 from freshswitch_backend.data.loader import get_scenario
@@ -34,7 +34,10 @@ from freshswitch_backend.integrations import (
     ScheduleChange,
     VesselMovement,
     detect_schedule_changes,
+    origin_provenance,
+    provided_provenance,
 )
+from freshswitch_backend.integrations.mof_provider import DataSource
 from freshswitch_backend.lots import ANY_ORG, LotFilter, LotUnavailable, RegisteredLot, lot_store
 from freshswitch_backend.notifications import notify_order_confirmation
 from freshswitch_backend.persistence import database
@@ -105,6 +108,12 @@ class ScheduleCheckResponse(BaseModel):
     movement_count: int
     changes: list[ScheduleChange]
     events: list[DelayEvent]
+    data_source: DataSource
+    fetched_at: datetime | None = None
+    snapshot_at: datetime | None = None
+    snapshot_name: str | None = None
+    demo_mixed: bool = False
+    source_note: str
 
 
 def _session(plan_id: str, org_id: str = DEMO_ORG) -> PlanSession:
@@ -523,11 +532,14 @@ async def schedule_check(
     voyages = [v for v in session.scenario.voyages if v.id in used] or session.scenario.voyages
     if body.movements is not None:
         movements, source, trusted = body.movements, "provided", False
+        provenance = provided_provenance(len(movements))
     else:
         start = min(v.etd for v in voyages).date() - timedelta(days=1)
         end = max(v.etd for v in voyages).date() + timedelta(days=3)
-        movements = await fetch_busan_movements(factory, start, end, "O", demo=demo)
+        sourced = await fetch_busan_sourced(factory, start, end, "O", demo=demo)
+        movements = sourced.feed.movements
         source, trusted = "해수부", not demo
+        provenance = origin_provenance(sourced.origin)
     changes = detect_schedule_changes(
         planned_voyages(voyages),
         movements,
@@ -558,4 +570,5 @@ async def schedule_check(
         movement_count=len(movements),
         changes=changes,
         events=events,
+        **provenance.model_dump(),
     )
