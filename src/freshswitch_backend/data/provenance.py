@@ -60,7 +60,16 @@ def asset_inventory() -> list[dict]:
         simulated = relative.startswith(("scenarios/", "quality/", "snapshots/demo/"))
         metadata = {
             key: document[key]
-            for key in ("source", "label", "fetched_at", "updated_at", "start", "end", "count")
+            for key in (
+                "source",
+                "label",
+                "source_url",
+                "fetched_at",
+                "updated_at",
+                "start",
+                "end",
+                "count",
+            )
             if key in document
         }
         assets.append(
@@ -92,5 +101,6 @@ def provenance_catalog(scenario_id: str = "default") -> dict:
             "Quality seed observations are not actual arrival inspection records.",
             "Published figures, converted estimates and contractual assumptions must not be presented as one measured dataset.",
             "Recorded dates are publication/reference dates, not proof that a price is currently valid.",
+            "Terminal berth snapshots are published plans at fetch time, not actual departures.",
         ],
     }
