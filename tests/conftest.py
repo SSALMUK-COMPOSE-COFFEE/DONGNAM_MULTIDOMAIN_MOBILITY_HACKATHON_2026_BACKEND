@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from freshswitch_backend.api.vessels import ulsan_client_factory
 from freshswitch_backend.main import app
@@ -28,3 +29,14 @@ def no_live_ulsan():
 @pytest.fixture
 def client() -> TestClient:
     return TestClient(app)
+
+
+@pytest.fixture
+def reset_admin_headers(monkeypatch):
+    from freshswitch_backend.api import access
+
+    settings = access.get_settings().model_copy(
+        update={"demo_reset_token": SecretStr("test-reset-token")}
+    )
+    monkeypatch.setattr(access, "get_settings", lambda: settings)
+    return {"Authorization": "Bearer test-reset-token"}

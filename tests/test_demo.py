@@ -9,10 +9,10 @@ from freshswitch_backend.config import Settings
 from freshswitch_backend.planning.store import store
 
 
-def test_reset_clears_sessions(client: TestClient) -> None:
+def test_reset_clears_sessions(client: TestClient, reset_admin_headers) -> None:
     plan_id = client.post("/api/plans", json={"scenario_id": "default"}).json()["plan_id"]
     assert store.count() >= 1
-    response = client.post("/api/demo/reset")
+    response = client.post("/api/demo/reset", headers=reset_admin_headers)
     assert response.status_code == 200
     assert response.json()["cleared_sessions"] >= 1
     assert store.count() == 0
@@ -71,7 +71,7 @@ def _check(actual, op: str, want) -> bool:
     return actual > want
 
 
-def test_script_runs_offline_end_to_end(client: TestClient, monkeypatch) -> None:
+def test_script_runs_offline_end_to_end(client: TestClient, monkeypatch, reset_admin_headers) -> None:
     monkeypatch.setattr(vessels, "get_settings", lambda: Settings(offline_mode=True))
     steps = client.get("/api/demo/script").json()
     assert [s["step"] for s in steps] == list(range(len(steps)))
@@ -107,7 +107,8 @@ def test_script_runs_offline_end_to_end(client: TestClient, monkeypatch) -> None
     for step in steps:
         path = _resolve(step["path"], variables)
         body = _resolve(step["body"], variables)
-        response = client.request(step["method"], path, json=body)
+        response = client.request(step["method"], path, json=body,
+                                  headers=reset_admin_headers if step["id"] == "reset" else {})
         assert 200 <= response.status_code < 300, (step["id"], response.text)
         data = response.json()
         for capture in step["capture"]:

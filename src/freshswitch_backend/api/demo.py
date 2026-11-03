@@ -2,10 +2,11 @@ import json
 import re
 from typing import Any, Literal
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
+from freshswitch_backend.api.access import require_demo_reset
 from freshswitch_backend.coldchain import coldchain_store
 from freshswitch_backend.config import get_settings
 from freshswitch_backend.data.loader import load_scenarios
@@ -691,10 +692,15 @@ MISMATCH=0
 
 call() {
   local method=$1 path=$2 body=${3-} out code
+  local -a auth=()
+  if [ "$path" = "/demo/reset" ]; then
+    : "${DEMO_RESET_TOKEN:?전체 초기화에는 관리자 토큰이 필요합니다}"
+    auth=(-H "Authorization: Bearer $DEMO_RESET_TOKEN")
+  fi
   if [ -n "$body" ]; then
-    out=$(curl -sS -X "$method" "$BASE$path" -H 'content-type: application/json' -d "$body" -w '\\n%%{http_code}')
+    out=$(curl -sS -X "$method" "$BASE$path" "${auth[@]}" -H 'content-type: application/json' -d "$body" -w '\\n%%{http_code}')
   else
-    out=$(curl -sS -X "$method" "$BASE$path" -w '\\n%%{http_code}')
+    out=$(curl -sS -X "$method" "$BASE$path" "${auth[@]}" -w '\\n%%{http_code}')
   fi
   code=${out##*$'\\n'}
   RESP=${out%%$'\\n'*}
@@ -756,7 +762,7 @@ def curl_script(base: str = DEFAULT_CURL_BASE) -> str:
     return "\n".join(lines) + "\n"
 
 
-@router.post("/reset")
+@router.post("/reset", dependencies=[Depends(require_demo_reset)])
 def reset() -> ResetResponse:
     cleared_quality, _ = quality_history.reset()
     return ResetResponse(
