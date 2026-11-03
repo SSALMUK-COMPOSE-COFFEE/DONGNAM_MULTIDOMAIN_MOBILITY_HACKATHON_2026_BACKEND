@@ -10,7 +10,7 @@ from itertools import pairwise
 from typing import Literal
 
 from pydantic import TypeAdapter
-from sqlalchemy import delete, func, select, text, tuple_
+from sqlalchemy import delete, func, select, text, tuple_, update
 from sqlalchemy.orm import Session
 
 from freshswitch_backend.coldchain.models import (
@@ -52,6 +52,7 @@ from freshswitch_backend.execution.quality import (
     arrival_settlement,
 )
 from freshswitch_backend.persistence import Database, database
+from freshswitch_backend.persistence.database import RESET_LOCK
 from freshswitch_backend.persistence.tables import (
     ALERT_SEQ,
     DEMO_ORG,
@@ -71,6 +72,7 @@ MAX_READINGS = 5000
 MAX_HISTORY = 1000
 MAX_CONTAINERS = 200
 MAX_RUNS = 200
+RESET_POLL_SECONDS = 0.05
 AMBIGUOUS = "동일 컨테이너의 계획이 여러 개입니다. plan_id를 지정하세요"
 DEFAULT_STAGE: Stage = "terminal"
 PREVIEW_RULE = (
@@ -268,6 +270,7 @@ class _Run:
     stop: threading.Event
     thread: threading.Thread | None = None
     org_id: str = DEMO_ORG
+    cancelled: bool = False
 
 
 def _now() -> datetime:
@@ -1018,23 +1021,28 @@ class ColdchainStore:
             raise ColdchainError("동시에 실행할 수 있는 시뮬레이션 수를 초과했습니다")
         db.execute(delete(RunRow).where(RunRow.run_id.in_(finished)))
 
-    def _persist_run(self, info: SimulationRun, org_id: str = DEMO_ORG) -> None:
+    def _insert_run(self, info: SimulationRun, org_id: str = DEMO_ORG) -> None:
         with self._db.begin() as db:
-            row = db.get(RunRow, info.run_id)
-            payload = info.model_dump(mode="json")
-            if row is None:
-                db.add(
-                    RunRow(
-                        run_id=info.run_id,
-                        org_id=org_id,
-                        container_id=info.container_id,
-                        done=info.done,
-                        payload=payload,
-                    )
+            db.add(
+                RunRow(
+                    run_id=info.run_id,
+                    org_id=org_id,
+                    container_id=info.container_id,
+                    done=info.done,
+                    payload=info.model_dump(mode="json"),
                 )
-            else:
-                row.done = info.done
-                row.payload = payload
+            )
+
+    def _update_run(self, db: Session, info: SimulationRun) -> None:
+        db.execute(
+            update(RunRow)
+            .where(RunRow.run_id == info.run_id)
+            .values(done=info.done, payload=info.model_dump(mode="json"))
+        )
+
+    def _persist_run(self, info: SimulationRun) -> None:
+        with self._db.begin() as db:
+            self._update_run(db, info)
 
     def simulate(self, body: SimulationRequest, org_id: str = DEMO_ORG) -> SimulationRun:
         preset = PRESETS[body.preset]
@@ -1084,7 +1092,7 @@ class ColdchainStore:
                 info.sent = len(readings)
                 info.done = True
                 info.state = result.containers[0] if result.containers else None
-                self._persist_run(info, org_id)
+                self._insert_run(info, org_id)
             return info
         run = _Run(info=info, readings=readings, stop=threading.Event(), org_id=org_id)
         run.thread = threading.Thread(target=self._stream, args=(run,), daemon=True)
@@ -1092,21 +1100,15 @@ class ColdchainStore:
             with self._db.begin() as db:
                 self._make_run_room(db, org_id)
             self._runs[info.run_id] = run
-            self._persist_run(info, org_id)
+            self._insert_run(info, org_id)
         run.thread.start()
         return info.model_copy()
 
     def _stream(self, run: _Run) -> None:
         try:
             for reading in run.readings:
-                with self._lock:
-                    if run.stop.is_set():
-                        break
-                    result = self.ingest([reading], run.org_id)
-                    run.info.sent += 1
-                    if result.containers:
-                        run.info.state = result.containers[0]
-                    self._persist_run(run.info, run.org_id)
+                if not self._tick(run, reading):
+                    break
                 if run.stop.wait(run.info.interval_seconds):
                     break
         except Exception as exc:
@@ -1115,14 +1117,38 @@ class ColdchainStore:
         finally:
             self._finish(run)
 
+    def _tick(self, run: _Run, reading: ReadingIn) -> bool:
+        while True:
+            with self._lock:
+                if run.stop.is_set():
+                    return False
+                self._db.init()
+                with Session(self._db.engine, expire_on_commit=False) as db:
+                    if db.scalar(select(func.pg_try_advisory_xact_lock_shared(RESET_LOCK))):
+                        if db.get(RunRow, run.info.run_id) is None:
+                            run.cancelled = True
+                            return False
+                        result = self._ingest(db, [reading], run.org_id)
+                        run.info.sent += 1
+                        if result.containers:
+                            run.info.state = result.containers[0]
+                        self._update_run(db, run.info)
+                        db.commit()
+                        return True
+                    db.rollback()
+            if run.stop.wait(RESET_POLL_SECONDS):
+                return False
+
     def _finish(self, run: _Run) -> None:
         with self._lock:
             run.info.done = True
             if self._runs.get(run.info.run_id) is not run:
                 return
             del self._runs[run.info.run_id]
+            if run.cancelled:
+                return
             try:
-                self._persist_run(run.info, run.org_id)
+                self._persist_run(run.info)
             except Exception:
                 logger.exception("시뮬레이션 종료 상태 저장 실패: %s", run.info.run_id)
 

@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from freshswitch_backend.coldchain import coldchain_store
 from freshswitch_backend.lots import lot_store
 from freshswitch_backend.lots.store import release_lots
-from freshswitch_backend.persistence.database import database, get_meta, set_meta
+from freshswitch_backend.persistence.database import RESET_LOCK, database, get_meta, set_meta
 from freshswitch_backend.persistence.seed import SCENARIO_ID, reset_to_baseline
 from freshswitch_backend.persistence.tables import (
     AlertRow,
@@ -31,7 +31,6 @@ from freshswitch_backend.quality import quality_history
 SANDBOX_SCOPE = "sandbox"
 RESET_COOLDOWN = timedelta(seconds=60)
 RESET_META_KEY = "sandbox_reset_at"
-RESET_LOCK = 7_310_101
 DEMO_DEVICE_PREFIX = "demo-"
 
 

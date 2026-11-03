@@ -14,6 +14,7 @@ from freshswitch_backend.persistence.tables import ALERT_SEQ, Base, MetaRow
 
 MIGRATIONS = "freshswitch_backend:migrations"
 MIGRATION_LOCK_KEY = 7_402_115_301
+RESET_LOCK = 7_310_101
 
 
 class DatabaseNotConfigured(RuntimeError):
