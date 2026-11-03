@@ -3,8 +3,10 @@ from typing import Any, ClassVar
 
 from sqlalchemy import (
     BigInteger,
+    CheckConstraint,
     Date,
     DateTime,
+    Float,
     ForeignKey,
     Identity,
     Index,
@@ -13,11 +15,16 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 Json = dict[str, Any]
+
+DEMO_ORG = "demo"
+ORG_TYPES = ("platform", "shipper", "forwarder", "demo")
+MEMBERSHIP_ROLES = ("admin", "member")
 
 
 class Base(DeclarativeBase):
@@ -32,6 +39,18 @@ class Base(DeclarativeBase):
 ALERT_SEQ = Sequence("coldchain_alert_seq", metadata=Base.metadata)
 
 
+def _org_fk(ondelete: str = "RESTRICT") -> ForeignKey:
+    return ForeignKey("organizations.id", ondelete=ondelete)
+
+
+def _org_column() -> Mapped[str]:
+    return mapped_column(String(64), _org_fk(), index=True, server_default=DEMO_ORG)
+
+
+def _user_fk(ondelete: str = "CASCADE") -> ForeignKey:
+    return ForeignKey("users.id", ondelete=ondelete)
+
+
 class MetaRow(Base):
     __tablename__ = "app_meta"
 
@@ -40,12 +59,106 @@ class MetaRow(Base):
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
 
+class OrganizationRow(Base):
+    __tablename__ = "organizations"
+    __table_args__ = (
+        CheckConstraint(
+            "type IN ('platform', 'shipper', 'forwarder', 'demo')",
+            name="organizations_type_check",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    type: Mapped[str] = mapped_column(String(20), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+
+class UserRow(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    email: Mapped[str] = mapped_column(String(320), unique=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    name: Mapped[str] = mapped_column(String(200))
+    is_demo: Mapped[bool] = mapped_column(server_default=text("false"))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+
+class MembershipRow(Base):
+    __tablename__ = "memberships"
+    __table_args__ = (
+        CheckConstraint("role IN ('admin', 'member')", name="memberships_role_check"),
+    )
+
+    user_id: Mapped[str] = mapped_column(String(64), _user_fk(), primary_key=True)
+    org_id: Mapped[str] = mapped_column(
+        String(64), _org_fk("CASCADE"), primary_key=True, index=True
+    )
+    role: Mapped[str] = mapped_column(String(20), server_default="member")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class AuthSessionRow(Base):
+    __tablename__ = "auth_sessions"
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64), _user_fk(), index=True)
+    active_org_id: Mapped[str | None] = mapped_column(String(64), _org_fk("SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(index=True)
+    last_seen_at: Mapped[datetime | None]
+
+
+class PackhouseRow(Base):
+    __tablename__ = "packhouses"
+
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    org_id: Mapped[str] = mapped_column(String(64), _org_fk("CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    region: Mapped[str] = mapped_column(String(100))
+    lat: Mapped[float] = mapped_column(Float)
+    lon: Mapped[float] = mapped_column(Float)
+    source: Mapped[str] = mapped_column(String(200), server_default="등록")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+
+class ShipperProfileRow(Base):
+    __tablename__ = "shipper_profiles"
+
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    org_id: Mapped[str] = mapped_column(String(64), _org_fk("CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    packhouse_id: Mapped[str] = mapped_column(
+        String(100), ForeignKey("packhouses.id", ondelete="RESTRICT"), index=True
+    )
+    product_ids: Mapped[list[Any]] = mapped_column(server_default=text("'[]'::jsonb"))
+    source: Mapped[str] = mapped_column(String(200), server_default="등록")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+
+class DeviceRow(Base):
+    __tablename__ = "devices"
+
+    device_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    org_id: Mapped[str] = mapped_column(String(64), _org_fk("CASCADE"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    name: Mapped[str | None] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    last_seen_at: Mapped[datetime | None]
+
+
 class LotRow(Base):
     __tablename__ = "lots"
 
     id: Mapped[str] = mapped_column(String(120), primary_key=True)
     scenario_id: Mapped[str] = mapped_column(String(100), index=True)
     shipper_id: Mapped[str] = mapped_column(String(100), index=True)
+    shipper_org_id: Mapped[str] = _org_column()
     product_id: Mapped[str] = mapped_column(String(100), index=True)
     pallets: Mapped[int] = mapped_column(Integer)
     ready_date: Mapped[date] = mapped_column(index=True)
@@ -64,6 +177,7 @@ class PlanRow(Base):
 
     plan_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     seq: Mapped[int] = mapped_column(BigInteger, Identity(), unique=True)
+    org_id: Mapped[str] = _org_column()
     scenario_id: Mapped[str] = mapped_column(String(100), index=True)
     version: Mapped[int]
     status: Mapped[str] = mapped_column(String(40))
@@ -77,6 +191,17 @@ class PlanRow(Base):
 
 def _plan_fk() -> ForeignKey:
     return ForeignKey("plan_sessions.plan_id", ondelete="CASCADE")
+
+
+class PlanForwarderRow(Base):
+    __tablename__ = "plan_forwarders"
+
+    plan_id: Mapped[str] = mapped_column(String(64), _plan_fk(), primary_key=True)
+    forwarder_org_id: Mapped[str] = mapped_column(
+        String(64), _org_fk("CASCADE"), primary_key=True, index=True
+    )
+    assigned_by: Mapped[str | None] = mapped_column(String(64), _user_fk("SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
 class PendingRow(Base):
@@ -119,6 +244,7 @@ class ContainerRow(Base):
 
     record_key: Mapped[str] = mapped_column(String(180), primary_key=True)
     seq: Mapped[int] = mapped_column(BigInteger, Identity(), unique=True)
+    org_id: Mapped[str] = _org_column()
     container_id: Mapped[str] = mapped_column(String(100), index=True)
     plan_id: Mapped[str | None] = mapped_column(String(64), index=True)
     stage: Mapped[str] = mapped_column(String(20))
@@ -148,6 +274,7 @@ class AlertRow(Base):
     __table_args__ = (UniqueConstraint("record_key", "key"),)
 
     seq: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    org_id: Mapped[str] = _org_column()
     record_key: Mapped[str] = mapped_column(String(180), _container_fk(), index=True)
     container_id: Mapped[str] = mapped_column(String(100), index=True)
     plan_id: Mapped[str | None] = mapped_column(String(64), index=True)
@@ -160,6 +287,7 @@ class BindingRow(Base):
     __tablename__ = "coldchain_bindings"
 
     device_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    org_id: Mapped[str] = _org_column()
     container_id: Mapped[str] = mapped_column(String(100), index=True)
     plan_id: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
@@ -171,6 +299,7 @@ class RunRow(Base):
 
     run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     seq: Mapped[int] = mapped_column(BigInteger, Identity(), unique=True)
+    org_id: Mapped[str] = _org_column()
     container_id: Mapped[str] = mapped_column(String(100), index=True)
     done: Mapped[bool]
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())

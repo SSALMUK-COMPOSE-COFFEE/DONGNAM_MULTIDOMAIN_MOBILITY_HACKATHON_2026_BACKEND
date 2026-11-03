@@ -17,6 +17,8 @@ from freshswitch_backend.coldchain import coldchain_store
 from freshswitch_backend.lots import lot_store
 from freshswitch_backend.main import app
 from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.orgs import ensure_demo_org
+from freshswitch_backend.persistence.seed import run as seed_demo_tenants
 from freshswitch_backend.planning.store import store
 
 FROZEN_NOW = datetime(2026, 11, 10, 0, 0, tzinfo=UTC)
@@ -151,6 +153,7 @@ def postgres() -> Iterator[str]:
 def clean_database(postgres: str) -> Iterator[None]:
     coldchain_store.stop_all()
     database.wipe()
+    ensure_demo_org()
     yield
     coldchain_store.stop_all()
 
@@ -171,6 +174,11 @@ def no_live_ulsan():
     app.dependency_overrides[ulsan_client_factory] = lambda: None
     yield
     app.dependency_overrides.pop(ulsan_client_factory, None)
+
+
+@pytest.fixture
+def demo_tenants() -> dict[str, int]:
+    return seed_demo_tenants(password="test-demo-password")
 
 
 @pytest.fixture
