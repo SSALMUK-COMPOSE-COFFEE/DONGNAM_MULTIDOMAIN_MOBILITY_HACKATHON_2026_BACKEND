@@ -89,8 +89,10 @@ def test_plan_includes_registered_and_inline_lots(client: TestClient) -> None:
     assert lot["id"] in assigned | unassigned
     assert client.get(f"/api/lots/{lot['id']}").json()["status"] == "planned"
 
+    extra = client.post("/api/lots", json={**FORM, "pallets": 3}).json()["registered"]
     included = client.post("/api/plans", json={"include_registered": True}).json()
-    assert lot["id"] in _lot_ids(included)
+    assert extra["id"] in _lot_ids(included)
+    assert lot["id"] not in _lot_ids(included)
 
     inline = {**plan["scenario"]["lots"][0], "id": "lot-inline-1"}
     with_inline = client.post("/api/plans", json={"lots": [inline]}).json()

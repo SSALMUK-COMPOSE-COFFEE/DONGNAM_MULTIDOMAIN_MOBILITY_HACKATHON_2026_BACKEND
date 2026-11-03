@@ -71,8 +71,9 @@ def test_inline_lot_colliding_with_registered_lot_rejected(client: TestClient) -
 def test_lot_status_reverts_when_plans_go_away(client: TestClient, reset_admin_headers) -> None:
     lot = client.post("/api/lots", json=FORM).json()["registered"]
     first = client.post("/api/plans", json={"lot_ids": [lot["id"]]}).json()
-    second = client.post("/api/plans", json={"include_registered": True}).json()
+    second = client.post("/api/plans", json={"lot_ids": [lot["id"]]}).json()
     assert first["registered_lot_ids"] == [lot["id"]]
+    assert second["registered_lot_ids"] == [lot["id"]]
     assert _status(client, lot["id"]) == "planned"
     assert client.delete(f"/api/plans/{first['plan_id']}").status_code == 204
     assert _status(client, lot["id"]) == "planned"
@@ -83,6 +84,22 @@ def test_lot_status_reverts_when_plans_go_away(client: TestClient, reset_admin_h
     assert _status(client, lot["id"]) == "planned"
     client.post("/api/demo/reset", headers=reset_admin_headers)
     assert _status(client, lot["id"]) == "registered"
+
+
+def test_include_registered_skips_lots_planned_elsewhere(client: TestClient) -> None:
+    taken = client.post("/api/lots", json=FORM).json()["registered"]
+    free = client.post("/api/lots", json={**FORM, "pallets": 3}).json()["registered"]
+    first = client.post("/api/plans", json={"lot_ids": [taken["id"]]}).json()
+    assert _status(client, taken["id"]) == "planned"
+
+    second = client.post("/api/plans", json={"include_registered": True}).json()
+    assert second["registered_lot_ids"] == [free["id"]]
+    assert taken["id"] not in _lot_ids(second)
+    assert free["id"] in _lot_ids(second)
+
+    assert client.delete(f"/api/plans/{first['plan_id']}").status_code == 204
+    assert _status(client, taken["id"]) == "registered"
+    assert _status(client, free["id"]) == "planned"
 
 
 def test_plan_delete_unbinds_coldchain_device(client: TestClient) -> None:

@@ -155,7 +155,7 @@ def _with_lots(scenario: Scenario, body: CreatePlanRequest) -> tuple[Scenario, l
         registered += [
             lot
             for lot in lot_store.search(LotFilter(scenario_id=scenario.id, limit=10_000))
-            if lot.status != "cancelled" and lot.id not in chosen
+            if lot.status == "registered" and lot.id not in chosen
         ]
     added = [*body.lots, *(lot.to_lot() for lot in registered)]
     if not added:
