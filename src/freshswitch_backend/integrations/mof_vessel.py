@@ -289,12 +289,15 @@ def _index(
 def _near(
     pool: list[VesselMovement], planned: datetime, taken: set[int], max_gap: timedelta
 ) -> list[tuple[timedelta, datetime, VesselMovement]]:
-    return [
-        (abs(m.observed_departure_at - planned), m.observed_departure_at, m)
+    aware = [
+        (_aware(m.observed_departure_at), m)
         for m in pool
-        if id(m) not in taken
-        and m.observed_departure_at is not None
-        and abs(m.observed_departure_at - planned) <= max_gap
+        if id(m) not in taken and m.observed_departure_at is not None
+    ]
+    return [
+        (abs(observed - planned), observed, m)
+        for observed, m in aware
+        if abs(observed - planned) <= max_gap
     ]
 
 

@@ -16,6 +16,8 @@ from freshswitch_backend.analysis.business import (
     FORWARDER_SENSITIVITY_SHARE,
     FORWARDER_SHARE_SENSITIVITY_LABEL,
     FORWARDER_SHARE_SOURCE,
+    MAX_ANNUAL_AMOUNT,
+    MAX_BASE_FEE_PER_PALLET,
     MAX_OPS_COST_PER_VOYAGE,
     MAX_VARIABLE_COST_PER_PALLET,
     MVP_CASH_FIXED_COST,
@@ -509,19 +511,21 @@ def platform_business_years(
     scenario_id: str = "default",
     years: int = Query(5, ge=1, le=5),
     fee_rate: float | None = Query(None, ge=0, le=1),
-    base_fee_per_pallet: int = Query(DEFAULT_BASE_FEE_PER_PALLET, ge=0),
+    base_fee_per_pallet: int = Query(DEFAULT_BASE_FEE_PER_PALLET, ge=0, le=MAX_BASE_FEE_PER_PALLET),
     base_fee_from_year: int = Query(DEFAULT_BASE_FEE_FROM_YEAR, ge=1, le=6),
     sensitivity_forwarder_share: float = Query(FORWARDER_SENSITIVITY_SHARE, ge=0, le=1),
-    fixed_cost: int = Query(ANNUAL_FIXED_COST, ge=0),
-    mvp_cash_fixed_cost: int = Query(MVP_CASH_FIXED_COST, ge=0),
+    fixed_cost: int = Query(ANNUAL_FIXED_COST, ge=0, le=MAX_ANNUAL_AMOUNT),
+    mvp_cash_fixed_cost: int = Query(MVP_CASH_FIXED_COST, ge=0, le=MAX_ANNUAL_AMOUNT),
     subsidies: Annotated[list[int] | None, Query(max_length=5)] = None,
     volume_scale: float = Query(1.0, gt=0, le=20),
 ) -> BusinessYears:
     scenario = get_scenario(scenario_id)
     if scenario is None:
         raise HTTPException(status_code=404, detail="시나리오를 찾을 수 없습니다")
-    if subsidies is not None and any(v < 0 for v in subsidies):
-        raise HTTPException(status_code=422, detail="지원금은 0 이상이어야 합니다")
+    if subsidies is not None and any(v < 0 or v > MAX_ANNUAL_AMOUNT for v in subsidies):
+        raise HTTPException(
+            status_code=422, detail=f"지원금은 0 이상 {MAX_ANNUAL_AMOUNT:,} 이하여야 합니다"
+        )
     with analysis_slot():
         result = business_years(
             scenario,
