@@ -6,7 +6,7 @@ from sqlalchemy.dialects.postgresql import insert
 from freshswitch_backend.coldchain import ColdchainError, NotFound, coldchain_store
 from freshswitch_backend.coldchain.models import BindingRequest, ReadingIn, SimulationRequest
 from freshswitch_backend.data.loader import get_scenario
-from freshswitch_backend.lots import LotFilter, lot_store
+from freshswitch_backend.lots import ANY_ORG, LotFilter, lot_store
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.tables import (
     DEMO_ORG,
@@ -59,14 +59,14 @@ def test_plan_rows_record_org_and_lookups_stay_inside_org() -> None:
     assert store.get(other_plan.plan_id) is None
     assert store.get(demo_plan.plan_id, org_id=OTHER) is None
     assert store.get(other_plan.plan_id, org_id=OTHER).plan_id == other_plan.plan_id
-    assert store.get(other_plan.plan_id, org_id=None).plan_id == other_plan.plan_id
+    assert store.get(other_plan.plan_id, org_id=ANY_ORG).plan_id == other_plan.plan_id
     assert store.org_of(other_plan.plan_id) == OTHER
 
     assert [s.plan_id for s in store.summaries()] == [demo_plan.plan_id]
     assert [s.plan_id for s in store.summaries(org_id=OTHER)] == [other_plan.plan_id]
     assert store.count() == 1
     assert store.count(OTHER) == 1
-    assert store.count(None) == 2
+    assert store.count(ANY_ORG) == 2
 
     assert store.orders(other_plan.plan_id) == []
     with pytest.raises(KeyError):
@@ -102,7 +102,7 @@ def test_lot_store_is_scoped_by_shipper_org() -> None:
     assert [x.id for x in lot_store.search(LotFilter())] == ["LOT-DEMO-1"]
     assert [x.id for x in lot_store.search(LotFilter(), org_id=OTHER)] == ["LOT-OTHER-1"]
     assert lot_store.ids() == {"LOT-DEMO-1"}
-    assert lot_store.ids(None) == {"LOT-DEMO-1", "LOT-OTHER-1"}
+    assert lot_store.ids(ANY_ORG) == {"LOT-DEMO-1", "LOT-OTHER-1"}
     assert lot_store.reservation().taken == {"LOT-DEMO-1", "LOT-OTHER-1"}
 
     assert lot_store.update("LOT-OTHER-1", lambda _: {"pallets": 1}) is None
@@ -200,7 +200,7 @@ def test_demo_reset_only_clears_demo_org(client: TestClient, reset_admin_headers
 
     assert store.get(demo_plan.plan_id) is None
     assert store.get(other_plan.plan_id, org_id=OTHER) is not None
-    assert lot_store.ids(None) == {"LOT-OTHER-1", "LOT-OTHER-2"}
+    assert lot_store.ids(ANY_ORG) == {"LOT-OTHER-1", "LOT-OTHER-2"}
     assert _lot_status("LOT-OTHER-2") == "planned"
     assert coldchain_store.summaries() == []
     assert len(coldchain_store.summaries(org_id=OTHER)) == 1
@@ -220,6 +220,26 @@ def test_plan_clear_releases_only_own_org_lots() -> None:
     assert _lot_status("LOT-DEMO-1") == "planned"
     store.clear()
     assert _lot_status("LOT-DEMO-1") == "registered"
+
+
+def test_plan_create_marks_only_lots_of_lot_org() -> None:
+    _register("LOT-DEMO-1", DEMO_ORG)
+    _register("LOT-OTHER-1", OTHER)
+    ids = ["LOT-DEMO-1", "LOT-OTHER-1"]
+    store.create(_scenario(), registered_lot_ids=ids)
+    assert _lot_status("LOT-DEMO-1") == "planned"
+    assert _lot_status("LOT-OTHER-1") == "registered"
+    store.create(_scenario(), registered_lot_ids=["LOT-OTHER-1"], org_id=DEMO_ORG, lot_org_id=OTHER)
+    assert _lot_status("LOT-OTHER-1") == "planned"
+
+
+def test_none_org_is_not_all_orgs() -> None:
+    _register("LOT-OTHER-1", OTHER)
+    other_plan = store.create(_scenario(), org_id=OTHER)
+    assert store.get(other_plan.plan_id, org_id=None) is None
+    assert store.count(None) == 0
+    assert lot_store.get("LOT-OTHER-1", org_id=None) is None
+    assert lot_store.ids(None) == set()
 
 
 def test_quality_reset_accepts_caller_org_type() -> None:

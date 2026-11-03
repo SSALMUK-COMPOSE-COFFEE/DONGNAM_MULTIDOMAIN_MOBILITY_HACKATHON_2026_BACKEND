@@ -13,6 +13,7 @@ from freshswitch_backend.lots.models import LotFilter, RegisteredLot
 from freshswitch_backend.persistence import Database, database
 from freshswitch_backend.persistence.tables import DEMO_ORG, LotRow, PlanRow
 
+ANY_ORG = "*"
 LOT_ID_LOCK = 7_310_001
 PLAN_LOT_IDS = text(
     "SELECT DISTINCT lot->>'id' FROM plan_sessions, "
@@ -30,17 +31,17 @@ class Reservation:
     reserved: set[str]
 
 
-def mark_planned(db: Session, lot_ids: list[str], now: datetime) -> None:
+def mark_planned(db: Session, lot_ids: list[str], now: datetime, org_id: str) -> None:
     if lot_ids:
         db.execute(
             update(LotRow)
-            .where(LotRow.id.in_(lot_ids), LotRow.status == "registered")
+            .where(LotRow.id.in_(lot_ids), LotRow.status == "registered", _lot_scope(org_id))
             .values(status="planned", updated_at=now)
         )
 
 
 def release_lots(
-    db: Session, lot_ids: set[str] | None, now: datetime, org_id: str | None = None
+    db: Session, lot_ids: set[str] | None, now: datetime, org_id: str = ANY_ORG
 ) -> None:
     if lot_ids is not None and not lot_ids:
         return
@@ -50,8 +51,7 @@ def release_lots(
     statement = update(LotRow).where(LotRow.status == "planned", ~referenced)
     if lot_ids is not None:
         statement = statement.where(LotRow.id.in_(lot_ids))
-    if org_id is not None:
-        statement = statement.where(LotRow.shipper_org_id == org_id)
+    statement = statement.where(_lot_scope(org_id))
     db.execute(statement.values(status="registered", updated_at=now))
 
 
@@ -59,8 +59,8 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _lot_scope(org_id: str | None) -> Any:
-    return true() if org_id is None else LotRow.shipper_org_id == org_id
+def _lot_scope(org_id: str) -> Any:
+    return true() if org_id == ANY_ORG else LotRow.shipper_org_id == org_id
 
 
 def _model(row: LotRow) -> RegisteredLot:
@@ -119,12 +119,12 @@ class LotStore:
             raise LotConflict(f"이미 있는 로트 ID입니다: {lot.id}") from exc
         return _model(row)
 
-    def get(self, lot_id: str, org_id: str | None = DEMO_ORG) -> RegisteredLot | None:
+    def get(self, lot_id: str, org_id: str = DEMO_ORG) -> RegisteredLot | None:
         with self._db.begin() as db:
             row = db.scalars(select(LotRow).where(LotRow.id == lot_id, _lot_scope(org_id))).first()
             return _model(row) if row is not None else None
 
-    def get_many(self, lot_ids: list[str], org_id: str | None = DEMO_ORG) -> list[RegisteredLot]:
+    def get_many(self, lot_ids: list[str], org_id: str = DEMO_ORG) -> list[RegisteredLot]:
         if not lot_ids:
             return []
         with self._db.begin() as db:
@@ -132,7 +132,7 @@ class LotStore:
             found = {row.id: _model(row) for row in rows}
         return [found[i] for i in lot_ids if i in found]
 
-    def ids(self, org_id: str | None = DEMO_ORG) -> set[str]:
+    def ids(self, org_id: str = DEMO_ORG) -> set[str]:
         with self._db.begin() as db:
             return set(db.scalars(select(LotRow.id).where(_lot_scope(org_id))))
 
@@ -140,7 +140,7 @@ class LotStore:
         with self._db.begin() as db:
             return db.scalar(select(LotRow.shipper_org_id).where(LotRow.id == lot_id))
 
-    def search(self, query: LotFilter, org_id: str | None = DEMO_ORG) -> list[RegisteredLot]:
+    def search(self, query: LotFilter, org_id: str = DEMO_ORG) -> list[RegisteredLot]:
         statement = select(LotRow).where(_lot_scope(org_id))
         conditions = [
             (query.scenario_id, LotRow.scenario_id),
@@ -168,11 +168,11 @@ class LotStore:
         self,
         lot_id: str,
         change: Callable[[RegisteredLot], dict[str, Any]],
-        org_id: str | None = DEMO_ORG,
+        org_id: str = DEMO_ORG,
     ) -> RegisteredLot | None:
         with self._lock, self._db.begin() as db:
             row = db.get(LotRow, lot_id, with_for_update=True)
-            if row is None or (org_id is not None and row.shipper_org_id != org_id):
+            if row is None or (org_id != ANY_ORG and row.shipper_org_id != org_id):
                 return None
             for name, value in change(_model(row)).items():
                 setattr(row, name, value)
@@ -180,7 +180,7 @@ class LotStore:
             db.flush()
             return _model(row)
 
-    def delete(self, lot_id: str, org_id: str | None = DEMO_ORG) -> bool:
+    def delete(self, lot_id: str, org_id: str = DEMO_ORG) -> bool:
         with self._lock, self._db.begin() as db:
             statement = delete(LotRow).where(LotRow.id == lot_id, _lot_scope(org_id))
             return db.execute(statement).rowcount > 0
