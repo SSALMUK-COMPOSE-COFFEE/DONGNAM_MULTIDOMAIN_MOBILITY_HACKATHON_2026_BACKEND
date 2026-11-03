@@ -373,13 +373,16 @@ def test_order_flow_with_server_decided_actors(
     assert foreign.status_code == 404
 
 
-def test_saas_mode_rejects_inline_lots(client: TestClient) -> None:
+def test_saas_mode_rejects_inline_lots(client: TestClient, demo_tenants) -> None:
     settings = get_settings().model_copy(update={"saas_mode": True})
     saas = TestClient(create_app(settings), base_url="https://testserver", headers=SAAS_CSRF)
     lot = _scenario().lots[0].model_dump(mode="json")
+    anonymous = saas.post("/api/plans", json={"lots": [{**lot, "id": "lot-inline-1"}]})
+    assert anonymous.status_code == 401
+    login = saas.post("/api/auth/demo-login", json={"org_type": "platform"})
+    assert login.status_code == 200
     inline = saas.post("/api/plans", json={"lots": [{**lot, "id": "lot-inline-1"}]})
     assert inline.status_code == 422
-    assert saas.post("/api/plans", json={}).status_code == 201
     allowed = client.post("/api/plans", json={"lots": [{**lot, "id": "lot-inline-1"}]})
     assert allowed.status_code == 201
 

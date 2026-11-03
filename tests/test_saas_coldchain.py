@@ -2,6 +2,7 @@ import hashlib
 
 import pytest
 from fastapi.testclient import TestClient
+from saas_fixtures import demo_org_type
 from sqlalchemy import select
 
 from freshswitch_backend.coldchain import DeviceDenied, coldchain_store
@@ -11,7 +12,6 @@ from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.lots import ANY_ORG, lot_store
 from freshswitch_backend.main import create_app
 from freshswitch_backend.persistence import database
-from freshswitch_backend.persistence.seed import DEMO_EMAIL_DOMAIN
 from freshswitch_backend.persistence.tables import (
     DEMO_ORG,
     BindingRow,
@@ -22,7 +22,6 @@ from freshswitch_backend.persistence.tables import (
 from freshswitch_backend.planning.store import store
 
 CSRF = {"X-Requested-With": "freshswitch"}
-PASSWORD = "test-demo-password"
 PLATFORM = "freshswitch"
 SHIPPER = "shipper-jinju"
 FORWARDER = "forwarder-dongnam"
@@ -44,8 +43,7 @@ def app(demo_tenants):
 def _login(app, org_id: str) -> TestClient:
     client = TestClient(app, base_url="https://testserver")
     response = client.post(
-        "/api/auth/login",
-        json={"email": f"{org_id}@{DEMO_EMAIL_DOMAIN}", "password": PASSWORD},
+        "/api/auth/demo-login", json={"org_type": demo_org_type(org_id), "org_id": org_id}
     )
     assert response.status_code == 200, response.text
     assert response.json()["active_org"]["org_id"] == org_id
@@ -88,10 +86,15 @@ def test_platform_simulation_is_stored_under_plan_owner(app, simulated: str) -> 
         rows = db.execute(select(ContainerRow.record_key, ContainerRow.org_id)).all()
     assert rows == [(f"{simulated}:CA-01", PLATFORM)]
     anonymous = _anonymous(app)
-    assert anonymous.get("/api/coldchain/containers").json() == []
-    assert anonymous.get("/api/coldchain/alerts").json()["alerts"] == []
+    assert anonymous.get("/api/coldchain/containers").status_code == 401
+    assert anonymous.get("/api/coldchain/alerts").status_code == 401
     hidden = anonymous.get("/api/coldchain/containers/CA-01", params={"plan_id": simulated})
-    assert hidden.status_code == 404
+    assert hidden.status_code == 401
+    demo = _anonymous(create_app())
+    assert demo.get("/api/coldchain/containers").json() == []
+    assert demo.get("/api/coldchain/alerts").json()["alerts"] == []
+    demo_hidden = demo.get("/api/coldchain/containers/CA-01", params={"plan_id": simulated})
+    assert demo_hidden.status_code == 404
 
 
 @pytest.mark.parametrize("org_id", [PLATFORM, FORWARDER, SHIPPER])
@@ -247,7 +250,8 @@ def test_devices_require_login_and_csrf(app) -> None:
     assert platform.post("/api/saas/devices", json={"device_id": "x"}).status_code == 403
 
 
-def test_registration_replaces_demo_binding(app) -> None:
+def test_registration_replaces_demo_binding(demo_tenants) -> None:
+    app = create_app()
     anonymous = _anonymous(app)
     bound = anonymous.post(
         "/api/coldchain/bindings", json={"device_id": "arduino-01", "container_id": "CA-01"}
@@ -300,7 +304,7 @@ def test_registered_device_readings_need_token(app, plan_id: str) -> None:
         assert db.get(DeviceRow, "dev-p1").last_seen_at is not None
         keys = db.scalars(select(ContainerRow.org_id)).all()
     assert keys == [PLATFORM]
-    assert device.get("/api/coldchain/containers").json() == []
+    assert device.get("/api/coldchain/containers").status_code == 401
     listed = platform.get("/api/saas/devices").json()
     assert listed[0]["binding"]["container_id"] == "CA-01"
 

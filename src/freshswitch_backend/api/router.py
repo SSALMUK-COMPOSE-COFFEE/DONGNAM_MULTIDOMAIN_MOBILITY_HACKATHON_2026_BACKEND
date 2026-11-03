@@ -9,6 +9,7 @@ from freshswitch_backend.api import (
     forecast,
     health,
     intake,
+    login_gate,
     lots,
     me,
     orgs,
@@ -25,7 +26,7 @@ from freshswitch_backend.api import (
     vessels,
 )
 
-api_router = APIRouter(dependencies=[Depends(auth.csrf_guard)])
+api_router = APIRouter(dependencies=[Depends(auth.csrf_guard), Depends(login_gate.require_login)])
 api_router.include_router(health.router)
 api_router.include_router(scenarios.router)
 api_router.include_router(plans.router)
