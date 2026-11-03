@@ -429,7 +429,10 @@ def _cleared(db: Session, row: PlanRow, session: PlanSession) -> set[str]:
 def _guard_real_apply(db: Session, row: PlanRow, session: PlanSession, event: Event) -> None:
     if row.org_id == DEMO_ORG or _sandbox(db, row.org_id):
         return
-    if session.status == "pending_shipper_confirmation":
+    if (
+        session.status == "pending_shipper_confirmation"
+        and _rejecting_shipper(db, row, session, event) is None
+    ):
         raise SessionConflict(APPLY_BEFORE_CONFIRMATION)
     if (
         isinstance(event, AddLotEvent)
