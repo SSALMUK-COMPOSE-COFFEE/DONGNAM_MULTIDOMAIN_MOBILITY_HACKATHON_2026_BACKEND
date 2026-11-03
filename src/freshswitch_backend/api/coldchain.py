@@ -30,7 +30,6 @@ from freshswitch_backend.coldchain.simulator import PRESETS
 from freshswitch_backend.domain.models import Quantity
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.tables import DEMO_ORG, ShipperProfileRow
-from freshswitch_backend.planning.store import store as plan_store
 
 DEVICE_TOKEN_HEADER = "X-Device-Token"
 UNREGISTERED_DEVICE = "등록되지 않은 장치입니다. 조직 기기로 먼저 등록하세요"
@@ -122,8 +121,7 @@ def read_scope(principal: OptionalPrincipal, plan_id: str | None = None) -> Read
         return ReadScope(DEMO_ORG, None)
     if plan_id is None:
         return ReadScope(principal.org_id, principal)
-    plan_for(plan_id, principal)
-    return ReadScope(plan_store.org_of(plan_id) or principal.org_id, principal)
+    return ReadScope(plan_for(plan_id, principal).owner_org_id, principal)
 
 
 Scope = Annotated[ReadScope, Depends(read_scope)]
