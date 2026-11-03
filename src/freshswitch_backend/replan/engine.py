@@ -5,6 +5,7 @@ from freshswitch_backend.domain.models import Plan, Scenario
 from freshswitch_backend.optimize import AIR
 from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.optimize.feasibility import air_rejection, sea_option
+from freshswitch_backend.planning.budget import remaining as remaining_budget
 from freshswitch_backend.planning.service import PlanWithRoutes, solve_with_routes
 from freshswitch_backend.replan.models import (
     AddLotEvent,
@@ -408,6 +409,7 @@ def replan(
     *,
     air_locked: Iterable[str] = (),
     time_limit_s: float = 8.0,
+    deadline: float | None = None,
 ) -> ReplanResult:
     started = time.perf_counter()
     after = apply_event(scenario, event)
@@ -423,6 +425,7 @@ def replan(
             fixed=ctx.fixed_for(free_lots),
             max_pull_forward_days=MAX_PULL_FORWARD_DAYS,
             time_limit_s=per_solve,
+            deadline=deadline,
         )
 
     pull_built, pull_ms = _timed(lambda: solve_pull(free))
@@ -460,6 +463,7 @@ def replan(
                 forbidden=forbidden,
                 require_savings=False,
                 time_limit_s=per_solve,
+                deadline=deadline,
             )
         )
         alternatives.append(
@@ -490,6 +494,7 @@ def replan(
             fixed=as_is_fixed,
             forbidden=as_is_forbidden,
             time_limit_s=per_solve,
+            deadline=deadline,
         )
     )
     as_is_reasons = []
@@ -515,6 +520,7 @@ def replan(
     )
 
     feasible = [a for a in alternatives if a.feasible]
+    remaining_budget(deadline, time_limit_s)
     best = min(feasible, key=lambda a: (a.total_cost, PREFERENCE[a.id]), default=None)
     return ReplanResult(
         event=event,

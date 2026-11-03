@@ -14,6 +14,7 @@ from freshswitch_backend.domain.models import (
 from freshswitch_backend.optimize import AIR, solve_plan
 from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.optimize.solver import resettle_plan
+from freshswitch_backend.planning.budget import remaining
 from freshswitch_backend.routing import (
     PickupPlan,
     PickupRequest,
@@ -69,7 +70,11 @@ def _pickup_request(scenario: Scenario, lot_ids: list[str], voyage_id: str) -> P
 
 
 def build_routes(
-    scenario: Scenario, plan: Plan, time_limit_s: float = ROUTE_TIME_LIMIT_S
+    scenario: Scenario,
+    plan: Plan,
+    time_limit_s: float = ROUTE_TIME_LIMIT_S,
+    *,
+    deadline: float | None = None,
 ) -> list[VoyagePickup]:
     effective = _effective_scenario(scenario, plan)
     by_voyage: dict[str, list[str]] = defaultdict(list)
@@ -92,7 +97,8 @@ def build_routes(
                 ]
             }
         )
-        pickup = solve_pickup(request, time_limit_s=time_limit_s)
+        pickup = solve_pickup(request, time_limit_s=remaining(deadline, time_limit_s))
+        remaining(deadline, time_limit_s)
         for route in pickup.routes:
             free = route.port_eta + timedelta(minutes=request.service_minutes)
             busy_until[route.truck_id] = max(free, busy_until.get(route.truck_id, free))
@@ -201,6 +207,7 @@ def solve_with_routes(
     fixed: Mapping[str, str] | None = None,
     forbidden: Iterable[tuple[str, str]] | None = None,
     max_rounds: int = MAX_ROUTE_ROUNDS,
+    deadline: float | None = None,
     **options,
 ) -> PlanWithRoutes:
     fixed = dict(fixed or {})
@@ -211,10 +218,14 @@ def solve_with_routes(
     for c in scenario.containers:
         containers_of[c.voyage_id].append(c.id)
     for round_no in range(1, max_rounds + 1):
+        solve_options = {
+            **options,
+            "time_limit_s": remaining(deadline, options.get("time_limit_s", 5.0)),
+        }
         plan = solve_plan(
-            scenario, fixed=fixed, forbidden=forbidden, forbidden_reasons=reasons, **options
+            scenario, fixed=fixed, forbidden=forbidden, forbidden_reasons=reasons, **solve_options
         )
-        routes = build_routes(scenario, plan)
+        routes = build_routes(scenario, plan, deadline=deadline)
         newly = _dropped(routes)
         if not newly or round_no == max_rounds:
             break
@@ -237,9 +248,13 @@ def solve_with_routes(
                 forbidden.append((lid, c.id))
                 reasons[(lid, c.id)] = CUTOFF_REASON
         plan = solve_plan(
-            scenario, fixed=kept, forbidden=forbidden, forbidden_reasons=reasons, **options
+            scenario,
+            fixed=kept,
+            forbidden=forbidden,
+            forbidden_reasons=reasons,
+            **{**options, "time_limit_s": remaining(deadline, options.get("time_limit_s", 5.0))},
         )
-        routes = build_routes(scenario, plan)
+        routes = build_routes(scenario, plan, deadline=deadline)
     lots = {lot.id: lot for lot in scenario.lots}
     reassigned = [
         CollectionReassignment(
