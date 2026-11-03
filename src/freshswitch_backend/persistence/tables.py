@@ -415,3 +415,37 @@ class NotificationRow(Base):
     link: Mapped[str] = mapped_column(String(500))
     dedupe_key: Mapped[str] = mapped_column(String(300), unique=True)
     created_at: Mapped[datetime]
+
+
+class DelayObservationRow(Base):
+    __tablename__ = "delay_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "org_id",
+            "vessel_key",
+            "planned_departure_at",
+            name="uq_delay_observations_org_vessel_planned",
+        ),
+        Index("ix_delay_observations_scope_id", "scope", "id"),
+        CheckConstraint(
+            "scope IN ('demo', 'sandbox', 'live')", name="delay_observations_scope_check"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    org_id: Mapped[str] = mapped_column(
+        String(64), _org_fk("CASCADE"), index=True, server_default=DEMO_ORG
+    )
+    scope: Mapped[str] = mapped_column(String(20), server_default=DEMO_SCOPE)
+    plan_id: Mapped[str | None] = mapped_column(String(64))
+    voyage_id: Mapped[str] = mapped_column(String(64))
+    vessel_key: Mapped[str] = mapped_column(String(200))
+    vessel_name: Mapped[str] = mapped_column(String(200))
+    call_sign: Mapped[str | None] = mapped_column(String(32))
+    matched_by: Mapped[str] = mapped_column(String(20))
+    terminal: Mapped[str | None] = mapped_column(String(100))
+    vessel_kind: Mapped[str | None] = mapped_column(String(100))
+    planned_departure_at: Mapped[datetime]
+    departure_at: Mapped[datetime]
+    delay_hours: Mapped[float] = mapped_column(Float)
+    recorded_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
