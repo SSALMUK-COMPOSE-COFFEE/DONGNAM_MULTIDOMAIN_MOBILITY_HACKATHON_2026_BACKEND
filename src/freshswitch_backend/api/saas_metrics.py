@@ -16,6 +16,8 @@ from freshswitch_backend.analysis.business import (
     FORWARDER_SENSITIVITY_SHARE,
     FORWARDER_SHARE_SENSITIVITY_LABEL,
     FORWARDER_SHARE_SOURCE,
+    MAX_OPS_COST_PER_VOYAGE,
+    MAX_VARIABLE_COST_PER_PALLET,
     MVP_CASH_FIXED_COST,
     PROPOSAL,
     VOYAGES_PER_YEAR,
@@ -438,8 +440,8 @@ def platform_business(
     principal: PlatformPrincipal,
     month: MonthQuery = None,
     sensitivity_forwarder_share: float = Query(FORWARDER_SENSITIVITY_SHARE, ge=0, le=1),
-    ops_cost_per_voyage: int = Query(DEFAULT_OPS_COST_PER_VOYAGE, ge=0),
-    variable_cost_per_pallet: int = Query(0, ge=0),
+    ops_cost_per_voyage: int = Query(DEFAULT_OPS_COST_PER_VOYAGE, ge=0, le=MAX_OPS_COST_PER_VOYAGE),
+    variable_cost_per_pallet: int = Query(0, ge=0, le=MAX_VARIABLE_COST_PER_PALLET),
 ) -> PlatformBusiness:
     target = _month(month)
     sessions = [s for s in org_sessions(principal.org_id) if plan_month(s) == target]

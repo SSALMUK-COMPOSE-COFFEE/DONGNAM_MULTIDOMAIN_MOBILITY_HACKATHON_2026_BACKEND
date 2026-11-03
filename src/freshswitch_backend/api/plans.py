@@ -20,6 +20,7 @@ from freshswitch_backend.api.vessels import (
     vessel_client_factory,
 )
 from freshswitch_backend.data.loader import get_scenario
+from freshswitch_backend.domain.inputs import FiniteFloat
 from freshswitch_backend.domain.models import Lot, Scenario
 from freshswitch_backend.execution.cancellation import annotate_cancellations
 from freshswitch_backend.execution.models import (
@@ -103,10 +104,13 @@ class ApplyRequest(BaseModel):
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=200)
 
 
+MAX_SCHEDULE_HOURS = 240.0
+
+
 class ScheduleCheckRequest(BaseModel):
     movements: list[VesselMovement] | None = None
-    threshold_hours: float = 3.0
-    max_gap_hours: float = Field(default=MAX_GAP_HOURS, gt=0)
+    threshold_hours: FiniteFloat = Field(default=3.0, ge=0, le=MAX_SCHEDULE_HOURS)
+    max_gap_hours: FiniteFloat = Field(default=MAX_GAP_HOURS, gt=0, le=MAX_SCHEDULE_HOURS)
 
 
 class ScheduleCheckResponse(BaseModel):

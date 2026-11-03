@@ -1,4 +1,5 @@
 import logging
+import math
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -26,6 +27,10 @@ async def _replan_error(_: Request, exc: Exception) -> JSONResponse:
 def _encodable(value: object) -> object:
     if isinstance(value, str):
         return value.encode("utf-8", "backslashreplace").decode("utf-8")
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            return "NaN"
+        return "Infinity" if value > 0 else "-Infinity"
     if isinstance(value, list):
         return [_encodable(item) for item in value]
     if isinstance(value, dict):

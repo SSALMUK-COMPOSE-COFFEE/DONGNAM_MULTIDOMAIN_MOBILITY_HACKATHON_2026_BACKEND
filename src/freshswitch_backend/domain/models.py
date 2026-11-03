@@ -10,7 +10,10 @@ DEFAULT_PALLET_KG = 415.0
 def to_kst(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=KST)
-    return value.astimezone(KST)
+    try:
+        return value.astimezone(KST)
+    except OverflowError as exc:
+        raise ValueError("시각 범위를 벗어났습니다") from exc
 
 
 KstDatetime = Annotated[datetime, AfterValidator(to_kst)]

@@ -19,10 +19,14 @@ from freshswitch_backend.analysis import (
     fuel_shock,
     sensitivity,
 )
-from freshswitch_backend.analysis.business import MAX_VARIABLE_COST_PER_PALLET
+from freshswitch_backend.analysis.business import (
+    MAX_OPS_COST_PER_VOYAGE,
+    MAX_VARIABLE_COST_PER_PALLET,
+)
 from freshswitch_backend.api.auth import OptionalPrincipal
 from freshswitch_backend.api.compute_limits import analysis_rate, analysis_slot
 from freshswitch_backend.data.loader import get_scenario
+from freshswitch_backend.domain.inputs import FiniteFloat
 from freshswitch_backend.domain.models import Scenario
 from freshswitch_backend.persistence.tables import DEMO_ORG
 from freshswitch_backend.planning.store import PlanSession, store
@@ -63,12 +67,13 @@ class BenchmarkRequest(BaseModel):
 
 MAX_SURCHARGE_POINTS = 41
 MAX_SURCHARGE_KRW = 20_000
+Surcharge = Annotated[FiniteFloat, Field(ge=0, le=MAX_SURCHARGE_KRW)]
 
 
 class SurchargeSweep(BaseModel):
-    start: float = Field(ge=0, le=MAX_SURCHARGE_KRW)
-    stop: float = Field(ge=0, le=MAX_SURCHARGE_KRW)
-    step: float = Field(gt=0)
+    start: FiniteFloat = Field(ge=0, le=MAX_SURCHARGE_KRW)
+    stop: FiniteFloat = Field(ge=0, le=MAX_SURCHARGE_KRW)
+    step: FiniteFloat = Field(gt=0, le=MAX_SURCHARGE_KRW)
 
     @model_validator(mode="after")
     def _check(self) -> "SurchargeSweep":
@@ -86,11 +91,11 @@ class SurchargeSweep(BaseModel):
 class FuelShockRequest(BaseModel):
     scenario_id: str = "fuel-shock"
     plan_id: str | None = None
-    surcharges: list[float] | None = Field(default=None, max_length=MAX_SURCHARGE_POINTS)
+    surcharges: list[Surcharge] | None = Field(default=None, max_length=MAX_SURCHARGE_POINTS)
     sweep: SurchargeSweep | None = None
-    baseline_surcharge: float | None = Field(default=None, ge=0, le=MAX_SURCHARGE_KRW)
+    baseline_surcharge: Surcharge | None = None
     find_thresholds: bool = True
-    threshold_max: float = Field(default=DEFAULT_THRESHOLD_MAX, gt=0, le=MAX_SURCHARGE_KRW)
+    threshold_max: FiniteFloat = Field(default=DEFAULT_THRESHOLD_MAX, gt=0, le=MAX_SURCHARGE_KRW)
 
     @model_validator(mode="after")
     def _check(self) -> "FuelShockRequest":
@@ -167,7 +172,7 @@ def run_business(
     scenario_id: str = "default",
     plan_id: str | None = None,
     forwarder_share: float = Query(DEFAULT_FORWARDER_SHARE, ge=0, le=1),
-    ops_cost_per_voyage: int = Query(DEFAULT_OPS_COST_PER_VOYAGE, ge=0),
+    ops_cost_per_voyage: int = Query(DEFAULT_OPS_COST_PER_VOYAGE, ge=0, le=MAX_OPS_COST_PER_VOYAGE),
     variable_cost_per_pallet: int = Query(0, ge=0, le=MAX_VARIABLE_COST_PER_PALLET),
 ) -> BusinessResult:
     scenario = _source(scenario_id, plan_id, org_id)
