@@ -361,6 +361,8 @@ def _cell(value: object) -> object:
         return ""
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
     return value
 
 

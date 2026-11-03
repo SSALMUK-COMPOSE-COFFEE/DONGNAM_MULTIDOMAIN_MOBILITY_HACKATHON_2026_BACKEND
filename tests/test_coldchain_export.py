@@ -173,3 +173,21 @@ def test_csv_role_scope(saas_app, saas_plan: str, kind: str) -> None:
         assert outsider.get(own, params=params).status_code == 404
     anonymous = TestClient(saas_app, base_url="https://testserver")
     assert anonymous.get(own, params=params).status_code == 401
+
+
+def test_readings_csv_neutralises_formula_cells(client: TestClient) -> None:
+    plan_id = client.post("/api/plans", json={"scenario_id": "default"}).json()["plan_id"]
+    reading = {
+        "device_id": "=1+1",
+        "container_id": "CA-01",
+        "plan_id": plan_id,
+        "ts": START.isoformat(),
+        "temp_c": -1.5,
+        "power_on": True,
+    }
+    assert client.post("/api/coldchain/readings", json=reading).status_code == 200
+    params = {"plan_id": plan_id}
+    readings = _rows(client.get("/api/coldchain/containers/CA-01/readings.csv", params=params))
+    raw = [r for r in readings if r["source"] == "raw"]
+    assert [r["device_id"] for r in raw] == ["'=1+1"]
+    assert raw[0]["temp_c"] == "-1.5"
