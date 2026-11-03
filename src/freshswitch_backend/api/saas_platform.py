@@ -1,10 +1,18 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from freshswitch_backend.api.auth import Principal, require_role
+from freshswitch_backend.api.compute_limits import (
+    cache_key,
+    check_lot_count,
+    check_preview_rate,
+    preview_cache,
+    preview_deadline,
+    run_bounded,
+)
 from freshswitch_backend.api.plans import (
     CreatePlanRequest,
     create_tenant_plan,
@@ -89,12 +97,37 @@ def create_plan(body: PlatformPlanRequest, principal: PlatformPrincipal) -> Plan
     return create_tenant_plan(request, principal.org_id)
 
 
-@router.post("/plans/preview")
-def preview_plan(body: PlatformPlanRequest, principal: PlatformPrincipal) -> PlanPreview:
-    scenario, _ = tenant_plan_scenario(CreatePlanRequest(**body.model_dump()), principal.org_id)
+def _compute_preview(scenario: Scenario, deadline: float) -> PlanPreview:
     working = scenario.model_copy(deep=True)
-    built = build_plan(working)
+    built = build_plan(working, deadline=deadline)
     return PlanPreview(scenario=working, plan=built.plan, routes=built.routes)
+
+
+@router.post("/plans/preview")
+def preview_plan(
+    body: PlatformPlanRequest, request: Request, principal: PlatformPrincipal
+) -> PlanPreview:
+    deadline = preview_deadline()
+    check_lot_count(len(dict.fromkeys(body.lot_ids)))
+    scenario, registered_ids = tenant_plan_scenario(
+        CreatePlanRequest(**body.model_dump()), principal.org_id
+    )
+    key = cache_key(
+        {
+            "org_id": principal.org_id,
+            "lot_ids": sorted(registered_ids),
+            "options": body.model_dump(exclude={"lot_ids"}),
+            "scenario": scenario.model_dump(mode="json"),
+        }
+    )
+    cache = preview_cache(request)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    check_preview_rate(request, principal)
+    preview = run_bounded(_compute_preview, scenario, deadline=deadline)
+    cache.put(key, preview)
+    return preview
 
 
 def _sessions(principal: Principal, limit: int, offset: int) -> list[PlanSession]:

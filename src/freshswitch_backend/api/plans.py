@@ -12,6 +12,7 @@ from freshswitch_backend.api.computation import (
     explanation_budget,
     request_deadline,
 )
+from freshswitch_backend.api.compute_limits import check_lot_count, compute_slot
 from freshswitch_backend.api.vessels import (
     VesselClientFactory,
     fetch_busan_movements,
@@ -242,11 +243,13 @@ def _base_scenario(scenario_id: str) -> Scenario:
 def tenant_plan_scenario(body: CreatePlanRequest, org_id: str) -> tuple[Scenario, list[str]]:
     if body.lots:
         raise HTTPException(status_code=422, detail=INLINE_LOTS_FORBIDDEN)
+    check_lot_count(len(dict.fromkeys(body.lot_ids)))
     base = _base_scenario(body.scenario_id)
     scenario = tenant_scenario(base, load_catalog(ANY_ORG, base, peer_of=org_id))
     scenario, registered_ids = _with_lots(
         scenario, body, lot_org=ANY_ORG, registered_only=True, peer_of=org_id
     )
+    check_lot_count(len(scenario.lots))
     if not registered_ids:
         raise HTTPException(status_code=422, detail="계획에 넣을 등록 출하가 없습니다")
     if body.use_learned_loss:
@@ -273,9 +276,10 @@ def _free_containers(scenario: Scenario, org_id: str) -> Scenario:
 def create_tenant_plan(body: CreatePlanRequest, org_id: str) -> PlanSession:
     scenario, registered_ids = tenant_plan_scenario(body, org_id)
     try:
-        return store.create(
-            scenario, registered_ids, org_id=org_id, lot_org_id=ANY_ORG, exclusive=True
-        )
+        with compute_slot():
+            return store.create(
+                scenario, registered_ids, org_id=org_id, lot_org_id=ANY_ORG, exclusive=True
+            )
     except LotUnavailable as exc:
         raise HTTPException(
             status_code=409,

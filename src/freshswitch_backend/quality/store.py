@@ -1,6 +1,7 @@
 import json
 import threading
 import uuid
+from datetime import datetime, time
 from pathlib import Path
 from typing import Literal
 
@@ -62,6 +63,12 @@ def _check_reset(org_type: str | None) -> None:
         raise QualityAccessDenied("품질 관측 초기화·삭제는 플랫폼 조직만 할 수 있습니다")
 
 
+def _seed_recorded_at(item: SeedObservation) -> datetime | None:
+    if item.observed_on is None:
+        return None
+    return datetime.combine(item.observed_on, time.min, tzinfo=KST)
+
+
 def _load_seed() -> tuple[str, list[SeedObservation]]:
     raw = json.loads(SEED_PATH.read_text(encoding="utf-8"))
     return raw["label"], [SeedObservation.model_validate(o) for o in raw["observations"]]
@@ -111,7 +118,12 @@ class QualityHistory:
         return scenario
 
     def _from_input(
-        self, body: ObservationIn, origin: str, obs_id: str, scenario: Scenario
+        self,
+        body: ObservationIn,
+        origin: str,
+        obs_id: str,
+        scenario: Scenario,
+        recorded_at: datetime | None = None,
     ) -> Observation:
         if body.product_id not in {p.id for p in scenario.products}:
             raise QualityInputError(f"시나리오에 없는 품목입니다: {body.product_id}")
@@ -141,23 +153,42 @@ class QualityHistory:
             condition_uplift=round(uplift, 6),
             adjusted_loss_rate=round(max(0.0, actual - uplift), 6),
             observed_on=body.observed_on or plan_store.clock().astimezone(KST).date(),
-            recorded_at=plan_store.clock(),
+            recorded_at=recorded_at or plan_store.clock(),
             note=body.note,
         )
 
+    def _seed_observations(self, scenario: Scenario, scope: LearningScope) -> list[Observation]:
+        if scope not in SEEDED_SCOPES:
+            return []
+        return [
+            self._from_input(
+                item, "seed", _seed_id(item.id, scope), scenario, _seed_recorded_at(item)
+            )
+            for item in self._seed
+        ]
+
     def _seed_rows(self, db: Session, scenario: Scenario, scope: LearningScope) -> int:
         set_meta(db, _seeded_key(scope), True)
-        if scope not in SEEDED_SCOPES:
-            return 0
-        for item in self._seed:
-            db.add(_row(self._from_input(item, "seed", _seed_id(item.id, scope), scenario), scope))
-        return len(self._seed)
+        seeds = self._seed_observations(scenario, scope)
+        for observation in seeds:
+            db.add(_row(observation, scope))
+        return len(seeds)
 
     def _ensure_seeded(self, db: Session, scope: LearningScope) -> None:
         if get_meta(db, _seeded_key(scope)):
             return
         self._seed_rows(db, self.reference_scenario(), scope)
         db.flush()
+
+    def _pending_seeds(self, db: Session, scope: LearningScope) -> list[Observation]:
+        if get_meta(db, _seeded_key(scope)):
+            return []
+        return self._seed_observations(self.reference_scenario(), scope)
+
+    def ensure_seeded(self, scopes: frozenset[LearningScope] = SEEDED_SCOPES) -> None:
+        with self._lock, self._db.begin() as db:
+            for scope in sorted(scopes):
+                self._ensure_seeded(db, scope)
 
     def reset(
         self, seed: bool = True, org_type: str | None = None, scope: LearningScope = "demo"
@@ -175,21 +206,20 @@ class QualityHistory:
 
     def observations(self, scope: LearningScope = "demo") -> list[Observation]:
         with self._lock, self._db.begin() as db:
-            self._ensure_seeded(db, scope)
             rows = db.scalars(
                 select(ObservationRow)
                 .where(ObservationRow.scope == scope)
                 .order_by(ObservationRow.seq)
             )
-            return [Observation.model_validate(row.payload) for row in rows]
+            stored = [Observation.model_validate(row.payload) for row in rows]
+            return [*stored, *self._pending_seeds(db, scope)]
 
     def get(self, obs_id: str, scope: LearningScope = "demo") -> Observation | None:
         with self._lock, self._db.begin() as db:
-            self._ensure_seeded(db, scope)
             row = db.get(ObservationRow, obs_id)
-            if row is None or row.scope != scope:
-                return None
-            return Observation.model_validate(row.payload)
+            if row is not None:
+                return Observation.model_validate(row.payload) if row.scope == scope else None
+            return next((o for o in self._pending_seeds(db, scope) if o.id == obs_id), None)
 
     def delete(
         self, obs_id: str, org_type: str | None = None, scope: LearningScope = "demo"
