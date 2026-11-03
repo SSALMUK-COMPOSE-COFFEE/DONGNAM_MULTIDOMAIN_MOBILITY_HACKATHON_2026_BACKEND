@@ -306,9 +306,52 @@ def _scope_explanations(payload: dict[str, Any], own: set[str]) -> None:
         ]
 
 
+def _cost_total(costs: list[dict[str, Any]], name: str) -> int:
+    return sum((c.get(name) or {}).get("total", 0) for c in costs)
+
+
+def _own_container(container: dict[str, Any], own: set[str]) -> dict[str, Any] | None:
+    rows = [r for r in container["shippers"] if r["shipper_id"] in own]
+    if not rows:
+        return None
+    return {
+        **container,
+        "shippers": rows,
+        "total_savings": sum(r["savings"] for r in rows),
+        "total_fee": sum(r["fee"] for r in rows),
+        "total_shipper_gain": sum(r["shipper_gain"] for r in rows),
+    }
+
+
+def _scope_settlements(payload: dict[str, Any], own: set[str]) -> None:
+    plan = payload["plan"]
+    rows = [s for s in plan["settlements"] if s["shipper_id"] in own]
+    costs = [c for c in plan["shipper_costs"] if c["shipper_id"] in own]
+    containers = [_own_container(c, own) for c in plan["container_settlements"]]
+    operational_baseline = _cost_total(costs, "operational_baseline")
+    operational = _cost_total(costs, "operational")
+    plan.update(
+        settlements=rows,
+        shipper_costs=costs,
+        container_settlements=[c for c in containers if c is not None],
+        total_baseline_cost=sum(s["baseline_cost"] for s in rows),
+        total_shared_cost=sum(s["shared_cost"] for s in rows),
+        total_savings=sum(s["savings"] for s in rows),
+        total_fee=sum(s["fee"] for s in rows),
+        total_operational_baseline_cost=operational_baseline,
+        total_operational_cost=operational,
+        total_operational_savings=operational_baseline - operational,
+        objective=None,
+    )
+    for entry in payload["history"]:
+        for name in HISTORY_MONEY:
+            entry[name] = None
+
+
 def anonymized_session(session: PlanSession, own_shipper_ids: Iterable[str]) -> dict[str, Any]:
     own = set(own_shipper_ids)
     payload = session.model_dump(mode="json")
+    _scope_settlements(payload, own)
     _scope_explanations(payload, own)
     return Anonymizer(session.scenario, own).session(payload)
 

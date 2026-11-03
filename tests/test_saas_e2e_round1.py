@@ -131,3 +131,42 @@ def test_shipper_free_text_has_only_own_amounts(platform_client: TestClient, saa
         if cancellation is not None:
             assert cancellation["fee"] is None
             assert all(t["shipper_id"] == "sh-sangju" for t in cancellation["transfers"])
+
+
+def test_shipper_plan_detail_holds_only_own_settlement(
+    platform_client: TestClient, saas_login
+) -> None:
+    plan_id, _ = _reduced_plan(platform_client, saas_login)
+    full = platform_client.get(f"/api/plans/{plan_id}").json()
+    own_row = next(s for s in full["plan"]["settlements"] if s["shipper_id"] == "sh-pohang")
+    own_cost = next(c for c in full["plan"]["shipper_costs"] if c["shipper_id"] == "sh-pohang")
+
+    pohang = saas_login("shipper-pohang")
+    body = pohang.get(f"/api/saas/shipper/plans/{plan_id}").json()
+    plan = body["plan"]
+    assert plan["settlements"] == [own_row]
+    assert [c["shipper_id"] for c in plan["shipper_costs"]] == ["sh-pohang"]
+    assert plan["total_baseline_cost"] == own_row["baseline_cost"]
+    assert plan["total_shared_cost"] == own_row["shared_cost"]
+    assert plan["total_savings"] == own_row["savings"]
+    assert plan["total_fee"] == own_row["fee"]
+    assert plan["total_operational_cost"] == own_cost["operational"]["total"]
+    assert plan["objective"] is None
+    assert plan["total_savings"] < full["plan"]["total_savings"]
+    for container in plan["container_settlements"]:
+        assert [r["shipper_id"] for r in container["shippers"]] == ["sh-pohang"]
+        assert container["total_savings"] == container["shippers"][0]["savings"]
+        assert container["total_fee"] == container["shippers"][0]["fee"]
+    assert plan["container_settlements"]
+    assert all(
+        entry[name] is None
+        for entry in body["history"]
+        for name in ("cost_before", "cost_after", "cost_delta")
+    )
+    others = [s for s in full["plan"]["settlements"] if s["shipper_id"] != "sh-pohang"]
+    text = json.dumps(plan["settlements"] + plan["container_settlements"])
+    for row in others:
+        assert str(row["shared_cost"]) not in text
+    assert sum(c["pallets"] for c in plan["containers"]) == sum(
+        c["pallets"] for c in full["plan"]["containers"]
+    )
