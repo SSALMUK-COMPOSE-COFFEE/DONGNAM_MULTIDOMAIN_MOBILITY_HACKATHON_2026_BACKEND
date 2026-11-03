@@ -310,11 +310,16 @@ def match_departures(
     for voyage in sorted(map(_as_voyage, voyages), key=lambda v: _aware(v.etd)):
         planned = _aware(voyage.etd)
         matched_by: MatchedBy = "call_sign"
-        pool = by_call.get(normalize_call_sign(voyage.call_sign), []) if voyage.call_sign else []
+        own = normalize_call_sign(voyage.call_sign) if voyage.call_sign else None
+        pool = by_call.get(own, []) if own else []
         candidates = _near(pool, planned, taken, max_gap)
         if not candidates:
             matched_by = "vessel_name"
-            pool = by_name.get(normalize_vessel_name(voyage.vessel_name), [])
+            pool = [
+                m
+                for m in by_name.get(normalize_vessel_name(voyage.vessel_name), [])
+                if own is None or not m.call_sign or normalize_call_sign(m.call_sign) == own
+            ]
             candidates = _near(pool, planned, taken, max_gap)
         if not candidates:
             continue

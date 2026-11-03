@@ -309,11 +309,26 @@ def test_call_sign_wins_over_name_and_name_is_fallback():
         movements,
     )
     assert [(m.matched_by, m.movement.call_sign) for m in by_call] == [("call_sign", "AAA1")]
-    fallback = match_departures(
+    other_ship = match_departures(
         [PlannedVoyage(voyage_id="V1", vessel_name="SAME NAME", etd=when, call_sign="ZZZ9")],
         movements,
     )
-    assert [(m.matched_by, m.movement.call_sign) for m in fallback] == [("vessel_name", "BBB2")]
+    assert other_ship == []
+    unsigned = VesselMovement(
+        port_code="020",
+        call_sign="",
+        vessel_name="SAME NAME",
+        departure_at=when + timedelta(hours=6),
+    )
+    fallback = match_departures(
+        [PlannedVoyage(voyage_id="V1", vessel_name="SAME NAME", etd=when, call_sign="ZZZ9")],
+        [*movements, unsigned],
+    )
+    assert [(m.matched_by, m.movement.call_sign) for m in fallback] == [("vessel_name", "")]
+    no_sign = match_departures(
+        [PlannedVoyage(voyage_id="V1", vessel_name="SAME NAME", etd=when)], movements
+    )
+    assert [(m.matched_by, m.movement.call_sign) for m in no_sign] == [("vessel_name", "BBB2")]
 
 
 @pytest.mark.skipif(
