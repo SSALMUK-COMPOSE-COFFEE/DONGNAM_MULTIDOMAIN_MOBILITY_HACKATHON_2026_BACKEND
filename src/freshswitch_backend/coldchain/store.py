@@ -46,6 +46,7 @@ MAX_READINGS = 5000
 MAX_HISTORY = 1000
 MAX_ALERTS = 2000
 MAX_CONTAINERS = 200
+MAX_RUNS = 200
 DEFAULT_STAGE: Stage = "terminal"
 PREVIEW_RULE = (
     "트윈 예상 손실률을 도착 검수 손실률 대신 넣어 품질 사후정산을 미리 계산한다. "
@@ -95,7 +96,7 @@ class ColdchainStore:
         self._records: OrderedDict[tuple[str | None, str], ContainerRecord] = OrderedDict()
         self._feed: list[Alert] = []
         self._seq = 0
-        self._runs: dict[str, _Run] = {}
+        self._runs: OrderedDict[str, _Run] = OrderedDict()
         self._lock = threading.RLock()
         self.clock: Callable[[], datetime] = _now
 
@@ -464,6 +465,7 @@ class ColdchainStore:
     def simulate(self, body: SimulationRequest) -> SimulationRun:
         preset = PRESETS[body.preset]
         with self._lock:
+            self._make_run_room()
             plan_id = self._resolve_plan(body.container_id, body.plan_id)
             self.require_plan(plan_id, body.container_id)
             if body.reset:
@@ -496,17 +498,28 @@ class ColdchainStore:
             end=readings[-1].ts,
         )
         if body.interval_seconds <= 0:
-            result = self.ingest(readings)
-            info.sent = len(readings)
-            info.done = True
-            info.state = result.containers[0] if result.containers else None
+            with self._lock:
+                self._make_run_room()
+                result = self.ingest(readings)
+                info.sent = len(readings)
+                info.done = True
+                info.state = result.containers[0] if result.containers else None
+                self._runs[info.run_id] = _Run(info=info, readings=[], stop=threading.Event())
             return info
         run = _Run(info=info, readings=readings, stop=threading.Event())
         run.thread = threading.Thread(target=self._stream, args=(run,), daemon=True)
         with self._lock:
+            self._make_run_room()
             self._runs[info.run_id] = run
         run.thread.start()
         return info.model_copy()
+
+    def _make_run_room(self) -> None:
+        while len(self._runs) >= MAX_RUNS:
+            finished = next((key for key, run in self._runs.items() if run.info.done), None)
+            if finished is None:
+                raise ColdchainError("동시에 실행할 수 있는 시뮬레이션 수를 초과했습니다")
+            self._runs.pop(finished)
 
     def _stream(self, run: _Run) -> None:
         for reading in run.readings:
