@@ -59,6 +59,19 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.execute(
+        sa.text(
+            "UPDATE plan_sessions SET status = 'committed' "
+            "WHERE status = 'pending_shipper_confirmation'"
+        )
+    )
+    op.execute(
+        sa.text(
+            "UPDATE plan_sessions "
+            "SET payload = jsonb_set(payload, '{status}', '\"committed\"'::jsonb) "
+            "WHERE payload->>'status' = 'pending_shipper_confirmation'"
+        )
+    )
     op.drop_index(
         "ix_plan_shipper_confirmations_org_status", table_name="plan_shipper_confirmations"
     )

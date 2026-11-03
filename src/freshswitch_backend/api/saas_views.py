@@ -371,6 +371,11 @@ MOVED_LOT = re.compile(r"(?<![\w-])(?P<lot>[^\s(]+)\((?P<name>[^\s()]+)(?P<rest>
 SHORT_PART_TEXT = r"[^\s(),:→]+ \d+→\d+(?![\w/→])"
 SHORT_RUN = re.compile(rf"(?<![^\s(]){SHORT_PART_TEXT}(?:, {SHORT_PART_TEXT})*")
 SHORT_PART = re.compile(r"(?P<name>[^\s(),:→]+)(?P<rest> \d+→\d+)")
+LOT_LIST_HEAD = r"(?:대상 출하: |(?<!\w)로트 )"
+LOT_LIST_END = r"(?=, |[.:(]|\s|$)"
+LOT_MOVE_LIST = re.compile(r"이동: (?P<body>.+?)(?= / |$)")
+LOT_MOVE_END = r"(?= \d+파렛트 )"
+LOT_ITEM_START = r"(?:^|(?<=, ))"
 OTHER_SHIPPER_LOG = {
     "shipper_confirmed": "모든 화주 확인 완료",
     "rejected": "화주 확인 → 이전 확정 계획으로 복귀",
@@ -783,6 +788,15 @@ class Anonymizer:
         self._tokens = tokens
         ordered = sorted(tokens, key=len, reverse=True)
         self._pattern = re.compile("|".join(patterns[t] for t in ordered)) if ordered else None
+        self._list_region: re.Pattern[str] | None = None
+        self._list_item: re.Pattern[str] | None = None
+        self._move_item: re.Pattern[str] | None = None
+        if any(anon != lot_id for lot_id, anon in self._lots.items()):
+            known = "|".join(re.escape(t) for t in sorted(self._lots, key=len, reverse=True) if t)
+            item = rf"(?:(?:{known}){LOT_LIST_END}|[^\s,]+)"
+            self._list_region = re.compile(rf"{LOT_LIST_HEAD}(?P<body>{item}(?:, {item})*)")
+            self._list_item = re.compile(rf"{LOT_ITEM_START}(?:{known}){LOT_LIST_END}")
+            self._move_item = re.compile(rf"{LOT_ITEM_START}(?:{known}){LOT_MOVE_END}")
 
     def extended(self, lots: Mapping[str, str]) -> "Anonymizer":
         if not lots:
@@ -795,9 +809,21 @@ class Anonymizer:
     def text(self, value: str, context: list[str] | None = None) -> str:
         value = MOVED_LOT.sub(self._moved, value)
         value = SHORT_RUN.sub(lambda m: self._run(m.group(0), context or []), value)
+        value = self._listed_lots(value)
         if self._pattern is None:
             return value
         return self._pattern.sub(lambda m: self._tokens[m.group(0)], value)
+
+    def _listed_lots(self, value: str) -> str:
+        region, listed, moved = self._list_region, self._list_item, self._move_item
+        if region is None or listed is None or moved is None:
+            return value
+        value = region.sub(lambda m: self._in_body(m, listed), value)
+        return LOT_MOVE_LIST.sub(lambda m: self._in_body(m, moved), value)
+
+    def _in_body(self, found: re.Match[str], item: re.Pattern[str]) -> str:
+        head = found.group(0)[: found.start("body") - found.start()]
+        return head + item.sub(lambda m: self._lots[m.group(0)], found.group("body"))
 
     def _moved(self, found: re.Match[str]) -> str:
         lot_id = found.group("lot")
@@ -1110,9 +1136,19 @@ def related_to_shipper(order: ExecutionOrder, own: set[str], my_lots: set[str]) 
     return bool(own & shippers) or any(my_lots & set(r.lot_ids) for r in order.requests)
 
 
-def _scoped_log(log: list[OrderLogEntry], own: set[str]) -> list[OrderLogEntry]:
+def _reply_request_id(entry: OrderLogEntry) -> str | None:
+    if entry.actor != "forwarder":
+        return None
+    return entry.action.split(" ", 1)[0]
+
+
+def _scoped_log(
+    log: list[OrderLogEntry], own: set[str], hidden_requests: set[str]
+) -> list[OrderLogEntry]:
     scoped: list[OrderLogEntry] = []
     for entry in log:
+        if _reply_request_id(entry) in hidden_requests:
+            continue
         if entry.actor != "shipper" or entry.shipper_id in own:
             scoped.append(entry)
             continue
@@ -1127,14 +1163,17 @@ def _scoped_log(log: list[OrderLogEntry], own: set[str]) -> list[OrderLogEntry]:
 def _order_view(
     anonymizer: Anonymizer, order: ExecutionOrder, own: set[str], my_lots: set[str]
 ) -> dict[str, Any]:
+    requests = [r for r in order.requests if my_lots & set(r.lot_ids)]
+    visible = {r.request_id for r in requests}
+    hidden = {r.request_id for r in order.requests} - visible
     trimmed = order.model_copy(
         update={
             "shipper_confirmations": [
                 c for c in order.shipper_confirmations if c.shipper_id in own
             ],
             "notified_shipper_ids": [s for s in order.notified_shipper_ids if s in own],
-            "requests": [r for r in order.requests if my_lots & set(r.lot_ids)],
-            "log": _scoped_log(order.log, own),
+            "requests": requests,
+            "log": _scoped_log(order.log, own, hidden),
         }
     )
     payload = trimmed.model_dump(mode="json")
