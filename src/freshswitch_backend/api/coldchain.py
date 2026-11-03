@@ -19,7 +19,8 @@ from freshswitch_backend.api.auth import (
     current_org_id,
     current_principal,
 )
-from freshswitch_backend.api.saas_access import plan_for
+from freshswitch_backend.api.saas_access import PlanAccess, plan_for
+from freshswitch_backend.api.saas_views import ShipperColdchainView, shipper_coldchain_view
 from freshswitch_backend.coldchain import (
     ActionConflict,
     ColdchainError,
@@ -31,6 +32,7 @@ from freshswitch_backend.coldchain.devices import device_store, is_simulator_dev
 from freshswitch_backend.coldchain.models import (
     ActionHandler,
     ActionUpdateBody,
+    Alert,
     AlertFeed,
     Binding,
     BindingRequest,
@@ -49,9 +51,11 @@ from freshswitch_backend.coldchain.power_plan import power_plan
 from freshswitch_backend.coldchain.simulator import PRESETS
 from freshswitch_backend.coldchain.store import ActionTransition
 from freshswitch_backend.domain.models import Quantity
+from freshswitch_backend.lots import lot_store
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.orgs import org_sandbox
 from freshswitch_backend.persistence.tables import DEMO_ORG, ShipperProfileRow
+from freshswitch_backend.planning.store import PlanSession
 from freshswitch_backend.planning.store import store as plan_store
 
 DEVICE_TOKEN_HEADER = "X-Device-Token"
@@ -80,9 +84,15 @@ def _http(exc: Exception) -> HTTPException:
 
 
 class ReadScope:
-    def __init__(self, org_id: str, principal: Principal | None) -> None:
+    def __init__(
+        self, org_id: str, principal: Principal | None, access: PlanAccess | None = None
+    ) -> None:
         self.org_id = org_id
         self.org_type = principal.org_type if principal is not None else None
+        self.viewer_org_id = principal.org_id if principal is not None else None
+        self.plan_id = access.session.plan_id if access is not None else None
+        self._session: PlanSession | None = access.session if access is not None else None
+        self._view: ShipperColdchainView | None = None
         self.shipper_ids: frozenset[str] = frozenset()
         if self.org_type == "shipper" and principal is not None:
             with database.begin() as db:
@@ -97,6 +107,32 @@ class ReadScope:
     @property
     def hides_money(self) -> bool:
         return self.org_type == "forwarder"
+
+    def refresh(self) -> None:
+        self._session = None
+        self._view = None
+
+    def _shipper_view(self) -> ShipperColdchainView:
+        if self._view is not None:
+            return self._view
+        session = self._session
+        if session is None and self.plan_id is not None:
+            session = plan_store.get(self.plan_id, org_id=self.org_id)
+        orders = plan_store.orders(session.plan_id, org_id=self.org_id) if session else []
+        own_lots = lot_store.ids(org_id=self.viewer_org_id) if self.viewer_org_id else set()
+        self._session = session
+        self._view = shipper_coldchain_view(session, self.shipper_ids, orders, own_lots)
+        return self._view
+
+    def alert(self, alert: Alert) -> Alert:
+        if self.org_type != "shipper":
+            return alert
+        return self._shipper_view().alert(alert)
+
+    def feed(self, feed: AlertFeed) -> AlertFeed:
+        if self.org_type != "shipper":
+            return feed
+        return feed.model_copy(update={"alerts": [self.alert(a) for a in feed.alerts]})
 
     def state(self, state: TwinState) -> TwinState:
         if self.hides_money:
@@ -125,7 +161,7 @@ class ReadScope:
                 "delta_krw": _total(lot.delta_krw for lot in lots),
             }
         )
-        return state.model_copy(update={"loss": loss})
+        return self._shipper_view().state(state.model_copy(update={"loss": loss}))
 
     def summary(self, item: TwinSummary) -> TwinSummary:
         if self.hides_money:
@@ -154,7 +190,8 @@ def read_scope(principal: OptionalPrincipal, plan_id: str | None = None) -> Read
         return ReadScope(DEMO_ORG, None)
     if plan_id is None:
         return ReadScope(principal.org_id, principal)
-    return ReadScope(plan_for(plan_id, principal).owner_org_id, principal)
+    access = plan_for(plan_id, principal)
+    return ReadScope(access.owner_org_id, principal, access)
 
 
 Scope = Annotated[ReadScope, Depends(read_scope)]
@@ -456,7 +493,7 @@ def read_alerts(
     limit: int = Query(100, ge=1, le=1000),
     plan_id: str | None = None,
 ) -> AlertFeed:
-    return coldchain_store.alerts(since, container_id, limit, plan_id, scope.org_id)
+    return scope.feed(coldchain_store.alerts(since, container_id, limit, plan_id, scope.org_id))
 
 
 def still_allowed(request: Request, principal: Principal | None, plan_id: str | None) -> bool:
@@ -495,9 +532,11 @@ async def stream_alerts(
                 recheck_at = time.monotonic() + STREAM_RECHECK_SECONDS
                 if not await run_in_threadpool(still_allowed, request, principal, plan_id):
                     break
+                scope.refresh()
             feed = await run_in_threadpool(
                 coldchain_store.alerts, cursor, container_id, 1000, plan_id, scope.org_id
             )
+            feed = await run_in_threadpool(scope.feed, feed)
             for alert in feed.alerts:
                 data = json.dumps(alert.model_dump(mode="json"), ensure_ascii=False)
                 yield f"id: {alert.seq}\nevent: alert\ndata: {data}\n\n"

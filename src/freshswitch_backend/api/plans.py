@@ -26,6 +26,7 @@ from freshswitch_backend.execution.models import (
     ExecutionOrder,
     RequestResultBody,
 )
+from freshswitch_backend.execution.orders import saas_requests
 from freshswitch_backend.forecast.observations import planned_voyages, record_schedule_check
 from freshswitch_backend.intake.tenants import load_catalog, tenant_scenario
 from freshswitch_backend.integrations import (
@@ -408,19 +409,29 @@ def apply_and_notify(plan_id: str, body: ApplyRequest, org_id: OrgId) -> PlanSes
     return session
 
 
+def _order_view(
+    order: ExecutionOrder, session: PlanSession, org_id: str, request: Request
+) -> ExecutionOrder:
+    if org_id == DEMO_ORG and not app_settings(request).saas_mode:
+        return order
+    requests = saas_requests(order.plan_id, order.requests, session.scenario)
+    return order.model_copy(update={"requests": requests})
+
+
 @router.get("/{plan_id}/orders")
-def list_orders(plan_id: str, org_id: OrgId) -> list[ExecutionOrder]:
-    _session(plan_id, org_id)
-    return store.orders(plan_id, org_id=org_id)
+def list_orders(plan_id: str, org_id: OrgId, request: Request) -> list[ExecutionOrder]:
+    session = _session(plan_id, org_id)
+    return [_order_view(o, session, org_id, request) for o in store.orders(plan_id, org_id=org_id)]
 
 
 @router.get("/{plan_id}/orders/{order_id}")
-def read_order(plan_id: str, order_id: str, org_id: OrgId) -> ExecutionOrder:
-    _session(plan_id, org_id)
+def read_order(plan_id: str, order_id: str, org_id: OrgId, request: Request) -> ExecutionOrder:
+    session = _session(plan_id, org_id)
     try:
-        return store.order(plan_id, order_id, org_id=org_id)
+        order = store.order(plan_id, order_id, org_id=org_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="실행 지시를 찾을 수 없습니다") from exc
+    return _order_view(order, session, org_id, request)
 
 
 @router.post("/{plan_id}/orders/{order_id}/confirm")

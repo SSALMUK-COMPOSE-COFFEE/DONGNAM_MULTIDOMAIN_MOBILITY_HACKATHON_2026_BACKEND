@@ -6,6 +6,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
+from freshswitch_backend.coldchain.models import Alert, ColdchainAction, LossSummary, TwinState
 from freshswitch_backend.domain.models import (
     Scenario,
     SettlementBaselineKind,
@@ -479,6 +480,9 @@ class Anonymizer:
             return value
         return self._pattern.sub(lambda m: self._tokens[m.group(0)], value)
 
+    def knows(self, value: str) -> bool:
+        return value in self._tokens
+
     def walk(self, value: Any) -> Any:
         if isinstance(value, str):
             return self.text(value)
@@ -790,3 +794,91 @@ def forwarder_order_view(order: ExecutionOrder) -> ForwarderOrder:
             for transfer in cancellation["transfers"]
         ]
     return ForwarderOrder.model_validate(payload)
+
+
+def _scrub(value: Any, pattern: re.Pattern[str], label: str) -> Any:
+    if isinstance(value, str):
+        return pattern.sub(label, value)
+    if isinstance(value, list):
+        return [_scrub(item, pattern, label) for item in value]
+    if isinstance(value, dict):
+        return {k: _scrub(v, pattern, label) for k, v in value.items()}
+    return value
+
+
+def _hidden_handler(handler: dict[str, Any] | None) -> dict[str, Any] | None:
+    if handler is None:
+        return None
+    return {"org_type": handler["org_type"], "org_id": None, "user_id": None}
+
+
+class ShipperColdchainView:
+    def __init__(self, anonymizer: Anonymizer | None, own_lot_ids: Iterable[str] = ()) -> None:
+        self.anonymizer = anonymizer
+        self.own_lot_ids = set(own_lot_ids)
+        if anonymizer is not None:
+            self.own_lot_ids |= anonymizer.own_lot_ids
+
+    def _walk(self, payload: Any) -> Any:
+        if self.anonymizer is None:
+            return payload
+        return self.anonymizer.walk(payload)
+
+    def _action_payload(self, action: dict[str, Any]) -> dict[str, Any]:
+        scoped = {
+            **action,
+            "accepted_by": _hidden_handler(action.get("accepted_by")),
+            "done_by": _hidden_handler(action.get("done_by")),
+        }
+        if self.anonymizer is None:
+            scoped["lot_ids"] = [x for x in scoped["lot_ids"] if x in self.own_lot_ids]
+            return scoped
+        unknown = sorted(
+            (
+                x
+                for x in set(scoped["lot_ids"])
+                if x not in self.own_lot_ids and not self.anonymizer.knows(x)
+            ),
+            key=len,
+            reverse=True,
+        )
+        if not unknown:
+            return scoped
+        pattern = re.compile("|".join(map(_token_pattern, unknown)))
+        return _scrub(scoped, pattern, f"anon-{UNKNOWN_OWNER_LABEL}")
+
+    def _alert_payload(self, alert: dict[str, Any]) -> dict[str, Any]:
+        action = alert.get("action")
+        if action is None:
+            return alert
+        return {**alert, "action": self._action_payload(action)}
+
+    def action(self, action: ColdchainAction) -> ColdchainAction:
+        payload = self._action_payload(action.model_dump(mode="json"))
+        return ColdchainAction.model_validate(self._walk(payload))
+
+    def alert(self, alert: Alert) -> Alert:
+        payload = self._alert_payload(alert.model_dump(mode="json"))
+        return Alert.model_validate(self._walk(payload))
+
+    def state(self, state: TwinState) -> TwinState:
+        actions = [self._action_payload(a.model_dump(mode="json")) for a in state.actions]
+        alerts = [self._alert_payload(a.model_dump(mode="json")) for a in state.alerts]
+        return state.model_copy(
+            update={
+                "actions": [ColdchainAction.model_validate(self._walk(a)) for a in actions],
+                "alerts": [Alert.model_validate(self._walk(a)) for a in alerts],
+                "loss": LossSummary.model_validate(self._walk(state.loss.model_dump(mode="json"))),
+            }
+        )
+
+
+def shipper_coldchain_view(
+    session: PlanSession | None,
+    own_shipper_ids: Iterable[str],
+    orders: Iterable[ExecutionOrder] = (),
+    own_lot_ids: Iterable[str] = (),
+) -> ShipperColdchainView:
+    if session is None:
+        return ShipperColdchainView(None, own_lot_ids)
+    return ShipperColdchainView(shipper_anonymizer(session, own_shipper_ids, orders), own_lot_ids)

@@ -71,7 +71,7 @@ class RequestDraft(BaseModel):
 
 class ActionHandler(BaseModel):
     org_type: HandlerRole
-    org_id: str
+    org_id: str | None = None
     user_id: str | None = None
 
 
