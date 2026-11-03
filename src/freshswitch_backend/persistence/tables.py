@@ -224,6 +224,19 @@ class PlanForwarderRow(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
+class ExecutionNumbersRow(Base):
+    __tablename__ = "plan_execution_numbers"
+
+    plan_id: Mapped[str] = mapped_column(String(64), _plan_fk(), primary_key=True)
+    container_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    booking_no: Mapped[str | None] = mapped_column(String(30))
+    container_no: Mapped[str | None] = mapped_column(String(11))
+    seal_no: Mapped[str | None] = mapped_column(String(20))
+    updated_by: Mapped[str | None] = mapped_column(String(64), _user_fk("SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime]
+
+
 class PendingRow(Base):
     __tablename__ = "plan_pending_replans"
 
