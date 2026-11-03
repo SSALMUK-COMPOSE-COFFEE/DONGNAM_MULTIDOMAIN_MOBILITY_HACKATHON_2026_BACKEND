@@ -1,8 +1,7 @@
 import asyncio
 import json
-import string
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
@@ -13,7 +12,7 @@ from sqlalchemy import select
 from freshswitch_backend.api.auth import OptionalPrincipal, Principal, current_org_id
 from freshswitch_backend.api.saas_access import plan_for
 from freshswitch_backend.coldchain import ColdchainError, DeviceDenied, NotFound, coldchain_store
-from freshswitch_backend.coldchain.devices import device_store
+from freshswitch_backend.coldchain.devices import device_store, is_simulator_device
 from freshswitch_backend.coldchain.models import (
     AlertFeed,
     Binding,
@@ -82,39 +81,27 @@ class ReadScope:
             return state.model_copy(update={"loss": loss})
         if self.org_type != "shipper":
             return state
-        labels = self._labels(
-            [s.shipper_id for s in state.loss.shippers]
-            + [lot.shipper_id for lot in state.loss.lots]
+        lots = [lot for lot in state.loss.lots if lot.shipper_id in self.shipper_ids]
+        shippers = [s for s in state.loss.shippers if s.shipper_id in self.shipper_ids]
+        loss = state.loss.model_copy(
+            update={
+                "lots": lots,
+                "shippers": shippers,
+                "cargo_value": _total(lot.lot_value for lot in lots),
+                "planned_loss_krw": _total(lot.planned_loss_krw for lot in lots),
+                "predicted_loss_krw": _total(lot.predicted_loss_krw for lot in lots),
+                "delta_krw": _total(lot.delta_krw for lot in lots),
+            }
         )
-        shippers = [
-            s
-            if s.shipper_id in self.shipper_ids
-            else s.model_copy(
-                update={"shipper_id": labels[s.shipper_id], "shipper_name": labels[s.shipper_id]}
-            )
-            for s in state.loss.shippers
-        ]
-        lots = [
-            lot
-            if lot.shipper_id in self.shipper_ids
-            else lot.model_copy(update={"shipper_id": labels[lot.shipper_id]})
-            for lot in state.loss.lots
-        ]
-        loss = state.loss.model_copy(update={"shippers": shippers, "lots": lots})
         return state.model_copy(update={"loss": loss})
-
-    def _labels(self, shipper_ids: list[str]) -> dict[str, str]:
-        out: dict[str, str] = {}
-        for shipper_id in shipper_ids:
-            if shipper_id in self.shipper_ids or shipper_id in out:
-                continue
-            out[shipper_id] = _alias(len(out))
-        return out
 
     def summary(self, item: TwinSummary) -> TwinSummary:
         if self.hides_money:
             return item.model_copy(update={"delta_krw": None})
-        return item
+        if self.org_type != "shipper":
+            return item
+        state = self.state(coldchain_store.state(item.container_id, item.plan_id, 0, self.org_id))
+        return item.model_copy(update={"delta_krw": state.loss.delta_krw})
 
     def preview(self, preview: SettlementPreview) -> SettlementPreview:
         if self.org_type != "shipper":
@@ -125,12 +112,9 @@ class ReadScope:
         )
 
 
-def _alias(index: int) -> str:
-    letters = string.ascii_uppercase
-    label = letters[index % len(letters)]
-    if index >= len(letters):
-        label += str(index // len(letters))
-    return f"화주 {label}"
+def _total(values: Iterable[int]) -> int | None:
+    items = list(values)
+    return sum(items) if items else None
 
 
 def read_scope(principal: OptionalPrincipal, plan_id: str | None = None) -> ReadScope:
@@ -300,7 +284,9 @@ def list_presets() -> list[PresetInfo]:
 
 
 @router.post("/simulate")
-def simulate(body: SimulationRequest, org_id: OrgId) -> SimulationRun:
+def simulate(body: SimulationRequest, org_id: OrgId, principal: OptionalPrincipal) -> SimulationRun:
+    if not is_simulator_device(body.device_id):
+        _device_org(body.device_id, org_id, principal)
     try:
         return coldchain_store.simulate(body, org_id)
     except (NotFound, ColdchainError) as exc:

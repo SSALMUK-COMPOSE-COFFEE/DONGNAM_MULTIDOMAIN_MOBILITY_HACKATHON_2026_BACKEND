@@ -150,26 +150,45 @@ def test_signed_up_org_cannot_read_other_plan(app, simulated: str) -> None:
     assert stream.status_code == 404
 
 
-def test_shipper_sees_other_shippers_anonymized(app, simulated: str) -> None:
-    client = _login(app, SHIPPER)
-    state = client.get("/api/coldchain/containers/CA-01", params={"plan_id": simulated}).json()
-    names = {s["shipper_id"]: s["shipper_name"] for s in state["loss"]["shippers"]}
-    assert names
-    scenario = get_scenario("default")
-    real = {s.id: s.name for s in scenario.shippers}
-    for shipper_id, name in names.items():
-        if shipper_id == "sh-jinju":
-            assert name == real["sh-jinju"]
-        else:
-            assert shipper_id.startswith("화주 ")
-            assert name == shipper_id
-    others = sorted(name for shipper_id, name in names.items() if shipper_id != "sh-jinju")
-    assert others == [f"화주 {chr(ord('A') + i)}" for i in range(len(others))]
-    for lot in state["loss"]["lots"]:
-        assert lot["shipper_id"] == "sh-jinju" or lot["shipper_id"].startswith("화주 ")
+def test_shipper_sees_only_own_share(app, simulated: str) -> None:
+    params = {"plan_id": simulated}
     platform = _login(app, PLATFORM)
-    full = platform.get("/api/coldchain/containers/CA-01", params={"plan_id": simulated}).json()
-    assert {s["shipper_id"] for s in full["loss"]["shippers"]} <= set(real)
+    full = platform.get("/api/coldchain/containers/CA-01", params=params).json()
+    assert {s["shipper_id"] for s in full["loss"]["shippers"]} - {"sh-jinju"}
+    client = _login(app, SHIPPER)
+    state = client.get("/api/coldchain/containers/CA-01", params=params).json()
+    loss = state["loss"]
+    assert loss["lots"]
+    assert {lot["shipper_id"] for lot in loss["lots"]} == {"sh-jinju"}
+    assert [s["shipper_id"] for s in loss["shippers"]] == ["sh-jinju"]
+    assert loss["cargo_value"] == sum(lot["lot_value"] for lot in loss["lots"])
+    assert loss["planned_loss_krw"] == sum(lot["planned_loss_krw"] for lot in loss["lots"])
+    assert loss["predicted_loss_krw"] == sum(lot["predicted_loss_krw"] for lot in loss["lots"])
+    assert loss["delta_krw"] == sum(lot["delta_krw"] for lot in loss["lots"])
+    assert loss["cargo_value"] < full["loss"]["cargo_value"]
+    summaries = client.get("/api/coldchain/containers", params=params).json()
+    assert [item["delta_krw"] for item in summaries] == [loss["delta_krw"]]
+
+
+def test_simulator_ids_cannot_be_registered(app, plan_id: str) -> None:
+    forwarder = _login(app, FORWARDER)
+    taken = forwarder.post("/api/saas/devices", json={"device_id": "sim-01"}, headers=CSRF)
+    assert taken.status_code == 422
+    platform = _login(app, PLATFORM)
+    run = platform.post(
+        "/api/coldchain/simulate",
+        json={"plan_id": plan_id, "container_id": "CA-01", "device_id": "sim-01"},
+        headers=CSRF,
+    )
+    assert run.status_code == 200, run.text
+
+
+def test_logged_in_simulation_needs_registered_device(app, plan_id: str) -> None:
+    platform = _login(app, PLATFORM)
+    body = {"plan_id": plan_id, "container_id": "CA-01", "device_id": "loose-01"}
+    assert platform.post("/api/coldchain/simulate", json=body, headers=CSRF).status_code == 422
+    platform.post("/api/saas/devices", json={"device_id": "loose-01"}, headers=CSRF)
+    assert platform.post("/api/coldchain/simulate", json=body, headers=CSRF).status_code == 200
 
 
 def test_forwarder_does_not_see_money(app, simulated: str) -> None:

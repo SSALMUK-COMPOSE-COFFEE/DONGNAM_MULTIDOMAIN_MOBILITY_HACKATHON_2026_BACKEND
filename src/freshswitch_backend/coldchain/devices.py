@@ -11,9 +11,15 @@ from freshswitch_backend.coldchain.models import Binding
 from freshswitch_backend.persistence import Database, database
 from freshswitch_backend.persistence.tables import DEMO_ORG, BindingRow, DeviceRow
 
+SIMULATOR_PREFIX = "sim-"
+
 
 class DeviceConflict(ValueError):
     pass
+
+
+def is_simulator_device(device_id: str) -> bool:
+    return device_id.startswith(SIMULATOR_PREFIX)
 
 
 class DeviceRequest(BaseModel):
@@ -26,6 +32,10 @@ class DeviceRequest(BaseModel):
         trimmed = value.strip()
         if not trimmed:
             raise ValueError("빈 값은 사용할 수 없습니다")
+        if is_simulator_device(trimmed):
+            raise ValueError(
+                f"'{SIMULATOR_PREFIX}'로 시작하는 id는 시뮬레이터용이라 등록할 수 없습니다"
+            )
         return trimmed
 
 
