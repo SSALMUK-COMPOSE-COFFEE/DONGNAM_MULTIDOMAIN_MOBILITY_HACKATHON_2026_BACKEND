@@ -229,9 +229,20 @@ def test_executed_dispatches_follow_later_orders() -> None:
     ]
 
 
-def test_dispatch_lock_is_scoped_to_its_voyage(scenario: Scenario, built: PlanWithRoutes) -> None:
+def test_dispatch_lock_follows_its_truck_and_lot_across_voyages(
+    scenario: Scenario, built: PlanWithRoutes
+) -> None:
     early = datetime(2026, 11, 10, 9, 0, tzinfo=KST)
-    result = _run(
+    other_truck = _run(
+        scenario,
+        built,
+        CancelEvent(lot_id="lot-pohang-gr-1", occurred_at=early),
+        dispatched=[
+            ExecutedDispatch(voyage_id="V-2611A", truck_id="RT-02", lot_ids=["lot-miryang-sb-1"])
+        ],
+    )
+    assert other_truck.fixed_reasons == []
+    relabelled = _run(
         scenario,
         built,
         CancelEvent(lot_id="lot-pohang-gr-1", occurred_at=early),
@@ -239,7 +250,9 @@ def test_dispatch_lock_is_scoped_to_its_voyage(scenario: Scenario, built: PlanWi
             ExecutedDispatch(voyage_id="V-2611B", truck_id="RT-03", lot_ids=["lot-miryang-sb-1"])
         ],
     )
-    assert result.fixed_reasons == []
+    assert [(f.lot_id, f.voyage_id, f.truck_id) for f in relabelled.fixed_reasons] == [
+        ("lot-miryang-sb-1", "V-2611A", "RT-03")
+    ]
 
 
 def test_occurred_at_defaults_to_now(scenario: Scenario, built: PlanWithRoutes) -> None:

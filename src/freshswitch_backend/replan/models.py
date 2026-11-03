@@ -206,6 +206,7 @@ class Alternative(BaseModel):
     routes: list[VoyagePickup] = Field(default_factory=list)
     diff: PlanDiff
     solve_ms: int
+    warnings: list[str] = Field(default_factory=list, exclude_if=lambda value: not value)
 
 
 class ReplanResult(BaseModel):

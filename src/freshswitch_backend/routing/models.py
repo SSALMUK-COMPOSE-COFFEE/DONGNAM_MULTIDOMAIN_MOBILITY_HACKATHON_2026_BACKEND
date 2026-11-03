@@ -40,6 +40,7 @@ class PickupTruck(BaseModel):
     id: str
     capacity_pallets: int = Field(gt=0)
     available_from: datetime | None = None
+    available_until: datetime | None = None
 
 
 class StopVisit(BaseModel):

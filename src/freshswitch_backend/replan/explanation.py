@@ -165,6 +165,7 @@ def build_explain_context(
         recommended_alternative_id=result.recommended_id,
         alternatives=[_alternative_input(current, result.event, a) for a in result.alternatives],
         shippers=_shipper_impacts(scenario_before, recommended),
+        warnings=list(result.warnings),
     )
 
 

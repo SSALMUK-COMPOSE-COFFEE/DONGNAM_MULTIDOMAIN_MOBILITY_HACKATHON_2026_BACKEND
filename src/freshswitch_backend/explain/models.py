@@ -36,6 +36,7 @@ class ExplainContext(BaseModel):
     recommended_alternative_id: str | None
     alternatives: list[AlternativeInput]
     shippers: list[ShipperImpact]
+    warnings: list[str] = Field(default_factory=list)
 
 
 class ShipperMessage(BaseModel):

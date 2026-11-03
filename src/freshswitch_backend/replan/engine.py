@@ -86,22 +86,22 @@ def _clock(at: datetime) -> str:
     return f"{at.astimezone(KST):%m-%d %H:%M}"
 
 
+def _dispatch_reason(truck_id: str, trip: int) -> str:
+    return f"{truck_id} {trip}회차 배차 실행됨: 트럭·출발 시각 고정(해상·항공 선택은 변경 가능)"
+
+
 def fixed_routes(
     routes: list[VoyagePickup],
     at: datetime | None,
     dispatched: Iterable[ExecutedDispatch] = (),
 ) -> tuple[LockedRoutes, list[FixedLot]]:
-    executed = {(d.voyage_id, d.truck_id, lid) for d in dispatched for lid in d.lot_ids}
+    executed = {(d.truck_id, lid) for d in dispatched for lid in d.lot_ids}
     held: LockedRoutes = {}
     reasons: list[FixedLot] = []
     for voyage_pickup in routes:
         for route in voyage_pickup.pickup.routes:
             departed = at is not None and route.earliest_departure <= at
-            ordered = any(
-                (voyage, route.truck_id, lid) in executed
-                for lid in route_lot_ids([route])
-                for voyage in (voyage_pickup.voyage_id, None)
-            )
+            ordered = any((route.truck_id, lid) in executed for lid in route_lot_ids([route]))
             if not departed and not ordered:
                 continue
             held.setdefault(voyage_pickup.voyage_id, []).append(route)
@@ -114,7 +114,7 @@ def fixed_routes(
                 )
             else:
                 code = "dispatch_executed"
-                why = f"{trip} 배차 실행됨: 트럭·출발 시각 고정(해상·항공 선택은 변경 가능)"
+                why = _dispatch_reason(route.truck_id, route.trip)
             reasons.extend(
                 FixedLot(
                     lot_id=lid,
@@ -336,8 +336,9 @@ class _Context:
         held: set[str],
         before: Scenario | None = None,
         unavailable: Iterable[str] = (),
-        pinned: Iterable[tuple[str, str, int]] = (),
+        pinned: Iterable[tuple[str, datetime]] = (),
         dispatched_lots: Iterable[str] = (),
+        pins: dict[str, FixedLot] | None = None,
     ) -> None:
         self.after = after
         self.current = current
@@ -352,6 +353,7 @@ class _Context:
         self.unavailable = set(unavailable) - set(self.where.values())
         self.pinned = set(pinned)
         self.dispatched_lots = set(dispatched_lots)
+        self.pin_of = {lid: pin for lid, pin in (pins or {}).items() if lid in self.lot_ids}
         self.air_locked = set(air_locked) & set(self.lot_ids)
         self.held = held & set(self.lot_ids)
         self.rule_switched: set[str] = set()
@@ -596,13 +598,14 @@ def _next_voyage_reasons(ctx: _Context, plan: Plan, blocked: dict[str, set[str]]
     for u in plan.unassigned:
         if u.lot_id not in blocked:
             continue
-        later = [
-            c
-            for c in ctx.after.containers
-            if c.id not in blocked[u.lot_id] and c.id not in ctx.unavailable
-        ]
-        if not later:
+        candidates = [c for c in ctx.after.containers if c.id not in blocked[u.lot_id]]
+        later = [c for c in candidates if c.id not in ctx.unavailable]
+        if not candidates:
             reasons.append(f"{u.lot_id}: 이후 항차 없음")
+            continue
+        if not later:
+            taken = ", ".join(f"{c.voyage_id}/{c.id} 다른 계획에 배정됨" for c in candidates)
+            reasons.append(f"{u.lot_id}: {taken}")
             continue
         details = []
         for container in later:
@@ -636,13 +639,47 @@ def _pinned_conflicts(
     return bool(details or crowded or _late_pinned(ctx, built.routes)), details
 
 
+def _kept_pins(ctx: _Context, plan: Plan, routes: list[VoyagePickup]) -> dict[str, FixedLot]:
+    where = locations(plan)
+    trips = {
+        lid: (vp.voyage_id, route)
+        for vp in routes
+        for route in vp.pickup.routes
+        for lid in route_lot_ids([route])
+    }
+    kept = {}
+    for lid, pin in ctx.pin_of.items():
+        voyage_id, route = trips.get(lid, (None, None))
+        if where.get(lid) not in ctx.voyage_of or route is None:
+            continue
+        if (route.truck_id, route.earliest_departure) == (pin.truck_id, pin.departure):
+            kept[lid] = pin.model_copy(
+                update={
+                    "voyage_id": voyage_id,
+                    "trip": route.trip,
+                    "reason": _dispatch_reason(route.truck_id, route.trip),
+                }
+            )
+    return kept
+
+
+def _broken_pins(ctx: _Context, plan: Plan, routes: list[VoyagePickup]) -> list[str]:
+    where = locations(plan)
+    kept = _kept_pins(ctx, plan, routes)
+    return [
+        f"{lid}: 배차가 실행된 트럭 {pin.truck_id} {pin.trip}회차의 트럭·출발 시각을 유지할 수 없음"
+        for lid, pin in sorted(ctx.pin_of.items())
+        if where.get(lid) in ctx.voyage_of and lid not in kept
+    ]
+
+
 def _late_pinned(ctx: _Context, routes: list[VoyagePickup]) -> list[str]:
     cutoff = {v.id: v.cy_cutoff for v in ctx.after.voyages}
     return [
         f"{lid}: 배차가 실행된 트럭 {route.truck_id}이 선적 마감 뒤에 항만에 도착"
         for vp in routes
         for route in vp.pickup.routes
-        if (vp.voyage_id, route.truck_id, route.trip) in ctx.pinned
+        if (route.truck_id, route.earliest_departure) in ctx.pinned
         and route.port_eta > cutoff[vp.voyage_id]
         for lid in sorted(route_lot_ids([route]))
     ]
@@ -668,6 +705,11 @@ def _alternative(
         if where.get(lid) != ctx.where.get(lid)
     ]
     reasons += _late_pinned(ctx, built.routes)
+    reasons += [
+        r
+        for r in _broken_pins(ctx, plan, built.routes)
+        if not any(r.partition(": ")[0] in other for other in reasons)
+    ]
     diff = diff_plans(
         ctx.after, ctx.current, plan, routes_before=ctx.routes_before, routes_after=built.routes
     )
@@ -721,6 +763,10 @@ def replan(
             released = _keep_pinned_next_voyage(released, result)
         if released is not None and released.recommended_id is not None:
             released.warnings.append(DISPATCH_RELEASED)
+            honored = {id(a) for a in result.alternatives}
+            for alternative in released.alternatives:
+                if id(alternative) not in honored:
+                    alternative.warnings.append(DISPATCH_RELEASED)
             result = released
     result.solve_ms = round((time.perf_counter() - started) * 1000)
     return result
@@ -781,11 +827,10 @@ def _replan_with(
     after = apply_event(scenario, event)
     held_lots = {f.lot_id for f in departed}
     pinned = {
-        (f.voyage_id, f.truck_id, f.trip)
-        for f in held_reasons
-        if f.reason_code == "dispatch_executed"
+        (f.truck_id, f.departure) for f in held_reasons if f.reason_code == "dispatch_executed"
     }
-    dispatched_lots = {f.lot_id for f in held_reasons if f.reason_code == "dispatch_executed"}
+    pins = {f.lot_id: f for f in held_reasons if f.reason_code == "dispatch_executed"}
+    dispatched_lots = set(pins)
     ctx = _Context(
         after,
         current_plan,
@@ -797,6 +842,7 @@ def _replan_with(
         unavailable,
         pinned,
         dispatched_lots,
+        pins,
     )
     with locked_routes(held, not_before=occurred_at):
         return _replan(ctx, held_reasons, occurred_at, started, time_limit_s, deadline)
@@ -933,16 +979,17 @@ def _replan(
 
     remaining_budget(deadline, time_limit_s)
     best = _recommend(alternatives)
+    kept_pins = _kept_pins(ctx, best.plan, best.routes) if best else ctx.pin_of
     return ReplanResult(
         event=event,
         scope=scope,
         free_lot_ids=sorted(free),
         fixed_lot_ids=sorted(fixed),
         fixed_reasons=[
-            f
+            kept_pins[f.lot_id] if f.reason_code == "dispatch_executed" else f
             for f in held_reasons
             if f.lot_id in ctx.held
-            or (f.reason_code == "dispatch_executed" and f.lot_id in ctx.lot_ids)
+            or (f.reason_code == "dispatch_executed" and f.lot_id in kept_pins)
         ],
         occurred_at=occurred_at,
         alternatives=alternatives,

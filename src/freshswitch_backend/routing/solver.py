@@ -67,16 +67,32 @@ def _floor_min(dt: datetime) -> datetime:
 def _release_locked(req: PickupRequest) -> PickupRequest:
     turnaround = timedelta(minutes=req.service_minutes)
     free_at: dict[str, datetime] = {}
-    for route in [*req.locked_routes, *req.blocking_routes, *req.reserved_routes]:
-        back = route.port_eta + turnaround
-        free_at[route.truck_id] = max(back, free_at.get(route.truck_id, back))
+    until: dict[str, datetime] = {}
+
+    def after(truck_id: str, at: datetime) -> None:
+        free_at[truck_id] = max(at, free_at.get(truck_id, at))
+
+    for route in req.locked_routes:
+        after(route.truck_id, route.port_eta + turnaround)
+    for route in [*req.blocking_routes, *req.reserved_routes]:
+        leave, back = route.earliest_departure - turnaround, route.port_eta + turnaround
+        if leave >= req.deadline:
+            continue
+        if back >= req.deadline:
+            until[route.truck_id] = min(leave, until.get(route.truck_id, leave))
+        else:
+            after(route.truck_id, back)
     trucks = [
         t.model_copy(
             update={
                 "available_from": max(
                     [x for x in (t.available_from, free_at.get(t.id)) if x is not None],
                     default=None,
-                )
+                ),
+                "available_until": min(
+                    [x for x in (t.available_until, until.get(t.id)) if x is not None],
+                    default=None,
+                ),
             }
         )
         for t in req.trucks
@@ -153,9 +169,13 @@ def solve_pickup(request: PickupRequest, time_limit_s: float = 5.0) -> PickupPla
     blocked = _blocked_intervals(req, t0, to_min)
     gate_mode: GateMode = "none"
     truck_start = [_truck_start(t.available_from, start_min, to_min) for t in req.trucks]
+    truck_end = [
+        min(horizon, to_min(t.available_until)) if t.available_until else horizon
+        for t in req.trucks
+    ]
 
     if windows and req.trucks:
-        args = (req, windows, km, travel, service, truck_start, horizon, time_limit_s)
+        args = (req, windows, km, travel, service, (truck_start, truck_end), horizon, time_limit_s)
         outcome = _run(*args, blocked) if blocked else None
         if blocked:
             gate_mode = "avoid"
@@ -183,7 +203,7 @@ def solve_pickup(request: PickupRequest, time_limit_s: float = 5.0) -> PickupPla
                         travel,
                         service,
                         truck_start[t],
-                        deadline,
+                        min(deadline, truck_end[t]),
                         to_dt,
                         blocked,
                     )
@@ -268,11 +288,12 @@ def _run(
     km: list[list[float]],
     travel: list[list[int]],
     service: list[int],
-    truck_start: list[int],
+    availability: tuple[list[int], list[int]],
     horizon: int,
     time_limit_s: float,
     blocked: list[Interval],
 ) -> tuple[list[list[list[int]]], list[str]] | None:
+    truck_start, truck_end = availability
     active = sorted(windows)
     nodes = [0] + active
     m = len(nodes)
@@ -322,19 +343,35 @@ def _run(
         index = manager.NodeToIndex(pos)
         time_dim.CumulVar(index).SetRange(*windows[node])
         routing.AddDisjunction([index], DROP_PENALTY)
-    for v in range(vehicles):
-        begin = min(truck_start[v % n_trucks], horizon)
+    usable = [
+        v
+        for v in range(vehicles)
+        if truck_start[v % n_trucks] + (v // n_trucks) * req.service_minutes
+        <= truck_end[v % n_trucks]
+    ]
+    if not usable:
+        return None
+    for v in sorted(set(range(vehicles)) - set(usable)):
+        for pos in range(1, m):
+            routing.VehicleVar(manager.NodeToIndex(pos)).RemoveValue(v)
+    for v in usable:
+        begin, end = truck_start[v % n_trucks], truck_end[v % n_trucks]
         time_dim.CumulVar(routing.Start(v)).SetRange(begin, horizon)
         time_dim.CumulVar(routing.End(v)).SetRange(begin, horizon)
         for lo, hi, _ in blocked:
             lo, hi = max(lo, begin), min(hi - 1, horizon)
             if lo <= hi:
                 time_dim.CumulVar(routing.End(v)).RemoveInterval(lo, hi)
-    for v in range(n_trucks, vehicles):
-        routing.solver().Add(
-            time_dim.CumulVar(routing.End(v - n_trucks)) + req.service_minutes
-            <= time_dim.CumulVar(routing.Start(v))
-        )
+        if end < horizon:
+            routing.solver().Add(
+                time_dim.CumulVar(routing.End(v))
+                <= end + (horizon - end) * (1 - routing.ActiveVehicleVar(v))
+            )
+        if v >= n_trucks:
+            routing.solver().Add(
+                time_dim.CumulVar(routing.End(v - n_trucks)) + req.service_minutes
+                <= time_dim.CumulVar(routing.Start(v))
+            )
 
     groups = sorted({req.stops[node - 1].cargo_group for node in active} - {None})
     type_of = {g: i for i, g in enumerate(groups)}

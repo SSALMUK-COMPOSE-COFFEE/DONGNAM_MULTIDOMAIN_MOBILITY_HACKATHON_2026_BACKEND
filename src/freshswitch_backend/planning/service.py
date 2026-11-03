@@ -62,12 +62,15 @@ def _effective_scenario(scenario: Scenario, plan: Plan) -> Scenario:
     )
 
 
-def _pickup_request(scenario: Scenario, lot_ids: list[str], voyage_id: str) -> PickupRequest:
+def _pickup_request(
+    scenario: Scenario, lot_ids: list[str], voyage_id: str, placed: Mapping[str, str]
+) -> PickupRequest:
     p = scenario.cost_params
     return build_pickup_request(
         scenario,
         lot_ids,
         voyage_id,
+        placed=placed,
         cost_per_km=p.reefer_truck_cost_per_km_krw.value,
         road_factor=p.road_distance_factor.value,
         truck_fixed_cost=p.reefer_truck_fixed_per_route_krw.value,
@@ -86,6 +89,7 @@ def build_routes(
     for a in plan.assignments:
         if a.mode == "sea" and a.voyage_id:
             by_voyage[a.voyage_id].append(a.lot_id)
+    placed = {lid: voyage_id for voyage_id, ids in by_voyage.items() for lid in ids}
     order = {v.id: i for i, v in enumerate(scenario.voyages)}
     cutoff = {v.id: v.cy_cutoff for v in scenario.voyages}
     busy_until: dict[str, datetime] = {}
@@ -93,7 +97,7 @@ def build_routes(
     for voyage_id, lot_ids in sorted(
         by_voyage.items(), key=lambda kv: (cutoff[kv[0]], order[kv[0]])
     ):
-        request = _pickup_request(effective, lot_ids, voyage_id)
+        request = _pickup_request(effective, lot_ids, voyage_id, placed)
         request = request.model_copy(
             update={
                 "trucks": [

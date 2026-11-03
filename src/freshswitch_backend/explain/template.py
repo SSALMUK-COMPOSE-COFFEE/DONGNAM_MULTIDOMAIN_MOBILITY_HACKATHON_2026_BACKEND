@@ -64,6 +64,7 @@ def _operator_summary(ctx: ExplainContext) -> str:
         parts.append(line + (f" 적재: {fills}." if fills else ""))
     else:
         parts.append("실행 가능한 대안이 없습니다.")
+    parts.extend(f"주의: {warning.rstrip('.')}." for warning in ctx.warnings)
     infeasible = [alt for alt in ctx.alternatives if not alt.feasible]
     for alt in infeasible:
         reason = alt.reason or "사유 미기재"
