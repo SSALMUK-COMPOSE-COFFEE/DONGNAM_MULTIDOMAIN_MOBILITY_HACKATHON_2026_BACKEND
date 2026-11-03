@@ -1,8 +1,9 @@
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
+from freshswitch_backend.domain.ids import ID_MAX_LENGTH, EntityId
 from freshswitch_backend.domain.models import Lot, Mode
 from freshswitch_backend.lots.models import RegisteredLot
 from freshswitch_backend.replan.models import AddLotEvent
@@ -18,8 +19,13 @@ class IntakeRequest(BaseModel):
     sell_window: Literal["normal", "short"] = "normal"
     scenario_id: str = "default"
     plan_id: str | None = None
-    lot_id: str | None = Field(default=None, max_length=120)
+    lot_id: EntityId | None = Field(default=None, max_length=ID_MAX_LENGTH)
     save: bool = False
+
+    @field_validator("lot_id", mode="before")
+    @classmethod
+    def _blank_lot_id(cls, value: object) -> object:
+        return None if value == "" else value
 
 
 class FieldError(BaseModel):

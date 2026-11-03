@@ -3,6 +3,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from freshswitch_backend.domain.ids import ID_MAX_LENGTH, EntityId
 from freshswitch_backend.domain.models import KstDatetime, Quantity
 from freshswitch_backend.routing.models import GateStatus
 
@@ -26,7 +27,7 @@ PowerStage = Literal["trucking", "gate", "plug"]
 
 
 class ReadingIn(BaseModel):
-    device_id: str = Field(min_length=1, max_length=100)
+    device_id: EntityId = Field(min_length=1, max_length=ID_MAX_LENGTH)
     container_id: str | None = Field(default=None, min_length=1, max_length=100)
     plan_id: str | None = None
     ts: KstDatetime | None = None
@@ -48,7 +49,7 @@ class Reading(BaseModel):
 
 
 class BindingRequest(BaseModel):
-    device_id: str = Field(min_length=1, max_length=100)
+    device_id: EntityId = Field(min_length=1, max_length=ID_MAX_LENGTH)
     container_id: str = Field(min_length=1, max_length=100)
     plan_id: str | None = None
     stage: Stage | None = None
@@ -273,7 +274,7 @@ class SimulationRequest(BaseModel):
     preset: SimulationPreset = "power_cut_restore"
     container_id: str = "CA-01"
     plan_id: str | None = None
-    device_id: str = "sim-01"
+    device_id: EntityId = "sim-01"
     stage: Stage = "terminal"
     start: KstDatetime | None = None
     interval_seconds: float = Field(default=0, ge=0, le=10)

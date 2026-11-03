@@ -8,6 +8,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 
 from freshswitch_backend.coldchain.models import Binding
+from freshswitch_backend.domain.ids import check_id
 from freshswitch_backend.persistence import Database, database
 from freshswitch_backend.persistence.tables import DEMO_ORG, BindingRow, DeviceRow
 
@@ -48,7 +49,7 @@ class DeviceRequest(BaseModel):
             raise ValueError(
                 f"'{SIMULATOR_PREFIX}'로 시작하는 id는 시뮬레이터용이라 등록할 수 없습니다"
             )
-        return trimmed
+        return check_id(trimmed)
 
 
 class Device(BaseModel):
