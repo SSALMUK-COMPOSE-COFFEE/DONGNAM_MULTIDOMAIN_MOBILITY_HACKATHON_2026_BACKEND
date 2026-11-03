@@ -19,12 +19,22 @@ router = APIRouter(prefix="/lots", tags=["lots"])
 OrgId = Annotated[str, Depends(current_org_id)]
 LOCKED_STATUSES = frozenset({"planned", "shipped"})
 LOT_NOT_FOUND = "등록된 로트를 찾을 수 없습니다"
-LOT_LOCKED = "계획에 들어간 출하는 수정·삭제할 수 없습니다"
+LOT_LOCKED = (
+    "계획에 들어간 출하는 직접 수정·삭제할 수 없습니다. 감량·취소·항공 전환은 "
+    "계획 상세에서 변경 요청으로 보내 주세요"
+)
+LOT_SHIPPED = "이미 선적된 출하는 수정·삭제할 수 없습니다"
 LOCKED_STATUS_FORBIDDEN = "화주는 등록·취소 상태로만 바꿀 수 있습니다"
 
 
 class LotLocked(Exception):
-    pass
+    def __init__(self, status: str) -> None:
+        super().__init__(status)
+        self.status = status
+
+
+def _locked_detail(status: str | None) -> str:
+    return LOT_SHIPPED if status == "shipped" else LOT_LOCKED
 
 
 def _lot(lot_id: str, org_id: str) -> RegisteredLot:
@@ -151,13 +161,13 @@ def update_locked_lot(
 
     def change(lot: RegisteredLot) -> dict[str, Any]:
         if lot.status in LOCKED_STATUSES:
-            raise LotLocked(lot.id)
+            raise LotLocked(lot.status)
         return _validate_patch(lot, patch, scope, recompute_sell_by=True)
 
     try:
         updated = lot_store.update(lot_id, change, org_id=org_id)
     except LotLocked as exc:
-        raise HTTPException(status_code=409, detail=LOT_LOCKED) from exc
+        raise HTTPException(status_code=409, detail=_locked_detail(exc.status)) from exc
     except IntakeError as exc:
         raise intake_error(exc) from exc
     if updated is None:
@@ -173,9 +183,9 @@ def delete_unlocked_lot(lot_id: str, org_id: str) -> None:
         ).rowcount
         if removed:
             return
-        exists = db.scalar(select(LotRow.id).where(owned))
-    if exists is not None:
-        raise HTTPException(status_code=409, detail=LOT_LOCKED)
+        status = db.scalar(select(LotRow.status).where(owned))
+    if status is not None:
+        raise HTTPException(status_code=409, detail=_locked_detail(status))
     raise HTTPException(status_code=404, detail=LOT_NOT_FOUND)
 
 

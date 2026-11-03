@@ -155,7 +155,10 @@ def test_planned_lots_are_locked(
     _platform_plan(platform_client, saas_login)
     patch = shipper_client.patch("/api/saas/shipper/lots/lot-jinju-sb-1", json={"pallets": 2})
     assert patch.status_code == 409
-    assert shipper_client.delete("/api/saas/shipper/lots/lot-jinju-sb-1").status_code == 409
+    assert "변경 요청" in patch.json()["detail"]
+    removed = shipper_client.delete("/api/saas/shipper/lots/lot-jinju-sb-1")
+    assert removed.status_code == 409
+    assert removed.json()["detail"] == patch.json()["detail"]
     again = platform_client.post("/api/saas/platform/plans", json={"lot_ids": ["lot-jinju-sb-1"]})
     assert again.status_code == 409
     empty = platform_client.post("/api/saas/platform/plans", json={"lot_ids": []})
