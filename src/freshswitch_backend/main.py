@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse
 
 from freshswitch_backend.api.router import api_router
 from freshswitch_backend.config import get_settings
+from freshswitch_backend.observability import RequestAuditMiddleware
 from freshswitch_backend.replan import ReplanError
 
 
@@ -24,7 +25,9 @@ def create_app() -> FastAPI:
         allow_origins=get_settings().cors_origins,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["X-Request-ID"],
     )
+    app.add_middleware(RequestAuditMiddleware)
     app.include_router(api_router)
     app.add_exception_handler(ReplanError, _replan_error)
     return app
