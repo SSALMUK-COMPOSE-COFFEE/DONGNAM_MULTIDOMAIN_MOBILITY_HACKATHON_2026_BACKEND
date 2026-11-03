@@ -1,16 +1,28 @@
+from datetime import UTC, datetime
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
-from freshswitch_backend.api.auth import Principal, require_role
+from freshswitch_backend.api.auth import AuthPrincipal, Principal, require_role
 from freshswitch_backend.persistence import database
-from freshswitch_backend.persistence.orgs import same_sandbox
-from freshswitch_backend.persistence.tables import OrganizationRow, PlanForwarderRow, PlanRow
+from freshswitch_backend.persistence.orgs import create_invitation, same_sandbox
+from freshswitch_backend.persistence.tables import (
+    MembershipRow,
+    OrganizationRow,
+    OrgInvitationRow,
+    PlanForwarderRow,
+    PlanRow,
+    UserRow,
+)
 
 ListedOrgType = Literal["shipper", "forwarder"]
+MemberRole = Literal["admin", "member"]
+InvitationStatus = Literal["pending", "used", "expired"]
+ADMIN_ONLY = "조직 관리자만 할 수 있습니다"
+SANDBOX_INVITE = "데모(sandbox) 조직에는 초대할 수 없습니다"
 LISTED_TYPES: tuple[str, ...] = ("shipper", "forwarder")
 
 router = APIRouter(prefix="/saas", tags=["saas-orgs"])
@@ -99,4 +111,127 @@ def unassign_forwarder(plan_id: str, principal: PlatformPrincipal) -> Response:
     with database.begin() as db:
         _lock_own_plan(db, plan_id, principal.org_id)
         db.execute(delete(PlanForwarderRow).where(PlanForwarderRow.plan_id == plan_id))
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+class OrgMember(BaseModel):
+    user_id: str
+    name: str
+    email: str
+    role: str
+    joined_at: datetime
+
+
+class InvitationCreate(BaseModel):
+    role: MemberRole = "member"
+
+
+class MemberRef(BaseModel):
+    user_id: str
+    name: str
+
+
+class Invitation(BaseModel):
+    invitation_id: str
+    org_id: str
+    role: str
+    status: InvitationStatus
+    created_at: datetime
+    expires_at: datetime
+    used_at: datetime | None = None
+    used_by: MemberRef | None = None
+
+
+class InvitationCreated(Invitation):
+    code: str
+    org_name: str
+
+
+def _require_admin(principal: Principal) -> None:
+    if principal.role != "admin":
+        raise HTTPException(status_code=403, detail=ADMIN_ONLY)
+
+
+def _status(row: OrgInvitationRow, now: datetime) -> InvitationStatus:
+    if row.used_at is not None:
+        return "used"
+    return "expired" if row.expires_at <= now else "pending"
+
+
+def _invitation(row: OrgInvitationRow, used_name: str | None, now: datetime) -> Invitation:
+    used_by = MemberRef(user_id=row.used_by, name=used_name or "") if row.used_by else None
+    return Invitation(
+        invitation_id=row.id,
+        org_id=row.org_id,
+        role=row.role,
+        status=_status(row, now),
+        created_at=row.created_at,
+        expires_at=row.expires_at,
+        used_at=row.used_at,
+        used_by=used_by,
+    )
+
+
+@router.get("/org/members")
+def list_members(principal: AuthPrincipal) -> list[OrgMember]:
+    with database.begin() as db:
+        rows = db.execute(
+            select(
+                UserRow.id,
+                UserRow.name,
+                UserRow.email,
+                MembershipRow.role,
+                MembershipRow.created_at,
+            )
+            .join(MembershipRow, MembershipRow.user_id == UserRow.id)
+            .where(MembershipRow.org_id == principal.org_id)
+            .order_by(MembershipRow.created_at, UserRow.id)
+        ).all()
+    return [
+        OrgMember(user_id=uid, name=name, email=email, role=role, joined_at=joined)
+        for uid, name, email, role, joined in rows
+    ]
+
+
+@router.post("/org/invitations", status_code=status.HTTP_201_CREATED)
+def create_org_invitation(body: InvitationCreate, principal: AuthPrincipal) -> InvitationCreated:
+    _require_admin(principal)
+    now = datetime.now(UTC)
+    with database.begin() as db:
+        org = db.get(OrganizationRow, principal.org_id)
+        if org is None or org.sandbox or org.type == "demo":
+            raise HTTPException(status_code=403, detail=SANDBOX_INVITE)
+        row, code = create_invitation(db, org.id, body.role, principal.user_id, now)
+        return InvitationCreated(
+            **_invitation(row, None, now).model_dump(), code=code, org_name=org.name
+        )
+
+
+@router.get("/org/invitations")
+def list_org_invitations(principal: AuthPrincipal) -> list[Invitation]:
+    _require_admin(principal)
+    now = datetime.now(UTC)
+    used = aliased(UserRow)
+    with database.begin() as db:
+        rows = db.execute(
+            select(OrgInvitationRow, used.name)
+            .outerjoin(used, used.id == OrgInvitationRow.used_by)
+            .where(OrgInvitationRow.org_id == principal.org_id)
+            .order_by(OrgInvitationRow.created_at.desc(), OrgInvitationRow.id)
+        ).all()
+    return [_invitation(row, name, now) for row, name in rows]
+
+
+@router.delete("/org/invitations/{invitation_id}", status_code=status.HTTP_204_NO_CONTENT)
+def revoke_org_invitation(invitation_id: str, principal: AuthPrincipal) -> Response:
+    _require_admin(principal)
+    with database.begin() as db:
+        deleted = db.execute(
+            delete(OrgInvitationRow).where(
+                OrgInvitationRow.id == invitation_id,
+                OrgInvitationRow.org_id == principal.org_id,
+            )
+        )
+    if not deleted.rowcount:
+        raise HTTPException(status_code=404, detail="초대 코드를 찾을 수 없습니다")
     return Response(status_code=status.HTTP_204_NO_CONTENT)

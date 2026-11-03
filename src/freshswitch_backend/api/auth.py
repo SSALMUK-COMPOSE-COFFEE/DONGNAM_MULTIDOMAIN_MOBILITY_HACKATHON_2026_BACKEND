@@ -16,13 +16,14 @@ from ipaddress import IPv4Network, IPv6Network, ip_address, ip_network
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from freshswitch_backend.config import Settings, get_settings
 from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.orgs import AlreadyMember, InvalidInvitation, redeem_invitation
 from freshswitch_backend.persistence.passwords import hash_password, verify_password
 from freshswitch_backend.persistence.seed import demo_orgs, is_demo_email
 from freshswitch_backend.persistence.tables import (
@@ -50,6 +51,7 @@ OrgType = Literal["platform", "shipper", "forwarder"]
 SignupOrgType = Literal["shipper", "forwarder"]
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+invitation_router = APIRouter(prefix="/saas/invitations", tags=["saas-orgs"])
 
 
 @dataclass(frozen=True)
@@ -141,8 +143,9 @@ class SignupRequest(BaseModel):
     email: str = Field(max_length=320)
     password: str = Field(min_length=8, max_length=128)
     name: str = Field(min_length=1, max_length=200)
-    org_name: str = Field(min_length=1, max_length=200)
-    org_type: SignupOrgType
+    org_name: str | None = Field(default=None, min_length=1, max_length=200)
+    org_type: SignupOrgType | None = None
+    invite_code: str | None = Field(default=None, min_length=1, max_length=100)
 
     @field_validator("email")
     @classmethod
@@ -151,11 +154,23 @@ class SignupRequest(BaseModel):
 
     @field_validator("name", "org_name")
     @classmethod
-    def _text(cls, value: str) -> str:
+    def _text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         trimmed = value.strip()
         if not trimmed:
             raise ValueError("빈 값은 사용할 수 없습니다")
         return trimmed
+
+    @model_validator(mode="after")
+    def _org_or_invite(self) -> "SignupRequest":
+        if self.invite_code is None and (self.org_name is None or self.org_type is None):
+            raise ValueError("초대 코드가 없으면 org_name과 org_type이 필요합니다")
+        return self
+
+
+class InvitationAccept(BaseModel):
+    code: str = Field(min_length=1, max_length=100)
 
 
 class LoginRequest(BaseModel):
@@ -469,7 +484,6 @@ def signup(body: SignupRequest, request: Request, response: Response) -> Me:
             exists = db.scalar(select(UserRow.id).where(func.lower(UserRow.email) == body.email))
             if exists is not None:
                 raise HTTPException(status_code=409, detail="이미 가입된 이메일입니다")
-            org_id = f"{body.org_type}-{uuid.uuid4().hex[:12]}"
             user = UserRow(
                 id=f"user-{uuid.uuid4().hex}",
                 email=body.email,
@@ -477,6 +491,17 @@ def signup(body: SignupRequest, request: Request, response: Response) -> Me:
                 name=body.name,
                 is_demo=False,
             )
+            if body.invite_code is not None:
+                db.add(user)
+                db.flush()
+                try:
+                    invited = redeem_invitation(db, body.invite_code, user.id, _now())
+                except InvalidInvitation as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                return _start_session(db, request, response, user, invited.org_id)
+            if body.org_type is None or body.org_name is None:
+                raise HTTPException(status_code=422, detail="조직 이름과 유형이 필요합니다")
+            org_id = f"{body.org_type}-{uuid.uuid4().hex[:12]}"
             db.add(OrganizationRow(id=org_id, type=body.org_type, name=body.org_name))
             db.add(user)
             db.flush()
@@ -541,6 +566,29 @@ def switch_active_org(body: ActiveOrgRequest, request: Request, _: AuthPrincipal
         memberships = _memberships(db, user.id)
         active = _choose(memberships, body.org_id, None)
         session.active_org_id = active.org_id
+        return _me(user, memberships, active)
+
+
+@invitation_router.post("/accept")
+def accept_invitation(body: InvitationAccept, request: Request, principal: AuthPrincipal) -> Me:
+    token = request.cookies.get(app_settings(request).session_cookie_name) or ""
+    with database.begin() as db:
+        user = db.get(UserRow, principal.user_id)
+        if user is None:
+            raise HTTPException(status_code=401, detail="로그인이 필요합니다")
+        if user.is_demo or is_demo_email(user.email):
+            raise HTTPException(status_code=403, detail="데모 계정은 초대 코드를 쓸 수 없습니다")
+        try:
+            invited = redeem_invitation(db, body.code, user.id, _now())
+        except InvalidInvitation as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except AlreadyMember as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        session = db.get(AuthSessionRow, _token_hash(token))
+        if session is not None:
+            session.active_org_id = invited.org_id
+        memberships = _memberships(db, user.id)
+        active = next(m for m in memberships if m.org_id == invited.org_id)
         return _me(user, memberships, active)
 
 

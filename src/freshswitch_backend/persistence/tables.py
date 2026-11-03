@@ -115,6 +115,23 @@ class AuthSessionRow(Base):
     last_seen_at: Mapped[datetime | None]
 
 
+class OrgInvitationRow(Base):
+    __tablename__ = "org_invitations"
+    __table_args__ = (
+        CheckConstraint("role IN ('admin', 'member')", name="org_invitations_role_check"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    org_id: Mapped[str] = mapped_column(String(64), _org_fk("CASCADE"), index=True)
+    code_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    role: Mapped[str] = mapped_column(String(20), server_default="member")
+    created_by: Mapped[str | None] = mapped_column(String(64), _user_fk("SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    expires_at: Mapped[datetime]
+    used_by: Mapped[str | None] = mapped_column(String(64), _user_fk("SET NULL"))
+    used_at: Mapped[datetime | None]
+
+
 class PackhouseRow(Base):
     __tablename__ = "packhouses"
 

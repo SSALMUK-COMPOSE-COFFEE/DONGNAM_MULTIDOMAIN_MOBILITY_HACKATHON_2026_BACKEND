@@ -1,3 +1,7 @@
+import hashlib
+import secrets
+import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -5,9 +9,25 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from freshswitch_backend.persistence.database import Database, database
-from freshswitch_backend.persistence.tables import DEMO_ORG, OrganizationRow
+from freshswitch_backend.persistence.tables import (
+    DEMO_ORG,
+    MembershipRow,
+    OrganizationRow,
+    OrgInvitationRow,
+)
 
 DEMO_ORG_NAME = "시연"
+INVITATION_TTL = timedelta(days=7)
+INVALID_INVITATION = "초대 코드가 올바르지 않거나 만료되었습니다"
+ALREADY_MEMBER = "이미 소속된 조직입니다"
+
+
+class InvalidInvitation(ValueError):
+    pass
+
+
+class AlreadyMember(ValueError):
+    pass
 
 
 def insert_demo_org(db: Session) -> None:
@@ -34,3 +54,49 @@ def same_sandbox(column: Any, org_id: str) -> Any:
 def org_sandbox(org_id: str, target: Database | None = None) -> bool:
     with (target or database).begin() as db:
         return bool(db.scalar(select(OrganizationRow.sandbox).where(OrganizationRow.id == org_id)))
+
+
+def invitation_code_hash(code: str) -> str:
+    return hashlib.sha256(code.strip().encode("utf-8")).hexdigest()
+
+
+def create_invitation(
+    db: Session, org_id: str, role: str, created_by: str | None, now: datetime | None = None
+) -> tuple[OrgInvitationRow, str]:
+    code = secrets.token_urlsafe(12)
+    issued = now or datetime.now(UTC)
+    row = OrgInvitationRow(
+        id=f"inv-{uuid.uuid4().hex[:16]}",
+        org_id=org_id,
+        code_hash=invitation_code_hash(code),
+        role=role,
+        created_by=created_by,
+        created_at=issued,
+        expires_at=issued + INVITATION_TTL,
+    )
+    db.add(row)
+    db.flush()
+    return row, code
+
+
+def redeem_invitation(
+    db: Session, code: str, user_id: str, now: datetime | None = None
+) -> OrgInvitationRow:
+    moment = now or datetime.now(UTC)
+    invitation = db.scalar(
+        select(OrgInvitationRow)
+        .where(OrgInvitationRow.code_hash == invitation_code_hash(code))
+        .with_for_update()
+    )
+    if invitation is None or invitation.used_at is not None or invitation.expires_at <= moment:
+        raise InvalidInvitation(INVALID_INVITATION)
+    org = db.get(OrganizationRow, invitation.org_id)
+    if org is None or org.sandbox or org.type == "demo":
+        raise InvalidInvitation(INVALID_INVITATION)
+    if db.get(MembershipRow, (user_id, org.id)) is not None:
+        raise AlreadyMember(ALREADY_MEMBER)
+    db.add(MembershipRow(user_id=user_id, org_id=org.id, role=invitation.role, created_at=moment))
+    invitation.used_by = user_id
+    invitation.used_at = moment
+    db.flush()
+    return invitation
