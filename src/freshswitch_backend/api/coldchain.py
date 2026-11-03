@@ -64,8 +64,8 @@ def ingest(body: list[ReadingIn] | ReadingIn) -> IngestResult:
 
 
 @router.get("/containers")
-def list_containers() -> list[TwinSummary]:
-    return coldchain_store.summaries()
+def list_containers(plan_id: str | None = None) -> list[TwinSummary]:
+    return coldchain_store.summaries(plan_id)
 
 
 @router.get("/containers/{container_id}")
@@ -81,8 +81,11 @@ def read_twin(
 
 
 @router.delete("/containers/{container_id}", status_code=status.HTTP_204_NO_CONTENT)
-def reset_container(container_id: str) -> None:
-    coldchain_store.reset_container(container_id)
+def reset_container(container_id: str, plan_id: str | None = None) -> None:
+    try:
+        coldchain_store.reset_container(container_id, plan_id)
+    except ColdchainError as exc:
+        raise _http(exc) from exc
 
 
 @router.get("/containers/{container_id}/settlement-preview")
@@ -98,8 +101,9 @@ def read_alerts(
     since: int = Query(0, ge=0),
     container_id: str | None = None,
     limit: int = Query(100, ge=1, le=1000),
+    plan_id: str | None = None,
 ) -> AlertFeed:
-    return coldchain_store.alerts(since, container_id, limit)
+    return coldchain_store.alerts(since, container_id, limit, plan_id)
 
 
 @router.get("/alerts/stream")
@@ -107,12 +111,13 @@ async def stream_alerts(
     since: int = Query(0, ge=0),
     container_id: str | None = None,
     timeout: float = Query(300, ge=0, le=3600),
+    plan_id: str | None = None,
 ) -> StreamingResponse:
     async def events() -> AsyncIterator[str]:
         cursor = since
         deadline = time.monotonic() + timeout
         while True:
-            feed = coldchain_store.alerts(cursor, container_id, 1000)
+            feed = coldchain_store.alerts(cursor, container_id, 1000, plan_id)
             for alert in feed.alerts:
                 data = json.dumps(alert.model_dump(mode="json"), ensure_ascii=False)
                 yield f"id: {alert.seq}\nevent: alert\ndata: {data}\n\n"

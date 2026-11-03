@@ -92,7 +92,7 @@ class ColdchainStore:
     def __init__(self, params: ColdchainParams | None = None) -> None:
         self.params = params or ColdchainParams()
         self._bindings: dict[str, Binding] = {}
-        self._records: OrderedDict[str, ContainerRecord] = OrderedDict()
+        self._records: OrderedDict[tuple[str | None, str], ContainerRecord] = OrderedDict()
         self._feed: list[Alert] = []
         self._seq = 0
         self._runs: dict[str, _Run] = {}
@@ -124,11 +124,12 @@ class ColdchainStore:
         }:
             raise ColdchainError(f"계획에 없는 컨테이너입니다: {container_id}")
 
-    def _record(self, container_id: str) -> ContainerRecord:
-        record = self._records.get(container_id)
+    def _record(self, container_id: str, plan_id: str | None = None) -> ContainerRecord:
+        key = (plan_id, container_id)
+        record = self._records.get(key)
         if record is None:
-            record = ContainerRecord(container_id=container_id)
-            self._records[container_id] = record
+            record = ContainerRecord(container_id=container_id, plan_id=plan_id)
+            self._records[key] = record
         return record
 
     def _trim(self) -> None:
@@ -136,19 +137,18 @@ class ColdchainStore:
             self._records.popitem(last=False)
 
     def bind(self, body: BindingRequest) -> Binding:
-        self.require_plan(body.plan_id, body.container_id)
         with self._lock:
+            plan_id = self._resolve_plan(body.container_id, body.plan_id)
+            self.require_plan(plan_id, body.container_id)
             binding = Binding(
                 device_id=body.device_id,
                 container_id=body.container_id,
-                plan_id=body.plan_id,
+                plan_id=plan_id,
                 stage=body.stage,
                 bound_at=self.clock(),
             )
             self._bindings[body.device_id] = binding
-            record = self._record(body.container_id)
-            if body.plan_id:
-                record.plan_id = body.plan_id
+            record = self._record(body.container_id, plan_id)
             if body.stage:
                 record.stage = body.stage
             self._trim()
@@ -157,6 +157,14 @@ class ColdchainStore:
     def bindings(self) -> list[Binding]:
         with self._lock:
             return sorted(self._bindings.values(), key=lambda b: b.device_id)
+
+    def _resolve_plan(self, container_id: str, plan_id: str | None) -> str | None:
+        if plan_id is not None:
+            return plan_id
+        matches = [r for r in self._records.values() if r.container_id == container_id]
+        if len(matches) > 1:
+            raise ColdchainError("동일 컨테이너의 계획이 여러 개입니다. plan_id를 지정하세요")
+        return matches[0].plan_id if matches else None
 
     def _context(self, record: ContainerRecord, plan_id: str | None = None) -> TwinContext:
         plan_id = plan_id or record.plan_id
@@ -201,7 +209,12 @@ class ColdchainStore:
             now = self.clock()
             action = alert.action.model_copy(update={"created_at": now}) if alert.action else None
             stored = alert.model_copy(
-                update={"seq": self._seq, "created_at": now, "action": action}
+                update={
+                    "seq": self._seq,
+                    "created_at": now,
+                    "action": action,
+                    "plan_id": record.plan_id,
+                }
             )
             record.alerts[alert.key] = stored
             self._feed.append(stored)
@@ -232,7 +245,7 @@ class ColdchainStore:
         accepted = 0
         duplicates = 0
         rejected: list[IngestRejected] = []
-        touched: list[str] = []
+        touched: list[tuple[str | None, str]] = []
         new_alerts: list[Alert] = []
         with self._lock:
             for index, item in enumerate(items):
@@ -251,15 +264,14 @@ class ColdchainStore:
                 if plan_id is None and binding and binding.container_id == container_id:
                     plan_id = binding.plan_id
                 try:
+                    plan_id = self._resolve_plan(container_id, plan_id)
                     self.require_plan(plan_id, container_id)
                 except (NotFound, ColdchainError) as exc:
                     rejected.append(
                         IngestRejected(index=index, device_id=item.device_id, reason=str(exc))
                     )
                     continue
-                record = self._record(container_id)
-                if plan_id:
-                    record.plan_id = plan_id
+                record = self._record(container_id, plan_id)
                 stage = item.stage or (binding.stage if binding else None)
                 if stage:
                     record.stage = stage
@@ -289,11 +301,12 @@ class ColdchainStore:
                 record.readings[key] = reading
                 new_alerts.extend(self._compact(record))
                 accepted += 1
-                if container_id not in touched:
-                    touched.append(container_id)
+                record_key = (plan_id, container_id)
+                if record_key not in touched:
+                    touched.append(record_key)
             summaries: list[TwinSummary] = []
-            for container_id in touched:
-                record = self._records[container_id]
+            for record_key in touched:
+                record = self._records[record_key]
                 ctx, ev = self._evaluate(record)
                 new_alerts.extend(self._merge(record, ev))
                 summaries.append(self._summary(record, ctx, ev))
@@ -306,16 +319,23 @@ class ColdchainStore:
             new_alerts=new_alerts,
         )
 
-    def get_record(self, container_id: str) -> ContainerRecord:
-        record = self._records.get(container_id)
-        if record is None:
-            raise NotFound(f"센서 기록이 없는 컨테이너입니다: {container_id}")
-        return record
+    def get_record(self, container_id: str, plan_id: str | None = None) -> ContainerRecord:
+        with self._lock:
+            matches = [
+                r
+                for r in self._records.values()
+                if r.container_id == container_id and (plan_id is None or r.plan_id == plan_id)
+            ]
+            if not matches:
+                raise NotFound(f"센서 기록이 없는 컨테이너입니다: {container_id}")
+            if len(matches) > 1:
+                raise ColdchainError("동일 컨테이너의 계획이 여러 개입니다. plan_id를 지정하세요")
+            return matches[0]
 
     def state(self, container_id: str, plan_id: str | None = None, points: int = 720) -> TwinState:
-        self.require_plan(plan_id)
+        self.require_plan(plan_id, container_id)
         with self._lock:
-            record = self.get_record(container_id)
+            record = self.get_record(container_id, plan_id)
             ctx, ev = self._evaluate(record, plan_id)
             alerts = list(record.alerts.values())
             return TwinState(
@@ -338,30 +358,51 @@ class ColdchainStore:
                 params=dict(self.params),
             )
 
-    def summaries(self) -> list[TwinSummary]:
+    def summaries(self, plan_id: str | None = None) -> list[TwinSummary]:
         with self._lock:
             out = []
             for record in self._records.values():
+                if plan_id is not None and record.plan_id != plan_id:
+                    continue
                 ctx, ev = self._evaluate(record)
                 out.append(self._summary(record, ctx, ev))
             return out
 
-    def reset_container(self, container_id: str) -> None:
+    def reset_container(self, container_id: str, plan_id: str | None = None) -> None:
         with self._lock:
-            self._records.pop(container_id, None)
-            self._feed = [a for a in self._feed if a.container_id != container_id]
+            matches = [
+                key
+                for key in self._records
+                if key[1] == container_id and (plan_id is None or key[0] == plan_id)
+            ]
+            if len(matches) > 1:
+                raise ColdchainError("동일 컨테이너의 계획이 여러 개입니다. plan_id를 지정하세요")
+            resolved = matches[0][0] if matches else plan_id
+            for key in matches:
+                self._records.pop(key, None)
+            self._feed = [
+                a
+                for a in self._feed
+                if not (a.container_id == container_id and a.plan_id == resolved)
+            ]
             for run in self._runs.values():
-                if run.info.container_id == container_id:
+                if run.info.container_id == container_id and run.info.plan_id == resolved:
                     run.stop.set()
 
     def alerts(
-        self, since: int = 0, container_id: str | None = None, limit: int = 100
+        self,
+        since: int = 0,
+        container_id: str | None = None,
+        limit: int = 100,
+        plan_id: str | None = None,
     ) -> AlertFeed:
         with self._lock:
             items = [
                 a
                 for a in self._feed
-                if a.seq > since and (container_id is None or a.container_id == container_id)
+                if a.seq > since
+                and (container_id is None or a.container_id == container_id)
+                and (plan_id is None or a.plan_id == plan_id)
             ][:limit]
             next_since = items[-1].seq if items else max(since, 0)
             if not items and since > self._seq:
@@ -371,9 +412,9 @@ class ColdchainStore:
     def settlement_preview(
         self, container_id: str, plan_id: str | None = None
     ) -> SettlementPreview:
-        self.require_plan(plan_id)
+        self.require_plan(plan_id, container_id)
         with self._lock:
-            record = self.get_record(container_id)
+            record = self.get_record(container_id, plan_id)
             plan_id = plan_id or record.plan_id
             session = self._session(plan_id)
             if session is None or plan_id is None:
@@ -421,22 +462,21 @@ class ColdchainStore:
         )
 
     def simulate(self, body: SimulationRequest) -> SimulationRun:
-        self.require_plan(body.plan_id, body.container_id)
         preset = PRESETS[body.preset]
         with self._lock:
+            plan_id = self._resolve_plan(body.container_id, body.plan_id)
+            self.require_plan(plan_id, body.container_id)
             if body.reset:
-                self.reset_container(body.container_id)
-            record = self._record(body.container_id)
+                self.reset_container(body.container_id, plan_id)
+            record = self._record(body.container_id, plan_id)
             record.stage = body.stage
-            if body.plan_id:
-                record.plan_id = body.plan_id
             ctx = self._context(record)
             self._trim()
         readings = preset_readings(
             preset,
             device_id=body.device_id,
             container_id=body.container_id,
-            plan_id=body.plan_id,
+            plan_id=plan_id,
             band_min_c=ctx.band_min_c,
             band_max_c=ctx.band_max_c,
             start=body.start,
@@ -445,7 +485,7 @@ class ColdchainStore:
             run_id=uuid.uuid4().hex[:12],
             preset=body.preset,
             container_id=body.container_id,
-            plan_id=body.plan_id,
+            plan_id=plan_id,
             device_id=body.device_id,
             mode="stream" if body.interval_seconds > 0 else "instant",
             total=len(readings),

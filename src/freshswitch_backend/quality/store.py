@@ -34,7 +34,7 @@ def _load_seed() -> tuple[str, list[SeedObservation]]:
 
 def _container_outage(plan_id: str, container_id: str) -> float | None:
     try:
-        record = coldchain_store.get_record(container_id)
+        record = coldchain_store.get_record(container_id, plan_id)
         if record.plan_id != plan_id:
             return None
         return coldchain_store.state(container_id, plan_id, points=2).outage.cumulative_minutes
