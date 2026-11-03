@@ -188,16 +188,28 @@ def csrf_guard(request: Request) -> None:
         raise HTTPException(status_code=403, detail="요청 출처를 확인할 수 없습니다")
 
 
+def _session_required(settings: Settings, *, stale_cookie: bool) -> HTTPException:
+    headers: dict[str, str] = {}
+    if stale_cookie:
+        cleared = Response()
+        _clear_cookie(cleared, settings)
+        headers["set-cookie"] = cleared.headers["set-cookie"]
+    return HTTPException(status_code=401, detail="로그인이 필요합니다", headers=headers or None)
+
+
 def current_principal(request: Request) -> Principal | None:
-    token = request.cookies.get(app_settings(request).session_cookie_name)
-    if not token:
-        return None
+    settings = app_settings(request)
+    token = request.cookies.get(settings.session_cookie_name)
     requested = request.headers.get(ORG_HEADER) or None
+    if not token:
+        if requested is not None:
+            raise _session_required(settings, stale_cookie=False)
+        return None
     now = _now()
     with database.begin() as db:
         session = db.get(AuthSessionRow, _token_hash(token))
         if session is None or session.expires_at <= now:
-            return None
+            raise _session_required(settings, stale_cookie=True)
         active = _choose(_memberships(db, session.user_id), requested, session.active_org_id)
         if session.active_org_id != active.org_id:
             session.active_org_id = active.org_id

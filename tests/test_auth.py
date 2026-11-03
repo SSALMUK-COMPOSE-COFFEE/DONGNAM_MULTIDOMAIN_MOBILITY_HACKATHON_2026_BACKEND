@@ -185,13 +185,18 @@ def test_relogin_replaces_previous_session(https_client: TestClient) -> None:
         assert len(db.scalars(select(AuthSessionRow)).all()) == 1
 
 
-def test_expired_session_is_anonymous(https_client: TestClient) -> None:
+def test_expired_session_requires_login(https_client: TestClient) -> None:
     _signup(https_client)
     with database.begin() as db:
         db.execute(
             update(AuthSessionRow).values(expires_at=datetime.now(UTC) - timedelta(seconds=1))
         )
-    assert https_client.get("/api/me").status_code == 401
+    response = https_client.get("/api/me")
+    assert response.status_code == 401
+    cleared = _cookie_attrs(response.headers["set-cookie"])
+    assert cleared["name"] == "fs_session"
+    assert cleared["max-age"] == "0"
+    assert cleared["path"] == "/"
 
 
 def test_demo_login_requires_seed(https_client: TestClient) -> None:
@@ -332,6 +337,57 @@ def test_principal_dependencies(demo_tenants) -> None:
     probe.post("/api/auth/demo-login", json={"org_type": "platform"}, headers=CSRF)
     assert probe.get("/api/probe/platform").status_code == 200
     assert probe.get("/api/probe/carriers").status_code == 403
+
+
+def _write_probe_app(calls: list[str]) -> FastAPI:
+    probe = APIRouter()
+
+    @probe.post("/probe/write")
+    def write(org_id: OrgScope) -> dict:
+        calls.append(org_id)
+        return {"org_id": org_id}
+
+    built = create_app()
+    built.include_router(probe, prefix=get_settings().api_prefix)
+    return built
+
+
+def test_stale_session_never_falls_back_to_demo() -> None:
+    calls: list[str] = []
+    probe = TestClient(_write_probe_app(calls), base_url="https://testserver")
+    me = _signup(probe)
+    org_id = me["active_org"]["org_id"]
+    saas_headers = {**CSRF, "X-Org-Id": org_id}
+    assert probe.post("/api/probe/write", headers=saas_headers).json() == {"org_id": org_id}
+
+    with database.begin() as db:
+        db.execute(
+            update(AuthSessionRow).values(expires_at=datetime.now(UTC) - timedelta(seconds=1))
+        )
+    expired = probe.post("/api/probe/write", headers=saas_headers)
+    assert expired.status_code == 401
+    assert _cookie_attrs(expired.headers["set-cookie"])["max-age"] == "0"
+    assert calls == [org_id]
+
+
+def test_logged_out_cookie_and_orphan_org_header_are_rejected() -> None:
+    calls: list[str] = []
+    probe = TestClient(_write_probe_app(calls), base_url="https://testserver")
+    _signup(probe)
+    token = probe.cookies.get("fs_session")
+    other_tab = TestClient(probe.app, base_url="https://testserver")
+    other_tab.cookies.set("fs_session", token)
+    assert other_tab.post("/api/auth/logout", headers=CSRF).status_code == 204
+
+    assert probe.post("/api/probe/write", headers=CSRF).status_code == 401
+    assert probe.get("/api/me").status_code == 401
+
+    anonymous = TestClient(probe.app, base_url="https://testserver")
+    orphan = anonymous.post("/api/probe/write", headers={**CSRF, "X-Org-Id": "shipper-x"})
+    assert orphan.status_code == 401
+    assert "set-cookie" not in orphan.headers
+    assert anonymous.post("/api/probe/write").json() == {"org_id": DEMO_ORG}
+    assert calls == [DEMO_ORG]
 
 
 def test_settings_normalize_paths() -> None:
