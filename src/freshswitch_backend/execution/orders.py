@@ -45,6 +45,7 @@ from freshswitch_backend.replan.models import (
     Event,
     ReduceEvent,
 )
+from freshswitch_backend.routing.models import TruckRoute
 
 AIR = "AIR"
 UNASSIGNED = "UNASSIGNED"
@@ -656,6 +657,7 @@ def build_order(
             actor="system",
             action=f"대안 {alternative.id} 적용 → 실행 지시 생성",
             status_after="proposed",
+            note="; ".join(alternative.warnings) or None,
         )
     ]
     if not confirmations:
@@ -1058,25 +1060,40 @@ def _automatic_actions(
     packhouses = {
         p.id: p.name for p in [*ctx.scenario_before.packhouses, *ctx.scenario_after.packhouses]
     }
+    trips: dict[tuple[str, datetime], list[tuple[str, TruckRoute]]] = {}
     for voyage_pickup in ctx.alternative.routes:
         for route in voyage_pickup.pickup.routes:
             key = (voyage_pickup.voyage_id, route.truck_id)
             if before_sig.get(key) == after_sig.get(key):
                 continue
-            stops = [packhouses.get(stop.packhouse_id, stop.packhouse_id) for stop in route.stops]
-            lot_ids = [x for stop in route.stops for x in stop.lot_ids]
-            actions.append(
-                AutomaticAction(
-                    kind="truck_dispatch",
-                    description=(
-                        f"{route.truck_id} {voyage_pickup.voyage_id}: {' → '.join(stops)} → 부산신항, "
-                        f"{route.load_pallets}파렛트, 출발 {fmt(route.earliest_departure)}~"
-                        f"{fmt(route.latest_departure)}, 항만 도착 예정 {fmt(route.port_eta)}"
-                    ),
-                    lot_ids=lot_ids,
-                    truck_id=route.truck_id,
-                )
+            trips.setdefault((route.truck_id, route.earliest_departure), []).append(
+                (voyage_pickup.voyage_id, route)
             )
+    for (truck_id, earliest), parts in trips.items():
+        voyage_ids = list(dict.fromkeys(voyage_id for voyage_id, _ in parts))
+        visits = [stop for _, route in parts for stop in route.stops]
+        if len(parts) > 1:
+            unique = {stop.stop_id: stop for stop in reversed(visits)}
+            visits = sorted(unique.values(), key=lambda stop: (stop.sequence, stop.eta))
+        stops = [packhouses.get(stop.packhouse_id, stop.packhouse_id) for stop in visits]
+        lot_ids = list(
+            dict.fromkeys(x for _, route in parts for stop in route.stops for x in stop.lot_ids)
+        )
+        pallets = sum(route.load_pallets for _, route in parts)
+        latest = min(route.latest_departure for _, route in parts)
+        port_eta = max(route.port_eta for _, route in parts)
+        actions.append(
+            AutomaticAction(
+                kind="truck_dispatch",
+                description=(
+                    f"{truck_id} {'·'.join(voyage_ids)}: {' → '.join(stops)} → 부산신항, "
+                    f"{pallets}파렛트, 출발 {fmt(earliest)}~"
+                    f"{fmt(latest)}, 항만 도착 예정 {fmt(port_eta)}"
+                ),
+                lot_ids=lot_ids,
+                truck_id=truck_id,
+            )
+        )
     for key in sorted(set(before_sig) - set(after_sig)):
         actions.append(
             AutomaticAction(

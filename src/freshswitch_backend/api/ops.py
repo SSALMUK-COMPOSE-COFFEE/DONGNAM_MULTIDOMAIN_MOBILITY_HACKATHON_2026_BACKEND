@@ -2,7 +2,7 @@ from collections import Counter
 from typing import Any
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
@@ -51,15 +51,34 @@ SEED_LOT_FIELDS = (
     "status",
 )
 
+COUNT_KEYS = (
+    "lots",
+    "missing_seed_lots",
+    "plans",
+    "orders",
+    "forwarder_assignments",
+    "coldchain_containers",
+    "devices",
+    "bindings",
+    "members",
+    "packhouses",
+    "shipper_profiles",
+)
+COUNT_PROPERTIES = {name: {"type": "integer"} for name in COUNT_KEYS}
+
 
 class OrgDrift(BaseModel):
     org_id: str
     org_type: str
     sandbox: bool
     seeded: bool
-    counts: dict[str, int]
-    baseline: dict[str, int]
-    drift: dict[str, int]
+    counts: dict[str, int] = Field(
+        json_schema_extra={"properties": COUNT_PROPERTIES, "required": list(COUNT_KEYS)}
+    )
+    baseline: dict[str, int] = Field(
+        json_schema_extra={"properties": COUNT_PROPERTIES, "required": list(COUNT_KEYS)}
+    )
+    drift: dict[str, int] = Field(json_schema_extra={"properties": COUNT_PROPERTIES})
     non_demo_members: int
 
 
@@ -96,22 +115,7 @@ def seed_completed(db: Session) -> bool:
 
 
 def _baseline(seed: DemoOrg | None) -> dict[str, int]:
-    counts = dict.fromkeys(
-        (
-            "lots",
-            "missing_seed_lots",
-            "plans",
-            "orders",
-            "forwarder_assignments",
-            "coldchain_containers",
-            "devices",
-            "bindings",
-            "members",
-            "packhouses",
-            "shipper_profiles",
-        ),
-        0,
-    )
+    counts = dict.fromkeys(COUNT_KEYS, 0)
     if seed is not None:
         counts.update(
             members=1, packhouses=len(seed.shipper_ids), shipper_profiles=len(seed.shipper_ids)
