@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Annotated, Any
 
 from fastapi import Depends, HTTPException
-from sqlalchemy import and_, exists, func, select
+from sqlalchemy import and_, exists, func, or_, select
 
 from freshswitch_backend.api.auth import AuthPrincipal, Principal
 from freshswitch_backend.persistence import database
@@ -50,10 +50,16 @@ def viewer_of(principal: Principal) -> Viewer:
 
 
 def shipper_lot_included(org_id: str) -> Any:
-    return exists().where(
-        LotRow.shipper_org_id == org_id,
-        PlanRow.payload["registered_lot_ids"].contains(func.jsonb_build_array(LotRow.id)),
+    snapshot = PlanRow.payload["shipper_org_ids"].contains(func.jsonb_build_array(org_id))
+    legacy = and_(
+        ~PlanRow.payload.has_key("shipper_org_ids"),
+        exists().where(
+            LotRow.shipper_org_id == org_id,
+            LotRow.created_at <= PlanRow.created_at,
+            PlanRow.payload["registered_lot_ids"].contains(func.jsonb_build_array(LotRow.id)),
+        ),
     )
+    return or_(snapshot, legacy)
 
 
 def forwarder_assigned(org_id: str) -> Any:

@@ -82,7 +82,9 @@ def build_preview(
         scenario = scope.scenario(body.scenario_id)
         if scenario is None:
             raise HTTPException(status_code=404, detail="시나리오를 찾을 수 없습니다")
-    reservation = reservation or lot_store.reservation()
+    reservation = reservation or lot_store.reservation(
+        scope.lot_org or ANY_ORG, peer_of=scope.peer_of
+    )
     try:
         preview = preview_lot(
             scenario,

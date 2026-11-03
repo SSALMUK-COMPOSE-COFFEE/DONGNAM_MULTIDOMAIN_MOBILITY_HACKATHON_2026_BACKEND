@@ -11,7 +11,8 @@ from sqlalchemy.orm import Session
 from freshswitch_backend.domain.models import Lot
 from freshswitch_backend.lots.models import LotFilter, RegisteredLot
 from freshswitch_backend.persistence import Database, database
-from freshswitch_backend.persistence.tables import DEMO_ORG, LotRow, PlanRow
+from freshswitch_backend.persistence.orgs import same_sandbox
+from freshswitch_backend.persistence.tables import DEMO_ORG, LotRow, OrganizationRow, PlanRow
 
 ANY_ORG = "*"
 LOT_ID_LOCK = 7_310_001
@@ -19,10 +20,34 @@ PLAN_LOT_IDS = text(
     "SELECT DISTINCT lot->>'id' FROM plan_sessions, "
     "jsonb_array_elements(payload->'scenario'->'lots') AS lot"
 )
+TENANT_PLAN_LOT_IDS = text(
+    "SELECT lot->>'id' FROM plan_sessions, "
+    "jsonb_array_elements(payload->'scenario'->'lots') AS lot WHERE org_id <> :demo "
+    "UNION SELECT lot->>'id' FROM plan_sessions, "
+    "jsonb_array_elements(committed->'scenario'->'lots') AS lot WHERE org_id <> :demo "
+    "UNION SELECT jsonb_array_elements_text("
+    "COALESCE(payload->'registered_lot_ids', '[]'::jsonb)) FROM plan_sessions "
+    "WHERE org_id <> :demo"
+)
+CLAIMED_FIELDS = (
+    "shipper_id",
+    "product_id",
+    "pallets",
+    "ready_date",
+    "destination",
+    "sell_by_date",
+    "sell_window",
+)
 
 
 class LotConflict(ValueError):
     pass
+
+
+class LotUnavailable(ValueError):
+    def __init__(self, lot_ids: list[str]) -> None:
+        super().__init__(", ".join(lot_ids))
+        self.lot_ids = lot_ids
 
 
 @dataclass
@@ -31,13 +56,48 @@ class Reservation:
     reserved: set[str]
 
 
-def mark_planned(db: Session, lot_ids: list[str], now: datetime, org_id: str) -> None:
-    if lot_ids:
-        db.execute(
-            update(LotRow)
-            .where(LotRow.id.in_(lot_ids), LotRow.status == "registered", _lot_scope(org_id))
-            .values(status="planned", updated_at=now)
-        )
+def mark_planned(db: Session, lot_ids: list[str], now: datetime, org_id: str) -> int:
+    if not lot_ids:
+        return 0
+    return db.execute(
+        update(LotRow)
+        .where(LotRow.id.in_(lot_ids), LotRow.status == "registered", _lot_scope(org_id))
+        .values(status="planned", updated_at=now)
+    ).rowcount
+
+
+def claim_lots(db: Session, lots: list[Lot], now: datetime) -> dict[str, str | None]:
+    wanted = {lot.id: lot for lot in lots}
+    if not wanted:
+        return {}
+    rows = db.scalars(
+        select(LotRow).where(LotRow.id.in_(wanted)).order_by(LotRow.id).with_for_update()
+    ).all()
+    found = {row.id: row for row in rows}
+    stale = sorted(
+        lot_id
+        for lot_id, lot in wanted.items()
+        if lot_id not in found
+        or found[lot_id].status != "registered"
+        or any(getattr(found[lot_id], name) != getattr(lot, name) for name in CLAIMED_FIELDS)
+    )
+    if stale:
+        raise LotUnavailable(stale)
+    if mark_planned(db, list(wanted), now, ANY_ORG) != len(wanted):
+        raise LotUnavailable(sorted(wanted))
+    return {lot_id: found[lot_id].shipper_org_id for lot_id in wanted}
+
+
+def lot_owners(
+    db: Session, lot_ids: list[str], created_by: datetime | None = None
+) -> dict[str, str | None]:
+    if not lot_ids:
+        return {}
+    query = select(LotRow.id, LotRow.shipper_org_id).where(LotRow.id.in_(lot_ids))
+    if created_by is not None:
+        query = query.where(LotRow.created_at <= created_by)
+    found = {lot_id: org_id for lot_id, org_id in db.execute(query)}
+    return {lot_id: found.get(lot_id) for lot_id in lot_ids}
 
 
 def release_lots(
@@ -113,15 +173,22 @@ class LotStore:
             updated_at=now,
         )
 
-    def _reservation(self, db: Session) -> Reservation:
-        return Reservation(
-            taken=set(db.scalars(select(LotRow.id))),
-            reserved={i for i in db.scalars(PLAN_LOT_IDS) if i},
-        )
+    def _reservation(
+        self, db: Session, org_id: str = ANY_ORG, peer_of: str | None = None
+    ) -> Reservation:
+        visible = select(LotRow.id).where(_lot_scope(org_id))
+        if peer_of is not None:
+            visible = visible.join(
+                OrganizationRow, OrganizationRow.id == LotRow.shipper_org_id
+            ).where(same_sandbox(OrganizationRow.sandbox, peer_of))
+        taken = set(db.scalars(visible))
+        if org_id == ANY_ORG and peer_of is None:
+            taken |= {i for i in db.scalars(TENANT_PLAN_LOT_IDS, {"demo": DEMO_ORG}) if i}
+        return Reservation(taken=taken, reserved={i for i in db.scalars(PLAN_LOT_IDS) if i})
 
-    def reservation(self) -> Reservation:
+    def reservation(self, org_id: str = ANY_ORG, peer_of: str | None = None) -> Reservation:
         with self._db.begin() as db:
-            return self._reservation(db)
+            return self._reservation(db, org_id, peer_of)
 
     def create(
         self,

@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, select, true
+from sqlalchemy import delete, func, select, text, true
 from sqlalchemy.orm import Session
 
 from freshswitch_backend.domain.models import Plan, Scenario
@@ -28,8 +28,16 @@ from freshswitch_backend.execution.quality import (
     current_inspections,
     planned_loss_rate,
 )
+from freshswitch_backend.explain import render_template
 from freshswitch_backend.explain.models import Explanation
-from freshswitch_backend.lots import ANY_ORG, mark_planned, release_lots, sync_committed_lots
+from freshswitch_backend.lots import (
+    ANY_ORG,
+    claim_lots,
+    lot_owners,
+    mark_planned,
+    release_lots,
+    sync_committed_lots,
+)
 from freshswitch_backend.persistence import Database, database
 from freshswitch_backend.persistence.tables import (
     DEMO_ORG,
@@ -37,6 +45,7 @@ from freshswitch_backend.persistence.tables import (
     ContainerRow,
     IdempotencyRow,
     OrderRow,
+    OrganizationRow,
     PendingRow,
     PlanRow,
 )
@@ -50,6 +59,8 @@ from freshswitch_backend.replan import (
     locks_air,
     plan_score,
 )
+from freshswitch_backend.replan.engine import PREFERENCE
+from freshswitch_backend.replan.explanation import build_explain_context
 from freshswitch_backend.replan.models import AlternativeId, CancellationCharge
 
 MAX_SESSIONS = 200
@@ -58,10 +69,27 @@ MAX_ORDERS = 50
 MAX_IDEMPOTENCY_KEYS = 100
 
 SessionStatus = Literal["committed", "pending_confirmation"]
+BOOKED_CONTAINERS = text(
+    "SELECT a->>'container_id' FROM plan_sessions, "
+    "jsonb_array_elements(payload->'plan'->'assignments') AS a "
+    "WHERE org_id = :org AND scenario_id = :scenario AND plan_id <> :plan AND a->>'mode' = 'sea' "
+    "UNION SELECT a->>'container_id' FROM plan_sessions, "
+    "jsonb_array_elements(committed->'plan'->'assignments') AS a "
+    "WHERE org_id = :org AND scenario_id = :scenario AND plan_id <> :plan AND a->>'mode' = 'sea'"
+)
 
 
 class SessionConflict(Exception):
     pass
+
+
+class ContainerBooked(SessionConflict):
+    def __init__(self, container_ids: list[str]) -> None:
+        super().__init__(
+            f"다른 계획에 이미 배정된 컨테이너입니다: {', '.join(container_ids)}. "
+            "이벤트를 다시 보내 재계산하세요"
+        )
+        self.container_ids = container_ids
 
 
 class OrderInputError(ValueError):
@@ -188,6 +216,66 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def sea_containers(plan: Plan) -> set[str]:
+    return {a.container_id for a in plan.assignments if a.mode == "sea" and a.container_id}
+
+
+def _booked(db: Session, org_id: str, scenario_id: str, plan_id: str = "") -> set[str]:
+    if org_id == DEMO_ORG:
+        return set()
+    params = {"org": org_id, "scenario": scenario_id, "plan": plan_id}
+    return {c for c in db.scalars(BOOKED_CONTAINERS, params) if c}
+
+
+def _lock_bookings(db: Session, org_id: str) -> None:
+    db.execute(select(OrganizationRow.id).where(OrganizationRow.id == org_id).with_for_update())
+
+
+def _payload(
+    db: Session,
+    session: PlanSession,
+    owners: dict[str, str | None],
+    created_by: datetime | None = None,
+) -> dict[str, Any]:
+    missing = [i for i in session.registered_lot_ids if i not in owners]
+    if missing:
+        owners = {**owners, **lot_owners(db, missing, created_by)}
+    return {
+        **session.model_dump(mode="json"),
+        "lot_owner_orgs": owners,
+        "shipper_org_ids": sorted({org for org in owners.values() if org}),
+    }
+
+
+def _stored_owners(row: PlanRow) -> tuple[dict[str, str | None], datetime | None]:
+    if "lot_owner_orgs" in row.payload:
+        return dict(row.payload["lot_owner_orgs"]), None
+    return {}, row.created_at
+
+
+def _mark_booked(session: PlanSession, result: ReplanResult, booked: set[str]) -> None:
+    changed = False
+    for alternative in result.alternatives:
+        clash = sorted(sea_containers(alternative.plan) & booked)
+        if alternative.feasible and clash:
+            alternative.feasible = False
+            alternative.infeasible_reasons.append(
+                f"다른 계획에 이미 배정된 컨테이너를 씁니다: {', '.join(clash)}"
+            )
+            changed = True
+    if not changed:
+        return
+    feasible = [a for a in result.alternatives if a.feasible]
+    if result.recommended_id not in {a.id for a in feasible}:
+        best = min(feasible, key=lambda a: (a.total_cost, PREFERENCE[a.id]), default=None)
+        result.recommended_id = best.id if best else None
+        result.diff = best.diff if best else None
+    if result.explanation is not None:
+        result.explanation = render_template(
+            build_explain_context(session.scenario, session.plan, result)
+        )
+
+
 def _snapshot(session: PlanSession) -> _Snapshot:
     return _Snapshot(
         version=session.version,
@@ -256,7 +344,7 @@ class SessionStore:
         row.updated_at = session.updated_at
         row.lot_count = len(session.scenario.lots)
         row.totals = _totals(session.plan)
-        row.payload = session.model_dump(mode="json")
+        row.payload = _payload(db, session, *_stored_owners(row))
         row.committed = state.committed.model_dump(mode="json")
         for order in state.orders.values():
             stored = db.get(OrderRow, order.order_id)
@@ -316,6 +404,7 @@ class SessionStore:
         registered_lot_ids: list[str] | None = None,
         org_id: str = DEMO_ORG,
         lot_org_id: str | None = None,
+        exclusive: bool = False,
     ) -> PlanSession:
         working = scenario.model_copy(deep=True)
         built = build_plan(working)
@@ -334,6 +423,16 @@ class SessionStore:
             registered_lot_ids=registered_lot_ids or [],
         )
         with self._lock, self._db.begin() as db:
+            if exclusive:
+                _lock_bookings(db, org_id)
+                chosen = set(session.registered_lot_ids)
+                owners = claim_lots(db, [lot for lot in scenario.lots if lot.id in chosen], now)
+                clash = sea_containers(session.plan) & _booked(db, org_id, scenario.id)
+                if clash:
+                    raise ContainerBooked(sorted(clash))
+            else:
+                mark_planned(db, session.registered_lot_ids, now, lot_org_id or org_id)
+                owners = {}
             db.add(
                 PlanRow(
                     plan_id=session.plan_id,
@@ -345,17 +444,20 @@ class SessionStore:
                     totals=_totals(session.plan),
                     created_at=now,
                     updated_at=now,
-                    payload=session.model_dump(mode="json"),
+                    payload=_payload(db, session, owners),
                     committed=_snapshot(session).model_dump(mode="json"),
                 )
             )
             db.flush()
-            mark_planned(db, session.registered_lot_ids, now, lot_org_id or org_id)
             scope = PlanRow.org_id == org_id
             cutoff = _cutoff(db, PlanRow, scope, self._max)
             if cutoff is not None:
                 self._drop(db, (PlanRow.seq <= cutoff) & scope)
         return session
+
+    def booked_containers(self, org_id: str, scenario_id: str, plan_id: str = "") -> set[str]:
+        with self._db.begin() as db:
+            return _booked(db, org_id, scenario_id, plan_id)
 
     def get(self, plan_id: str, org_id: str = DEMO_ORG) -> PlanSession | None:
         with self._lock:
@@ -485,8 +587,10 @@ class SessionStore:
             replan_id=str(uuid.uuid4()), base_version=session.version, result=result
         )
         with self._lock, self._db.begin() as db:
-            if _plan_row(db, session.plan_id, org_id) is None:
+            row = _plan_row(db, session.plan_id, org_id)
+            if row is None:
                 return pending
+            _mark_booked(session, result, _booked(db, row.org_id, row.scenario_id, row.plan_id))
             db.add(
                 PendingRow(
                     replan_id=pending.replan_id,
@@ -553,6 +657,14 @@ class SessionStore:
             raise SessionConflict(
                 f"실행 불가한 대안입니다: {'; '.join(alternative.infeasible_reasons)}"
             )
+        row = _plan_row(db, plan_id, ANY_ORG)
+        if row.org_id != DEMO_ORG:
+            _lock_bookings(db, row.org_id)
+            clash = sea_containers(alternative.plan) & _booked(
+                db, row.org_id, row.scenario_id, plan_id
+            )
+            if clash:
+                raise ContainerBooked(sorted(clash))
         event = pending.result.event
         scenario = pending.result.scenario_after
         locked = set(session.air_locked_lot_ids)

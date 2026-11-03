@@ -33,11 +33,12 @@ from freshswitch_backend.integrations import (
     VesselMovement,
     detect_schedule_changes,
 )
-from freshswitch_backend.lots import ANY_ORG, LotFilter, RegisteredLot, lot_store
+from freshswitch_backend.lots import ANY_ORG, LotFilter, LotUnavailable, RegisteredLot, lot_store
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.orgs import same_sandbox
 from freshswitch_backend.persistence.tables import DEMO_ORG, LotRow, OrganizationRow
 from freshswitch_backend.planning.store import (
+    ContainerBooked,
     HistoryEntry,
     IdempotencyMismatch,
     OrderInputError,
@@ -250,12 +251,44 @@ def tenant_plan_scenario(body: CreatePlanRequest, org_id: str) -> tuple[Scenario
         raise HTTPException(status_code=422, detail="계획에 넣을 등록 출하가 없습니다")
     if body.use_learned_loss:
         scenario = with_learned_loss(scenario, scope=learning_scope(org_id))
-    return scenario, registered_ids
+    return _free_containers(scenario, org_id), registered_ids
+
+
+def _free_containers(scenario: Scenario, org_id: str) -> Scenario:
+    booked = store.booked_containers(org_id, scenario.id)
+    if not booked:
+        return scenario
+    free = [c for c in scenario.containers if c.id not in booked]
+    if not free:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "이 시나리오의 컨테이너가 모두 다른 계획에 배정되어 있습니다"
+                f"({', '.join(sorted(booked))}). 기존 계획을 지우거나 초기화한 뒤 다시 만드세요"
+            ),
+        )
+    return scenario.model_copy(update={"containers": free})
 
 
 def create_tenant_plan(body: CreatePlanRequest, org_id: str) -> PlanSession:
     scenario, registered_ids = tenant_plan_scenario(body, org_id)
-    return store.create(scenario, registered_ids, org_id=org_id, lot_org_id=ANY_ORG)
+    try:
+        return store.create(
+            scenario, registered_ids, org_id=org_id, lot_org_id=ANY_ORG, exclusive=True
+        )
+    except LotUnavailable as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"이미 계획에 들어갔거나 그사이 바뀐 출하입니다: {exc}. 다시 시도하세요",
+        ) from exc
+    except ContainerBooked as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "그사이 다른 계획이 컨테이너를 배정했습니다: "
+                f"{', '.join(exc.container_ids)}. 계획을 다시 만드세요"
+            ),
+        ) from exc
 
 
 @router.post("", status_code=201)
