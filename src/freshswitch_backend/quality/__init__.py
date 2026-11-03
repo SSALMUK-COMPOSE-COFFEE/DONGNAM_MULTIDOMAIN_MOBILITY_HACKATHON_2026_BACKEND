@@ -1,7 +1,12 @@
 from freshswitch_backend.domain.models import Scenario
 from freshswitch_backend.quality.learning import loss_table, with_adjustments
 from freshswitch_backend.quality.models import LossTable
-from freshswitch_backend.quality.store import QualityHistory, QualityInputError, quality_history
+from freshswitch_backend.quality.store import (
+    QualityAccessDenied,
+    QualityHistory,
+    QualityInputError,
+    quality_history,
+)
 
 
 def learned_table(scenario: Scenario, history: QualityHistory = quality_history) -> LossTable:
@@ -13,6 +18,7 @@ def with_learned_loss(scenario: Scenario, history: QualityHistory = quality_hist
 
 
 __all__ = [
+    "QualityAccessDenied",
     "QualityHistory",
     "QualityInputError",
     "learned_table",

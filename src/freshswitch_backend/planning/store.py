@@ -32,6 +32,7 @@ from freshswitch_backend.explain.models import Explanation
 from freshswitch_backend.lots import mark_planned, release_lots
 from freshswitch_backend.persistence import Database, database
 from freshswitch_backend.persistence.tables import (
+    DEMO_ORG,
     BindingRow,
     ContainerRow,
     IdempotencyRow,
@@ -230,8 +231,8 @@ class SessionStore:
         self._max = max_sessions
         self.clock: Callable[[], datetime] = _now
 
-    def _load(self, db: Session, plan_id: str) -> _State | None:
-        row = db.get(PlanRow, plan_id)
+    def _load(self, db: Session, plan_id: str, org_id: str | None = DEMO_ORG) -> _State | None:
+        row = _plan_row(db, plan_id, org_id)
         if row is None:
             return None
         orders = db.scalars(
@@ -295,22 +296,25 @@ class SessionStore:
                 return True
         return False
 
-    def _expire(self, plan_id: str) -> None:
+    def _expire(self, plan_id: str, org_id: str | None = DEMO_ORG) -> None:
         with self._db.begin() as db:
-            if not self._has_due(db, plan_id):
+            if _plan_row(db, plan_id, org_id) is None or not self._has_due(db, plan_id):
                 return
-            state = self._load(db, plan_id)
+            state = self._load(db, plan_id, org_id)
             if state is not None and self._expire_due(state):
                 self._save(db, state)
 
-    def _require(self, db: Session, plan_id: str) -> _State:
-        state = self._load(db, plan_id)
+    def _require(self, db: Session, plan_id: str, org_id: str | None = DEMO_ORG) -> _State:
+        state = self._load(db, plan_id, org_id)
         if state is None:
             raise KeyError(plan_id)
         return state
 
     def create(
-        self, scenario: Scenario, registered_lot_ids: list[str] | None = None
+        self,
+        scenario: Scenario,
+        registered_lot_ids: list[str] | None = None,
+        org_id: str = DEMO_ORG,
     ) -> PlanSession:
         working = scenario.model_copy(deep=True)
         built = build_plan(working)
@@ -332,6 +336,7 @@ class SessionStore:
             db.add(
                 PlanRow(
                     plan_id=session.plan_id,
+                    org_id=org_id,
                     scenario_id=session.scenario_id,
                     version=session.version,
                     status=session.status,
@@ -345,22 +350,30 @@ class SessionStore:
             )
             db.flush()
             mark_planned(db, session.registered_lot_ids, now)
-            cutoff = _cutoff(db, PlanRow, None, self._max)
+            scope = PlanRow.org_id == org_id
+            cutoff = _cutoff(db, PlanRow, scope, self._max)
             if cutoff is not None:
-                self._drop(db, PlanRow.seq <= cutoff)
+                self._drop(db, (PlanRow.seq <= cutoff) & scope)
         return session
 
-    def get(self, plan_id: str) -> PlanSession | None:
+    def get(self, plan_id: str, org_id: str | None = DEMO_ORG) -> PlanSession | None:
         with self._lock:
-            self._expire(plan_id)
+            self._expire(plan_id, org_id)
             with self._db.begin() as db:
-                row = db.get(PlanRow, plan_id)
+                row = _plan_row(db, plan_id, org_id)
                 return PlanSession.model_validate(row.payload) if row is not None else None
 
-    def summaries(self, limit: int = 100, offset: int = 0) -> list[PlanSummary]:
+    def org_of(self, plan_id: str) -> str | None:
+        with self._db.begin() as db:
+            return db.scalar(select(PlanRow.org_id).where(PlanRow.plan_id == plan_id))
+
+    def summaries(
+        self, limit: int = 100, offset: int = 0, org_id: str | None = DEMO_ORG
+    ) -> list[PlanSummary]:
         with self._db.begin() as db:
             rows = db.scalars(
                 select(PlanRow)
+                .where(_plan_scope(org_id))
                 .order_by(PlanRow.created_at.desc(), PlanRow.seq.desc())
                 .limit(limit)
                 .offset(offset)
@@ -383,18 +396,20 @@ class SessionStore:
         release_lots(db, {lot_id for row in rows for lot_id in row[1] or []}, self.clock())
         return len(plan_ids)
 
-    def delete(self, plan_id: str) -> bool:
+    def delete(self, plan_id: str, org_id: str | None = DEMO_ORG) -> bool:
         with self._lock, self._db.begin() as db:
-            return self._drop(db, PlanRow.plan_id == plan_id) > 0
+            return self._drop(db, (PlanRow.plan_id == plan_id) & _plan_scope(org_id)) > 0
 
-    def count(self) -> int:
+    def count(self, org_id: str | None = DEMO_ORG) -> int:
         with self._db.begin() as db:
-            return db.scalar(select(func.count()).select_from(PlanRow)) or 0
+            return (
+                db.scalar(select(func.count()).select_from(PlanRow).where(_plan_scope(org_id))) or 0
+            )
 
-    def clear(self) -> int:
+    def clear(self, org_id: str = DEMO_ORG) -> int:
         with self._lock, self._db.begin() as db:
-            count = self._drop(db, true())
-            release_lots(db, None, self.clock())
+            count = self._drop(db, PlanRow.org_id == org_id)
+            release_lots(db, None, self.clock(), org_id=org_id)
             return count
 
     def _idempotent(
@@ -422,8 +437,11 @@ class SessionStore:
         kind: str,
         fingerprint: str,
         model: type[BaseModel] | None = None,
+        org_id: str | None = DEMO_ORG,
     ) -> Any | None:
         with self._lock, self._db.begin() as db:
+            if _plan_row(db, plan_id, org_id) is None:
+                return None
             return self._idempotent(db, plan_id, key, kind, fingerprint, model)
 
     def _remember(
@@ -446,19 +464,27 @@ class SessionStore:
         return value
 
     def remember(
-        self, plan_id: str, key: str, kind: str, fingerprint: str, value: BaseModel
+        self,
+        plan_id: str,
+        key: str,
+        kind: str,
+        fingerprint: str,
+        value: BaseModel,
+        org_id: str | None = DEMO_ORG,
     ) -> Any:
         with self._lock, self._db.begin() as db:
-            if db.get(PlanRow, plan_id) is None:
+            if _plan_row(db, plan_id, org_id) is None:
                 return value
             return self._remember(db, plan_id, key, kind, fingerprint, value)
 
-    def add_pending(self, session: PlanSession, result: ReplanResult) -> PendingReplan:
+    def add_pending(
+        self, session: PlanSession, result: ReplanResult, org_id: str | None = DEMO_ORG
+    ) -> PendingReplan:
         pending = PendingReplan(
             replan_id=str(uuid.uuid4()), base_version=session.version, result=result
         )
         with self._lock, self._db.begin() as db:
-            if db.get(PlanRow, session.plan_id) is None:
+            if _plan_row(db, session.plan_id, org_id) is None:
                 return pending
             db.add(
                 PendingRow(
@@ -490,17 +516,18 @@ class SessionStore:
         alternative_id: str,
         replan_id: str | None = None,
         idempotency: tuple[str, str] | None = None,
+        org_id: str | None = DEMO_ORG,
     ) -> PlanSession:
         with self._lock:
             if idempotency is not None:
                 replayed = self.idempotent(
-                    plan_id, idempotency[0], "apply", idempotency[1], PlanSession
+                    plan_id, idempotency[0], "apply", idempotency[1], PlanSession, org_id
                 )
                 if replayed is not None:
                     return replayed
-            self._expire(plan_id)
+            self._expire(plan_id, org_id)
             with self._db.begin() as db:
-                return self._apply(db, plan_id, alternative_id, replan_id, idempotency)
+                return self._apply(db, plan_id, alternative_id, replan_id, idempotency, org_id)
 
     def _apply(
         self,
@@ -509,8 +536,9 @@ class SessionStore:
         alternative_id: str,
         replan_id: str | None,
         idempotency: tuple[str, str] | None,
+        org_id: str | None = DEMO_ORG,
     ) -> PlanSession:
-        state = self._require(db, plan_id)
+        state = self._require(db, plan_id, org_id)
         session = state.session
         pending = self._pending(db, plan_id, replan_id)
         if pending.base_version != session.version:
@@ -592,10 +620,12 @@ class SessionStore:
             self._remember(db, plan_id, idempotency[0], "apply", idempotency[1], updated)
         return updated
 
-    def orders(self, plan_id: str) -> list[ExecutionOrder]:
+    def orders(self, plan_id: str, org_id: str | None = DEMO_ORG) -> list[ExecutionOrder]:
         with self._lock:
-            self._expire(plan_id)
+            self._expire(plan_id, org_id)
             with self._db.begin() as db:
+                if _plan_row(db, plan_id, org_id) is None:
+                    return []
                 rows = db.scalars(
                     select(OrderRow.payload)
                     .where(OrderRow.plan_id == plan_id)
@@ -603,11 +633,11 @@ class SessionStore:
                 )
                 return [ExecutionOrder.model_validate(payload) for payload in rows]
 
-    def order(self, plan_id: str, order_id: str) -> ExecutionOrder:
+    def order(self, plan_id: str, order_id: str, org_id: str | None = DEMO_ORG) -> ExecutionOrder:
         with self._lock:
-            self._expire(plan_id)
+            self._expire(plan_id, org_id)
         with self._db.begin() as db:
-            return self._require(db, plan_id).orders[order_id]
+            return self._require(db, plan_id, org_id).orders[order_id]
 
     def _transition(
         self,
@@ -699,14 +729,22 @@ class SessionStore:
         state.session = updated
         state.committed = _snapshot(updated)
 
-    def confirm(self, plan_id: str, order_id: str, body: ConfirmRequest) -> ExecutionOrder:
+    def confirm(
+        self,
+        plan_id: str,
+        order_id: str,
+        body: ConfirmRequest,
+        org_id: str | None = DEMO_ORG,
+    ) -> ExecutionOrder:
         with self._lock:
-            self._expire(plan_id)
-            return self._confirm(plan_id, order_id, body)
+            self._expire(plan_id, org_id)
+            return self._confirm(plan_id, order_id, body, org_id)
 
-    def _confirm(self, plan_id: str, order_id: str, body: ConfirmRequest) -> ExecutionOrder:
+    def _confirm(
+        self, plan_id: str, order_id: str, body: ConfirmRequest, org_id: str | None
+    ) -> ExecutionOrder:
         with self._db.begin() as db:
-            state = self._require(db, plan_id)
+            state = self._require(db, plan_id, org_id)
             order = state.orders[order_id]
             now = self.clock()
             if body.actor == "shipper":
@@ -815,17 +853,27 @@ class SessionStore:
                 state.session = state.session.model_copy(update={"active_order_id": None})
 
     def answer_request(
-        self, plan_id: str, order_id: str, request_id: str, body: RequestResultBody
+        self,
+        plan_id: str,
+        order_id: str,
+        request_id: str,
+        body: RequestResultBody,
+        org_id: str | None = DEMO_ORG,
     ) -> ExecutionOrder:
         with self._lock:
-            self._expire(plan_id)
-            return self._answer_request(plan_id, order_id, request_id, body)
+            self._expire(plan_id, org_id)
+            return self._answer_request(plan_id, order_id, request_id, body, org_id)
 
     def _answer_request(
-        self, plan_id: str, order_id: str, request_id: str, body: RequestResultBody
+        self,
+        plan_id: str,
+        order_id: str,
+        request_id: str,
+        body: RequestResultBody,
+        org_id: str | None,
     ) -> ExecutionOrder:
         with self._db.begin() as db:
-            state = self._require(db, plan_id)
+            state = self._require(db, plan_id, org_id)
             order = state.orders[order_id]
             request = next((r for r in order.requests if r.request_id == request_id), None)
             if request is None:
@@ -859,21 +907,23 @@ class SessionStore:
             self._save(db, state)
             return order
 
-    def record_arrival(self, plan_id: str, body: ArrivalRequest) -> ArrivalSettlementResult:
-        return self.record_arrival_snapshot(plan_id, body)[0]
+    def record_arrival(
+        self, plan_id: str, body: ArrivalRequest, org_id: str | None = DEMO_ORG
+    ) -> ArrivalSettlementResult:
+        return self.record_arrival_snapshot(plan_id, body, org_id)[0]
 
     def record_arrival_snapshot(
-        self, plan_id: str, body: ArrivalRequest
+        self, plan_id: str, body: ArrivalRequest, org_id: str | None = DEMO_ORG
     ) -> tuple[ArrivalSettlementResult, PlanSession]:
         with self._lock:
-            self._expire(plan_id)
-            return self._record_arrival(plan_id, body)
+            self._expire(plan_id, org_id)
+            return self._record_arrival(plan_id, body, org_id)
 
     def _record_arrival(
-        self, plan_id: str, body: ArrivalRequest
+        self, plan_id: str, body: ArrivalRequest, org_id: str | None
     ) -> tuple[ArrivalSettlementResult, PlanSession]:
         with self._db.begin() as db:
-            state = self._require(db, plan_id)
+            state = self._require(db, plan_id, org_id)
             session = state.session
             now = self.clock()
             result, inspections = arrival_settlement(
@@ -909,6 +959,17 @@ class SessionStore:
                 continue
             kept.append(inspection)
         return kept
+
+
+def _plan_scope(org_id: str | None) -> Any:
+    return true() if org_id is None else PlanRow.org_id == org_id
+
+
+def _plan_row(db: Session, plan_id: str, org_id: str | None) -> PlanRow | None:
+    row = db.get(PlanRow, plan_id)
+    if row is None or (org_id is not None and row.org_id != org_id):
+        return None
+    return row
 
 
 def _cutoff(db: Session, table: type, where: Any, keep: int) -> int | None:

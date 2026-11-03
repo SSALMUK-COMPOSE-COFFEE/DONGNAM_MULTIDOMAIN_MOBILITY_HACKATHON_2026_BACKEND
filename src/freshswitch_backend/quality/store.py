@@ -12,7 +12,7 @@ from freshswitch_backend.domain.models import KST, Scenario
 from freshswitch_backend.execution.quality import ArrivalSettlementResult
 from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.persistence import Database, database, get_meta, set_meta
-from freshswitch_backend.persistence.tables import ObservationRow
+from freshswitch_backend.persistence.tables import DEMO_ORG, ObservationRow
 from freshswitch_backend.planning.store import PlanSession
 from freshswitch_backend.planning.store import store as plan_store
 from freshswitch_backend.quality.learning import condition_uplift, outage_bucket, prior_model_rate
@@ -27,10 +27,20 @@ from freshswitch_backend.quality.params import QualityParams
 SEED_PATH = Path(__file__).resolve().parent.parent / "data" / "quality" / "seed-observations.json"
 MAX_OBSERVATIONS = 5000
 SEEDED_KEY = "quality_seeded"
+RESET_ORG_TYPES = frozenset({"platform"})
 
 
 class QualityInputError(ValueError):
     pass
+
+
+class QualityAccessDenied(PermissionError):
+    pass
+
+
+def _check_reset(org_type: str | None) -> None:
+    if org_type is not None and org_type not in RESET_ORG_TYPES:
+        raise QualityAccessDenied("품질 관측 초기화·삭제는 플랫폼 조직만 할 수 있습니다")
 
 
 def _load_seed() -> tuple[str, list[SeedObservation]]:
@@ -38,12 +48,13 @@ def _load_seed() -> tuple[str, list[SeedObservation]]:
     return raw["label"], [SeedObservation.model_validate(o) for o in raw["observations"]]
 
 
-def _container_outage(plan_id: str, container_id: str) -> float | None:
+def _container_outage(plan_id: str, container_id: str, org_id: str = DEMO_ORG) -> float | None:
     try:
-        record = coldchain_store.get_record(container_id, plan_id)
+        record = coldchain_store.get_record(container_id, plan_id, org_id)
         if record.plan_id != plan_id:
             return None
-        return coldchain_store.state(container_id, plan_id, points=2).outage.cumulative_minutes
+        state = coldchain_store.state(container_id, plan_id, points=2, org_id=org_id)
+        return state.outage.cumulative_minutes
     except (NotFound, ColdchainError):
         return None
 
@@ -121,7 +132,8 @@ class QualityHistory:
         self._seed_rows(db, self.reference_scenario())
         db.flush()
 
-    def reset(self, seed: bool = True) -> tuple[int, int]:
+    def reset(self, seed: bool = True, org_type: str | None = None) -> tuple[int, int]:
+        _check_reset(org_type)
         scenario = self.reference_scenario()
         with self._lock, self._db.begin() as db:
             cleared = db.scalar(select(func.count()).select_from(ObservationRow)) or 0
@@ -143,7 +155,8 @@ class QualityHistory:
             row = db.get(ObservationRow, obs_id)
             return Observation.model_validate(row.payload) if row is not None else None
 
-    def delete(self, obs_id: str) -> bool:
+    def delete(self, obs_id: str, org_type: str | None = None) -> bool:
+        _check_reset(org_type)
         with self._lock, self._db.begin() as db:
             self._ensure_seeded(db)
             return (
@@ -174,7 +187,11 @@ class QualityHistory:
         return observation
 
     def record_arrival(
-        self, plan_id: str, session: PlanSession, result: ArrivalSettlementResult
+        self,
+        plan_id: str,
+        session: PlanSession,
+        result: ArrivalSettlementResult,
+        org_id: str = DEMO_ORG,
     ) -> Observation:
         scenario = session.scenario
         plan = session.plan
@@ -206,7 +223,7 @@ class QualityHistory:
                     mix = "mixed_products"
                 elif len(load.shipper_ids) > 1:
                     mix = "shared_same_product"
-            outage = _container_outage(plan_id, container.id)
+            outage = _container_outage(plan_id, container.id, org_id)
         else:
             baseline = model.air_loss_rate(lot)
         reference = prior_model_rate(prior, lot.product_id, assignment.mode, 0)

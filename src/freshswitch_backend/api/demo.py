@@ -13,6 +13,7 @@ from freshswitch_backend.data.loader import load_scenarios
 from freshswitch_backend.integrations import SnapshotDate, SnapshotStore
 from freshswitch_backend.integrations.mof_snapshot import load_demo_fixture
 from freshswitch_backend.lots import lot_store
+from freshswitch_backend.persistence.tables import DEMO_ORG
 from freshswitch_backend.planning.store import store
 from freshswitch_backend.quality import quality_history
 
@@ -768,10 +769,10 @@ def curl_script(base: str = DEFAULT_CURL_BASE) -> str:
 def reset(include_lots: bool = Query(False)) -> ResetResponse:
     cleared_quality, _ = quality_history.reset()
     return ResetResponse(
-        cleared_sessions=store.clear(),
-        cleared_coldchain_containers=coldchain_store.clear(),
+        cleared_sessions=store.clear(DEMO_ORG),
+        cleared_coldchain_containers=coldchain_store.clear(DEMO_ORG),
         cleared_quality_observations=cleared_quality,
-        cleared_lots=lot_store.clear() if include_lots else 0,
+        cleared_lots=lot_store.clear(DEMO_ORG) if include_lots else 0,
     )
 
 
@@ -786,7 +787,7 @@ def status() -> DemoStatus:
         snapshot_dates=SnapshotStore().dates(),
         demo_fixture=load_demo_fixture() is not None,
         scenario_ids=sorted(load_scenarios()),
-        session_count=store.count(),
+        session_count=store.count(DEMO_ORG),
     )
 
 
