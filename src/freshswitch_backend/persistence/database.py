@@ -3,6 +3,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -10,9 +12,26 @@ from sqlalchemy.orm import Session
 from freshswitch_backend.config import get_settings
 from freshswitch_backend.persistence.tables import ALERT_SEQ, Base, MetaRow
 
+MIGRATIONS = "freshswitch_backend:migrations"
+MIGRATION_LOCK_KEY = 7_402_115_301
+
 
 class DatabaseNotConfigured(RuntimeError):
     pass
+
+
+def migration_config() -> Config:
+    config = Config()
+    config.set_main_option("script_location", MIGRATIONS)
+    return config
+
+
+def upgrade_schema(engine: Engine) -> None:
+    config = migration_config()
+    with engine.begin() as conn:
+        conn.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": MIGRATION_LOCK_KEY})
+        config.attributes["connection"] = conn
+        command.upgrade(config, "head")
 
 
 def normalize_url(url: str) -> str:
@@ -59,7 +78,7 @@ class Database:
         engine = self.engine
         with self._lock:
             if not self._ready:
-                Base.metadata.create_all(engine)
+                upgrade_schema(engine)
                 self._ready = True
 
     @contextmanager
