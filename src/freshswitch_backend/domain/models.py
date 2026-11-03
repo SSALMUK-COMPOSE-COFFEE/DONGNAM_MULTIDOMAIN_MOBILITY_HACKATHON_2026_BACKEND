@@ -225,6 +225,32 @@ class ScenarioSummary(BaseModel):
 Mode = Literal["sea", "air"]
 
 
+AssignmentReasonCode = Literal[
+    "fixed",
+    "capacity_or_cost",
+    "destination_mismatch",
+    "over_capacity",
+    "ca_unsupported",
+    "sea_deadline_miss",
+    "sea_sell_by_miss",
+    "sea_shelf_life_miss",
+    "sea_forbidden",
+    "pickup_cutoff_miss",
+    "air_not_allowed",
+    "air_forbidden",
+    "air_sell_by_miss",
+    "air_shelf_life_miss",
+    "no_feasible_mode",
+    "no_solution",
+    "other",
+]
+
+
+class AssignmentReason(BaseModel):
+    code: AssignmentReasonCode
+    message: str
+
+
 class Assignment(BaseModel):
     lot_id: str
     shipper_id: str
@@ -234,6 +260,7 @@ class Assignment(BaseModel):
     container_id: str | None = None
     voyage_id: str | None = None
     pull_forward_days: int = 0
+    reason: AssignmentReason | None = None
 
 
 class UnassignedLot(BaseModel):
@@ -241,6 +268,7 @@ class UnassignedLot(BaseModel):
     shipper_id: str
     pallets: int
     reason: str
+    reason_code: AssignmentReasonCode = "other"
 
 
 class ContainerLoad(BaseModel):

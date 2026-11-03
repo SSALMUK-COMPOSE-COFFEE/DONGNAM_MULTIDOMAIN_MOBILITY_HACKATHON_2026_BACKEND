@@ -6,11 +6,14 @@ from datetime import datetime, timedelta
 from pydantic import BaseModel, Field
 
 from freshswitch_backend.domain.models import (
+    Assignment,
+    AssignmentReason,
     CollectionReassignment,
     Lot,
     LotCollection,
     Plan,
     Scenario,
+    UnassignedLot,
 )
 from freshswitch_backend.observability import record_event
 from freshswitch_backend.optimize import AIR, solve_plan
@@ -271,15 +274,32 @@ def solve_with_routes(
         )
         for lid, (voyage_id, stop_id) in {**dropped_at, **still}.items()
     ]
-    unassigned = [
-        u.model_copy(update={"reason": f"{CUTOFF_REASON}; {u.reason}"})
-        if u.lot_id in dropped_at and CUTOFF_REASON not in u.reason
-        else u
-        for u in plan.unassigned
+    unassigned = [_cutoff_unassigned(u) if u.lot_id in dropped_at else u for u in plan.unassigned]
+    assignments = [
+        _cutoff_air(a, dropped_at[a.lot_id][0]) if a.mode == "air" and a.lot_id in dropped_at else a
+        for a in plan.assignments
     ]
     return with_routes(
-        scenario, plan, routes, collection_reassigned=reassigned, unassigned=unassigned
+        scenario,
+        plan,
+        routes,
+        collection_reassigned=reassigned,
+        unassigned=unassigned,
+        assignments=assignments,
     )
+
+
+def _cutoff_unassigned(lot: UnassignedLot) -> UnassignedLot:
+    reason = lot.reason if CUTOFF_REASON in lot.reason else f"{CUTOFF_REASON}; {lot.reason}"
+    return lot.model_copy(update={"reason": reason, "reason_code": "pickup_cutoff_miss"})
+
+
+def _cutoff_air(assignment: Assignment, voyage_id: str) -> Assignment:
+    reason = AssignmentReason(
+        code="pickup_cutoff_miss",
+        message=f"{CUTOFF_REASON}: {voyage_id} 집하 경로에 넣을 수 없어 항공 배정",
+    )
+    return assignment.model_copy(update={"reason": reason})
 
 
 def build_plan(scenario: Scenario, **options) -> PlanWithRoutes:
