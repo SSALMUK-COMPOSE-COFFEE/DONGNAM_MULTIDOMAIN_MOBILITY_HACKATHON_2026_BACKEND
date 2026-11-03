@@ -47,6 +47,7 @@ from freshswitch_backend.execution.quality import (
 from freshswitch_backend.persistence import Database, database
 from freshswitch_backend.persistence.tables import (
     ALERT_SEQ,
+    DEMO_ORG,
     AlertRow,
     BindingRow,
     ContainerRow,
@@ -91,10 +92,11 @@ class ContainerRecord:
     stored_readings: set[tuple[str, datetime]] = field(default_factory=set)
     stored_alerts: set[str] = field(default_factory=set)
     stored: bool = False
+    org_id: str = DEMO_ORG
 
     @property
     def key(self) -> str:
-        return _record_key(self.plan_id, self.container_id)
+        return _record_key(self.plan_id, self.container_id, self.org_id)
 
     def sorted_readings(self) -> list[Reading]:
         return sorted(self.readings.values(), key=lambda r: (r.ts, r.device_id))
@@ -106,14 +108,19 @@ class _Run:
     readings: list[ReadingIn]
     stop: threading.Event
     thread: threading.Thread | None = None
+    org_id: str = DEMO_ORG
 
 
 def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _record_key(plan_id: str | None, container_id: str) -> str:
-    return f"{plan_id or '-'}:{container_id}"
+def _record_key(plan_id: str | None, container_id: str, org_id: str = DEMO_ORG) -> str:
+    if plan_id:
+        return f"{plan_id}:{container_id}"
+    if org_id == DEMO_ORG:
+        return f"-:{container_id}"
+    return f"-{org_id}:{container_id}"
 
 
 _CARRY = TypeAdapter(Carry)
@@ -139,14 +146,31 @@ class ColdchainStore:
             if run.thread is not None and run.thread is not threading.current_thread():
                 run.thread.join(timeout=5)
 
-    def clear(self) -> int:
-        self.stop_all()
+    def _stop_runs(self, org_id: str) -> None:
+        with self._lock:
+            runs = [run for run in self._runs.values() if run.org_id == org_id]
+            for run in runs:
+                run.stop.set()
+                del self._runs[run.info.run_id]
+        for run in runs:
+            if run.thread is not None and run.thread is not threading.current_thread():
+                run.thread.join(timeout=5)
+
+    def clear(self, org_id: str = DEMO_ORG) -> int:
+        self._stop_runs(org_id)
         with self._lock:
             with self._db.begin() as db:
-                count = db.scalar(select(func.count()).select_from(ContainerRow)) or 0
-                db.execute(delete(ContainerRow))
-                db.execute(delete(BindingRow))
-                db.execute(delete(RunRow))
+                count = (
+                    db.scalar(
+                        select(func.count())
+                        .select_from(ContainerRow)
+                        .where(ContainerRow.org_id == org_id)
+                    )
+                    or 0
+                )
+                db.execute(delete(ContainerRow).where(ContainerRow.org_id == org_id))
+                db.execute(delete(BindingRow).where(BindingRow.org_id == org_id))
+                db.execute(delete(RunRow).where(RunRow.org_id == org_id))
             return count
 
     def finish_orphan_runs(self) -> int:
@@ -161,13 +185,15 @@ class ColdchainStore:
                 count += 1
             return count
 
-    def _session(self, plan_id: str | None) -> PlanSession | None:
-        return plan_store.get(plan_id) if plan_id else None
+    def _session(self, plan_id: str | None, org_id: str = DEMO_ORG) -> PlanSession | None:
+        return plan_store.get(plan_id, org_id=org_id) if plan_id else None
 
-    def require_plan(self, plan_id: str | None, container_id: str | None = None) -> None:
+    def require_plan(
+        self, plan_id: str | None, container_id: str | None = None, org_id: str = DEMO_ORG
+    ) -> None:
         if plan_id is None:
             return
-        session = plan_store.get(plan_id)
+        session = self._session(plan_id, org_id)
         if session is None:
             raise NotFound("계획을 찾을 수 없습니다")
         if container_id is not None and container_id not in {
@@ -176,25 +202,29 @@ class ColdchainStore:
             raise ColdchainError(f"계획에 없는 컨테이너입니다: {container_id}")
 
     def _matches(
-        self, db: Session, container_id: str, plan_id: str | None = None
+        self, db: Session, container_id: str, plan_id: str | None = None, org_id: str = DEMO_ORG
     ) -> list[ContainerRow]:
-        query = select(ContainerRow).where(ContainerRow.container_id == container_id)
+        query = select(ContainerRow).where(
+            ContainerRow.container_id == container_id, ContainerRow.org_id == org_id
+        )
         if plan_id is not None:
             query = query.where(ContainerRow.plan_id == plan_id)
         return list(db.scalars(query.order_by(ContainerRow.seq)))
 
-    def _resolve_plan(self, db: Session, container_id: str, plan_id: str | None) -> str | None:
+    def _resolve_plan(
+        self, db: Session, container_id: str, plan_id: str | None, org_id: str = DEMO_ORG
+    ) -> str | None:
         if plan_id is not None:
             return plan_id
-        matches = self._matches(db, container_id)
+        matches = self._matches(db, container_id, None, org_id)
         if len(matches) > 1:
             raise ColdchainError(AMBIGUOUS)
         return matches[0].plan_id if matches else None
 
     def _find(
-        self, db: Session, container_id: str, plan_id: str | None = None
+        self, db: Session, container_id: str, plan_id: str | None = None, org_id: str = DEMO_ORG
     ) -> ContainerRecord | None:
-        matches = self._matches(db, container_id, plan_id)
+        matches = self._matches(db, container_id, plan_id, org_id)
         if len(matches) > 1:
             raise ColdchainError(AMBIGUOUS)
         return self._load(db, matches[0]) if matches else None
@@ -213,6 +243,7 @@ class ColdchainStore:
             history=_HISTORY.validate_python(row.history),
             anchors=set(_ANCHORS.validate_python(row.anchors)),
             stored=True,
+            org_id=row.org_id,
         )
         for item in readings:
             reading = Reading.model_validate(item.payload)
@@ -232,6 +263,7 @@ class ColdchainStore:
             db.add(
                 ContainerRow(
                     record_key=record.key,
+                    org_id=record.org_id,
                     container_id=record.container_id,
                     plan_id=record.plan_id,
                     stage=record.stage,
@@ -273,6 +305,7 @@ class ColdchainStore:
             db.add(
                 AlertRow(
                     seq=alert.seq,
+                    org_id=record.org_id,
                     record_key=record.key,
                     container_id=record.container_id,
                     plan_id=record.plan_id,
@@ -291,33 +324,38 @@ class ColdchainStore:
         records: dict[str, ContainerRecord],
         container_id: str,
         plan_id: str | None,
+        org_id: str = DEMO_ORG,
     ) -> ContainerRecord:
-        key = _record_key(plan_id, container_id)
+        key = _record_key(plan_id, container_id, org_id)
         record = records.get(key)
         if record is None:
             row = db.get(ContainerRow, key)
+            if row is not None and row.org_id != org_id:
+                raise NotFound("계획을 찾을 수 없습니다")
             record = (
                 self._load(db, row)
                 if row is not None
-                else ContainerRecord(container_id=container_id, plan_id=plan_id)
+                else ContainerRecord(container_id=container_id, plan_id=plan_id, org_id=org_id)
             )
             records[key] = record
         return record
 
-    def _trim(self, db: Session) -> None:
+    def _trim(self, db: Session, org_id: str = DEMO_ORG) -> None:
+        scope = ContainerRow.org_id == org_id
         cutoff = db.scalar(
             select(ContainerRow.seq)
+            .where(scope)
             .order_by(ContainerRow.seq.desc())
             .offset(MAX_CONTAINERS)
             .limit(1)
         )
         if cutoff is not None:
-            db.execute(delete(ContainerRow).where(ContainerRow.seq <= cutoff))
+            db.execute(delete(ContainerRow).where(ContainerRow.seq <= cutoff, scope))
 
-    def bind(self, body: BindingRequest) -> Binding:
+    def bind(self, body: BindingRequest, org_id: str = DEMO_ORG) -> Binding:
         with self._lock, self._db.begin() as db:
-            plan_id = self._resolve_plan(db, body.container_id, body.plan_id)
-            self.require_plan(plan_id, body.container_id)
+            plan_id = self._resolve_plan(db, body.container_id, body.plan_id, org_id)
+            self.require_plan(plan_id, body.container_id, org_id)
             binding = Binding(
                 device_id=body.device_id,
                 container_id=body.container_id,
@@ -326,11 +364,14 @@ class ColdchainStore:
                 bound_at=self.clock(),
             )
             row = db.get(BindingRow, body.device_id)
+            if row is not None and row.org_id != org_id:
+                raise ColdchainError(f"다른 조직에 연결된 장치입니다: {body.device_id}")
             payload = binding.model_dump(mode="json")
             if row is None:
                 db.add(
                     BindingRow(
                         device_id=body.device_id,
+                        org_id=org_id,
                         container_id=body.container_id,
                         plan_id=plan_id,
                         payload=payload,
@@ -340,25 +381,29 @@ class ColdchainStore:
                 row.container_id = body.container_id
                 row.plan_id = plan_id
                 row.payload = payload
-            record = self._record(db, {}, body.container_id, plan_id)
+            record = self._record(db, {}, body.container_id, plan_id, org_id)
             if body.stage:
                 record.stage = body.stage
             self._save(db, record)
-            self._trim(db)
+            self._trim(db, org_id)
             return binding
 
-    def bindings(self) -> list[Binding]:
+    def bindings(self, org_id: str = DEMO_ORG) -> list[Binding]:
         with self._db.begin() as db:
-            rows = db.scalars(select(BindingRow).order_by(BindingRow.device_id))
+            rows = db.scalars(
+                select(BindingRow).where(BindingRow.org_id == org_id).order_by(BindingRow.device_id)
+            )
             return [Binding.model_validate(row.payload) for row in rows]
 
-    def _binding(self, db: Session, device_id: str) -> Binding | None:
+    def _binding(self, db: Session, device_id: str, org_id: str = DEMO_ORG) -> Binding | None:
         row = db.get(BindingRow, device_id)
-        return Binding.model_validate(row.payload) if row is not None else None
+        if row is None or row.org_id != org_id:
+            return None
+        return Binding.model_validate(row.payload)
 
     def _context(self, record: ContainerRecord, plan_id: str | None = None) -> TwinContext:
         plan_id = plan_id or record.plan_id
-        session = self._session(plan_id)
+        session = self._session(plan_id, record.org_id)
         return build_context(
             record.container_id,
             record.stage,
@@ -428,11 +473,11 @@ class ColdchainStore:
             open_actions=sum(1 for a in record.alerts.values() if a.action is not None),
         )
 
-    def ingest(self, items: list[ReadingIn]) -> IngestResult:
+    def ingest(self, items: list[ReadingIn], org_id: str = DEMO_ORG) -> IngestResult:
         with self._lock, self._db.begin() as db:
-            return self._ingest(db, items)
+            return self._ingest(db, items, org_id)
 
-    def _ingest(self, db: Session, items: list[ReadingIn]) -> IngestResult:
+    def _ingest(self, db: Session, items: list[ReadingIn], org_id: str) -> IngestResult:
         accepted = 0
         duplicates = 0
         rejected: list[IngestRejected] = []
@@ -444,7 +489,7 @@ class ColdchainStore:
         live: dict[str, bool] = {}
         for index, item in enumerate(items):
             if item.device_id not in bindings:
-                bindings[item.device_id] = self._binding(db, item.device_id)
+                bindings[item.device_id] = self._binding(db, item.device_id, org_id)
             binding = bindings[item.device_id]
             container_id = item.container_id or (binding.container_id if binding else None)
             if container_id is None:
@@ -461,14 +506,14 @@ class ColdchainStore:
                 plan_id = binding.plan_id
                 if plan_id is not None:
                     if plan_id not in live:
-                        live[plan_id] = plan_store.get(plan_id) is not None
+                        live[plan_id] = self._session(plan_id, org_id) is not None
                     if not live[plan_id]:
                         plan_id = None
             check = (plan_id, container_id)
             if check not in checked:
                 try:
-                    resolved = self._resolve_plan(db, container_id, plan_id)
-                    self.require_plan(resolved, container_id)
+                    resolved = self._resolve_plan(db, container_id, plan_id, org_id)
+                    self.require_plan(resolved, container_id, org_id)
                     checked[check] = (resolved, None)
                 except (NotFound, ColdchainError) as exc:
                     checked[check] = (None, str(exc))
@@ -478,7 +523,7 @@ class ColdchainStore:
                     IngestRejected(index=index, device_id=item.device_id, reason=reason)
                 )
                 continue
-            record = self._record(db, records, container_id, plan_id)
+            record = self._record(db, records, container_id, plan_id, org_id)
             stage = item.stage or (binding.stage if binding else None)
             if stage:
                 record.stage = stage
@@ -518,7 +563,7 @@ class ColdchainStore:
             summaries.append(self._summary(record, ctx, ev))
         for record in records.values():
             self._save(db, record)
-        self._trim(db)
+        self._trim(db, org_id)
         return IngestResult(
             accepted=accepted,
             duplicates=duplicates,
@@ -527,20 +572,30 @@ class ColdchainStore:
             new_alerts=new_alerts,
         )
 
-    def get_record(self, container_id: str, plan_id: str | None = None) -> ContainerRecord:
+    def get_record(
+        self, container_id: str, plan_id: str | None = None, org_id: str = DEMO_ORG
+    ) -> ContainerRecord:
         with self._db.begin() as db:
-            record = self._find(db, container_id, plan_id)
+            record = self._find(db, container_id, plan_id, org_id)
         if record is None:
             raise NotFound(f"센서 기록이 없는 컨테이너입니다: {container_id}")
         return record
 
-    def state(self, container_id: str, plan_id: str | None = None, points: int = 720) -> TwinState:
-        self.require_plan(plan_id, container_id)
+    def state(
+        self,
+        container_id: str,
+        plan_id: str | None = None,
+        points: int = 720,
+        org_id: str = DEMO_ORG,
+    ) -> TwinState:
+        self.require_plan(plan_id, container_id, org_id)
         with self._lock:
             with self._db.begin() as db:
-                record = self._find(db, container_id, plan_id)
+                record = self._find(db, container_id, plan_id, org_id)
             has_data = record is not None
-            record = record or ContainerRecord(container_id=container_id, plan_id=plan_id)
+            record = record or ContainerRecord(
+                container_id=container_id, plan_id=plan_id, org_id=org_id
+            )
             ctx, ev = self._evaluate(record, plan_id)
             alerts = list(record.alerts.values())
             return TwinState(
@@ -564,10 +619,14 @@ class ColdchainStore:
                 has_data=has_data,
             )
 
-    def summaries(self, plan_id: str | None = None) -> list[TwinSummary]:
+    def summaries(self, plan_id: str | None = None, org_id: str = DEMO_ORG) -> list[TwinSummary]:
         with self._lock:
             with self._db.begin() as db:
-                query = select(ContainerRow).order_by(ContainerRow.seq)
+                query = (
+                    select(ContainerRow)
+                    .where(ContainerRow.org_id == org_id)
+                    .order_by(ContainerRow.seq)
+                )
                 if plan_id is not None:
                     query = query.where(ContainerRow.plan_id == plan_id)
                 records = [self._load(db, row) for row in db.scalars(query).all()]
@@ -577,20 +636,27 @@ class ColdchainStore:
                 out.append(self._summary(record, ctx, ev))
             return out
 
-    def reset_container(self, container_id: str, plan_id: str | None = None) -> None:
+    def reset_container(
+        self, container_id: str, plan_id: str | None = None, org_id: str = DEMO_ORG
+    ) -> None:
         with self._lock:
             with self._db.begin() as db:
-                matches = self._matches(db, container_id, plan_id)
+                matches = self._matches(db, container_id, plan_id, org_id)
                 if len(matches) > 1:
                     raise ColdchainError(AMBIGUOUS)
                 resolved = matches[0].plan_id if matches else plan_id
                 db.execute(
                     delete(ContainerRow).where(
-                        ContainerRow.record_key == _record_key(resolved, container_id)
+                        ContainerRow.record_key == _record_key(resolved, container_id, org_id),
+                        ContainerRow.org_id == org_id,
                     )
                 )
             for run in self._runs.values():
-                if run.info.container_id == container_id and run.info.plan_id == resolved:
+                if (
+                    run.org_id == org_id
+                    and run.info.container_id == container_id
+                    and run.info.plan_id == resolved
+                ):
                     run.stop.set()
 
     def _last_seq(self, db: Session) -> int:
@@ -603,9 +669,14 @@ class ColdchainStore:
         container_id: str | None = None,
         limit: int = 100,
         plan_id: str | None = None,
+        org_id: str = DEMO_ORG,
     ) -> AlertFeed:
         with self._db.begin() as db:
-            query = select(AlertRow).where(AlertRow.seq > since).order_by(AlertRow.seq)
+            query = (
+                select(AlertRow)
+                .where(AlertRow.seq > since, AlertRow.org_id == org_id)
+                .order_by(AlertRow.seq)
+            )
             if container_id is not None:
                 query = query.where(AlertRow.container_id == container_id)
             if plan_id is not None:
@@ -619,13 +690,13 @@ class ColdchainStore:
             return AlertFeed(alerts=items, next_since=next_since)
 
     def settlement_preview(
-        self, container_id: str, plan_id: str | None = None
+        self, container_id: str, plan_id: str | None = None, org_id: str = DEMO_ORG
     ) -> SettlementPreview:
-        self.require_plan(plan_id, container_id)
+        self.require_plan(plan_id, container_id, org_id)
         with self._lock:
-            record = self.get_record(container_id, plan_id)
+            record = self.get_record(container_id, plan_id, org_id)
             plan_id = plan_id or record.plan_id
-            session = self._session(plan_id)
+            session = self._session(plan_id, org_id)
             if session is None or plan_id is None:
                 raise ColdchainError("계획과 연결되지 않은 컨테이너입니다. plan_id를 지정하세요")
             ctx, ev = self._evaluate(record, plan_id)
@@ -670,19 +741,23 @@ class ColdchainStore:
             note="도착 검수 전 예상치. 계획 손실 가정을 넘는 손실액만큼 성과보수에서 뺀다(하한 0)",
         )
 
-    def _make_run_room(self, db: Session) -> None:
-        total = db.scalar(select(func.count()).select_from(RunRow)) or 0
+    def _make_run_room(self, db: Session, org_id: str = DEMO_ORG) -> None:
+        scope = RunRow.org_id == org_id
+        total = db.scalar(select(func.count()).select_from(RunRow).where(scope)) or 0
         excess = total - MAX_RUNS + 1
         if excess <= 0:
             return
         finished = db.scalars(
-            select(RunRow.run_id).where(RunRow.done.is_(True)).order_by(RunRow.seq).limit(excess)
+            select(RunRow.run_id)
+            .where(RunRow.done.is_(True), scope)
+            .order_by(RunRow.seq)
+            .limit(excess)
         ).all()
         if len(finished) < excess:
             raise ColdchainError("동시에 실행할 수 있는 시뮬레이션 수를 초과했습니다")
         db.execute(delete(RunRow).where(RunRow.run_id.in_(finished)))
 
-    def _persist_run(self, info: SimulationRun) -> None:
+    def _persist_run(self, info: SimulationRun, org_id: str = DEMO_ORG) -> None:
         with self._db.begin() as db:
             row = db.get(RunRow, info.run_id)
             payload = info.model_dump(mode="json")
@@ -690,6 +765,7 @@ class ColdchainStore:
                 db.add(
                     RunRow(
                         run_id=info.run_id,
+                        org_id=org_id,
                         container_id=info.container_id,
                         done=info.done,
                         payload=payload,
@@ -699,21 +775,21 @@ class ColdchainStore:
                 row.done = info.done
                 row.payload = payload
 
-    def simulate(self, body: SimulationRequest) -> SimulationRun:
+    def simulate(self, body: SimulationRequest, org_id: str = DEMO_ORG) -> SimulationRun:
         preset = PRESETS[body.preset]
         with self._lock:
             with self._db.begin() as db:
-                self._make_run_room(db)
-                plan_id = self._resolve_plan(db, body.container_id, body.plan_id)
-                self.require_plan(plan_id, body.container_id)
+                self._make_run_room(db, org_id)
+                plan_id = self._resolve_plan(db, body.container_id, body.plan_id, org_id)
+                self.require_plan(plan_id, body.container_id, org_id)
             if body.reset:
-                self.reset_container(body.container_id, plan_id)
+                self.reset_container(body.container_id, plan_id, org_id)
             with self._db.begin() as db:
-                record = self._record(db, {}, body.container_id, plan_id)
+                record = self._record(db, {}, body.container_id, plan_id, org_id)
                 record.stage = body.stage
                 ctx = self._context(record)
                 self._save(db, record)
-                self._trim(db)
+                self._trim(db, org_id)
         readings = preset_readings(
             preset,
             device_id=body.device_id,
@@ -740,20 +816,20 @@ class ColdchainStore:
         if body.interval_seconds <= 0:
             with self._lock:
                 with self._db.begin() as db:
-                    self._make_run_room(db)
-                result = self.ingest(readings)
+                    self._make_run_room(db, org_id)
+                result = self.ingest(readings, org_id)
                 info.sent = len(readings)
                 info.done = True
                 info.state = result.containers[0] if result.containers else None
-                self._persist_run(info)
+                self._persist_run(info, org_id)
             return info
-        run = _Run(info=info, readings=readings, stop=threading.Event())
+        run = _Run(info=info, readings=readings, stop=threading.Event(), org_id=org_id)
         run.thread = threading.Thread(target=self._stream, args=(run,), daemon=True)
         with self._lock:
             with self._db.begin() as db:
-                self._make_run_room(db)
+                self._make_run_room(db, org_id)
             self._runs[info.run_id] = run
-            self._persist_run(info)
+            self._persist_run(info, org_id)
         run.thread.start()
         return info.model_copy()
 
@@ -763,11 +839,11 @@ class ColdchainStore:
                 with self._lock:
                     if run.stop.is_set():
                         break
-                    result = self.ingest([reading])
+                    result = self.ingest([reading], run.org_id)
                     run.info.sent += 1
                     if result.containers:
                         run.info.state = result.containers[0]
-                    self._persist_run(run.info)
+                    self._persist_run(run.info, run.org_id)
                 if run.stop.wait(run.info.interval_seconds):
                     break
         except Exception as exc:
@@ -783,45 +859,51 @@ class ColdchainStore:
                 return
             del self._runs[run.info.run_id]
             try:
-                self._persist_run(run.info)
+                self._persist_run(run.info, run.org_id)
             except Exception:
                 logger.exception("시뮬레이션 종료 상태 저장 실패: %s", run.info.run_id)
 
-    def _stored_run(self, run_id: str) -> SimulationRun:
+    def _stored_run(self, run_id: str, org_id: str = DEMO_ORG) -> SimulationRun:
         with self._db.begin() as db:
             row = db.get(RunRow, run_id)
-            if row is None:
+            if row is None or row.org_id != org_id:
                 raise NotFound("시뮬레이션 실행을 찾을 수 없습니다")
             info = SimulationRun.model_validate(row.payload)
         if not info.done:
             info.done = True
         return info
 
-    def run(self, run_id: str) -> SimulationRun:
+    def _live_run(self, run_id: str, org_id: str) -> _Run | None:
+        run = self._runs.get(run_id)
+        if run is None or run.org_id != org_id:
+            return None
+        return run
+
+    def run(self, run_id: str, org_id: str = DEMO_ORG) -> SimulationRun:
         with self._lock:
-            run = self._runs.get(run_id)
+            run = self._live_run(run_id, org_id)
             if run is None:
-                return self._stored_run(run_id)
+                return self._stored_run(run_id, org_id)
             return run.info.model_copy()
 
-    def stop(self, run_id: str) -> SimulationRun:
+    def stop(self, run_id: str, org_id: str = DEMO_ORG) -> SimulationRun:
         with self._lock:
-            run = self._runs.get(run_id)
+            run = self._live_run(run_id, org_id)
             if run is None:
-                return self._stored_run(run_id)
+                return self._stored_run(run_id, org_id)
             run.stop.set()
         if run.thread is not None:
             run.thread.join(timeout=5)
-        return self.run(run_id)
+        return self.run(run_id, org_id)
 
-    def wait(self, run_id: str, timeout: float = 30) -> SimulationRun:
+    def wait(self, run_id: str, timeout: float = 30, org_id: str = DEMO_ORG) -> SimulationRun:
         with self._lock:
-            run = self._runs.get(run_id)
+            run = self._live_run(run_id, org_id)
         if run is None:
-            return self._stored_run(run_id)
+            return self._stored_run(run_id, org_id)
         if run.thread is not None:
             run.thread.join(timeout=timeout)
-        return self.run(run_id)
+        return self.run(run_id, org_id)
 
 
 coldchain_store = ColdchainStore()
