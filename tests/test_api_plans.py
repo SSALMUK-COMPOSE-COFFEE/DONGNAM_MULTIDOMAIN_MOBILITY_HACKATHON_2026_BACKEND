@@ -178,7 +178,7 @@ def test_explanation_llm_flag_needs_setting(client: TestClient, monkeypatch) -> 
 
     calls: list = []
 
-    async def fake_explain(ctx):
+    async def fake_explain(ctx, **kwargs):
         calls.append(ctx)
         from freshswitch_backend.explain import render_template
 

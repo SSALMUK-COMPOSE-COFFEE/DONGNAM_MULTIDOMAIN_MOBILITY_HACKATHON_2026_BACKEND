@@ -47,3 +47,4 @@ class Explanation(BaseModel):
     shipper_messages: list[ShipperMessage]
     generated_by: Literal["llm", "template"]
     model: str | None = None
+    fallback_reason: Literal["unavailable", "timeout", "validation", "provider_error"] | None = None

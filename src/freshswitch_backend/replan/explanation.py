@@ -9,6 +9,8 @@ from freshswitch_backend.explain import (
     explain,
     render_template,
 )
+from freshswitch_backend.explain.service import LLM_TIMEOUT_SECONDS
+from freshswitch_backend.observability import record_event
 from freshswitch_backend.optimize import AIR
 from freshswitch_backend.replan.engine import UNASSIGNED, locations
 from freshswitch_backend.replan.models import (
@@ -147,8 +149,16 @@ async def explain_replan(
     result: ReplanResult,
     *,
     use_llm: bool = False,
+    timeout_s: float = LLM_TIMEOUT_SECONDS,
 ) -> Explanation:
     ctx = build_explain_context(scenario_before, current, result)
     if use_llm:
-        return await explain(ctx)
+        return await explain(ctx, timeout_s=timeout_s)
+    record_event(
+        "ai.explanation",
+        source="template",
+        event_type=ctx.event_type,
+        fallback_reason="disabled",
+        shipper_count=len(ctx.shippers),
+    )
     return render_template(ctx)
