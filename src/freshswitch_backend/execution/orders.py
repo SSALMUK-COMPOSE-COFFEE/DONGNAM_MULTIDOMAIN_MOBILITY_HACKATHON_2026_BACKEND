@@ -14,6 +14,8 @@ from freshswitch_backend.execution.models import (
     ShipperConfirmation,
 )
 from freshswitch_backend.execution.params import ExecutionParams
+
+CONSOLIDATOR_LABEL = {"platform": "플랫폼(혼재 주관)", "forwarder": "포워더(혼재 주관)"}
 from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.planning.service import VoyagePickup
 from freshswitch_backend.replan.engine import locations
@@ -670,12 +672,16 @@ def _automatic_actions(
     )
     charge = ctx.alternative.diff.cancellation
     if charge and charge.fee > 0:
-        transfers = ", ".join(
+        recipients = [
             f"{short_name(ctx.shipper_name(t.shipper_id))} {t.amount:,}원" for t in charge.transfers
-        )
+        ]
+        if charge.consolidator_amount > 0:
+            recipients.append(
+                f"{CONSOLIDATOR_LABEL[charge.consolidator]} {charge.consolidator_amount:,}원"
+            )
         text += (
             f". 취소 부담금 {short_name(ctx.shipper_name(charge.payer_shipper_id))} "
-            f"{charge.fee:,}원 → {transfers}"
+            f"{charge.fee:,}원 → {', '.join(recipients)}"
         )
     actions.append(AutomaticAction(kind="settlement_recompute", description=text))
     return actions

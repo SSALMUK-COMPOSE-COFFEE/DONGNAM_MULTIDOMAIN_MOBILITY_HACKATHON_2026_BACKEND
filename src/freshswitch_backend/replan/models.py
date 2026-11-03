@@ -114,6 +114,9 @@ class CancellationCharge(BaseModel):
     fee_rate: float
     fee: int
     transfers: list[CancellationTransfer]
+    recipient_kind: Literal["shippers", "consolidator", "mixed"] | None = None
+    consolidator: Literal["platform", "forwarder"] = "platform"
+    consolidator_amount: int = 0
     rule: str
     source: str
 

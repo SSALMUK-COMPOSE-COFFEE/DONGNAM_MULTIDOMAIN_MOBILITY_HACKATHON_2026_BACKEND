@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel
 
 from freshswitch_backend.domain.models import Quantity
@@ -38,4 +40,10 @@ class ExecutionParams(BaseModel):
         "비율",
         "가정: 취소·감량 화주가 같은 컨테이너 다른 화주의 늘어난 운임·부대비 몫(데드프레이트)을 "
         "부담하는 비율. 심사 실무자 지적(judge-2: 미달분 데드프레이트 부담 규칙은 참여 계약서에)",
+    )
+    cancellation_consolidator: Literal["platform", "forwarder"] = "platform"
+    cancellation_consolidator_source: str = (
+        "결정(D12): 정산표 단가 화주는 컨테이너 몫이 늘어도 단가가 그대로라 손실이 없다. "
+        "그 빈칸 비용은 혼재 주관자(플랫폼)가 떠안으므로 부담금도 플랫폼이 받는다. "
+        "포워더 배분은 D2(0%)를 따른다"
     )

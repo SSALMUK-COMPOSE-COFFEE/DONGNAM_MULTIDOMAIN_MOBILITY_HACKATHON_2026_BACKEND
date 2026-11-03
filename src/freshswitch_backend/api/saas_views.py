@@ -37,7 +37,13 @@ CONFIRMATION_MONEY = (
     "cancellation_adjustment",
     "net_cost_delta",
 )
-CANCELLATION_MONEY = ("container_cost", "share_per_pallet_before", "share_per_pallet_after", "fee")
+CANCELLATION_MONEY = (
+    "container_cost",
+    "share_per_pallet_before",
+    "share_per_pallet_after",
+    "fee",
+    "consolidator_amount",
+)
 INSPECTION_FIELDS = (
     "lot_id",
     "shipper_id",
@@ -70,6 +76,7 @@ class ForwarderCancellation(CancellationCharge):
     share_per_pallet_before: int | None = None
     share_per_pallet_after: int | None = None
     fee: int | None = None
+    consolidator_amount: int | None = None
     transfers: list[ForwarderCancellationTransfer]
 
 
@@ -470,6 +477,7 @@ def shipper_order_view(
     if cancellation is not None:
         if cancellation["payer_shipper_id"] not in own:
             cancellation["fee"] = None
+            cancellation["consolidator_amount"] = None
         cancellation["transfers"] = [t for t in cancellation["transfers"] if t["shipper_id"] in own]
     return Anonymizer(session.scenario, own).walk(payload)
 
