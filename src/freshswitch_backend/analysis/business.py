@@ -21,14 +21,17 @@ from freshswitch_backend.analysis.models import (
     VoyageEconomics,
 )
 from freshswitch_backend.analysis.params import SPEC_BY_KEY, anchor_value, scaled
-from freshswitch_backend.domain.models import Plan, Scenario
+from freshswitch_backend.domain.models import CostParams, Plan, Scenario
+from freshswitch_backend.optimize.settlement import usage_fee, uses_usage_fee
 
 ANNUAL_FIXED_COST = 150_000_000
 VOYAGES_PER_YEAR = 52
-DEFAULT_FORWARDER_SHARE = 0.4
+DEFAULT_FORWARDER_SHARE = 0.0
+FORWARDER_SHARE_SOURCE = (
+    "최종 기획서: 포워더는 실행 파트너, 자기 운임·수수료를 화주에게 별도 청구. 성과보수 배분 없음"
+)
+FORWARDER_SHARE_SENSITIVITY_LABEL = "가정(포워더 배분형)"
 DEFAULT_OPS_COST_PER_VOYAGE = round(ANNUAL_FIXED_COST / VOYAGES_PER_YEAR)
-USAGE_FEE_PER_PALLET = 20_000
-USAGE_FEE_PRODUCTS = frozenset({"grape_so2"})
 PALLET_KG = 415
 PROPOSAL = "기획서 ㅍ3"
 FREIGHT_DIFFERENCE_PER_PALLET = 664_000
@@ -95,8 +98,10 @@ def voyage_economics(
     ops_cost_per_voyage: int,
     variable_cost_per_pallet: int = 0,
 ) -> list[VoyageEconomics]:
-    fee_rate = scenario.cost_params.platform_fee_rate.value
+    params = scenario.cost_params
+    fee_rate = params.platform_fee_rate.value
     keep = fee_rate * (1 - forwarder_share)
+    usage_keep = params.billing.usage_fee_per_pallet_krw.value * (1 - forwarder_share)
     money = _LotMoney(plan)
     lots_in: dict[str, list] = defaultdict(list)
     for a in plan.assignments:
@@ -117,13 +122,19 @@ def voyage_economics(
             fee = sum(money.fee[a.lot_id] for a in items)
             fee_total += fee
             usage_rule_total += sum(
-                USAGE_FEE_PER_PALLET * a.pallets
-                if a.product_id in USAGE_FEE_PRODUCTS
+                usage_fee(params, a.pallets)
+                if uses_usage_fee(params, a.product_id)
                 else money.fee[a.lot_id]
                 for a in items
             )
             margin = (savings + fixed) / load.pallets if load.pallets else 0.0
-            platform = _breakeven(ops_per_container / keep + fixed, margin) if keep > 0 else None
+            usage_only = bool(items) and all(uses_usage_fee(params, a.product_id) for a in items)
+            if usage_only:
+                platform = _breakeven(ops_per_container, usage_keep)
+            else:
+                platform = (
+                    _breakeven(ops_per_container / keep + fixed, margin) if keep > 0 else None
+                )
             rows.append(
                 ContainerEconomics(
                     container_id=load.container_id,
@@ -180,7 +191,9 @@ def season_projection(
     if not all(pid in product_ids for pid, _, _ in SEASON_VOLUMES):
         return None
     money = _LotMoney(plan)
-    fee_rate = scenario.cost_params.platform_fee_rate.value
+    params = scenario.cost_params
+    fee_rate = params.platform_fee_rate.value
+    per_pallet_fee = usage_fee(params, 1)
     lines = []
     for product_id, tonnes, source in SEASON_VOLUMES:
         sea = [a for a in plan.assignments if a.mode == "sea" and a.product_id == product_id]
@@ -191,9 +204,9 @@ def season_projection(
         containers = {a.container_id for a in sea}
         per_container = sea_pallets / len(containers)
         pallets = round(tonnes * 1000 / PALLET_KG)
-        if product_id in USAGE_FEE_PRODUCTS:
-            rule = f"파렛트 이용료 {USAGE_FEE_PER_PALLET:,}원({PROPOSAL} 8-1: 이미 배로 가는 품목)"
-            revenue = pallets * USAGE_FEE_PER_PALLET
+        if uses_usage_fee(params, product_id):
+            rule = f"파렛트 이용료 {per_pallet_fee:,}원({PROPOSAL} 8-1: 이미 배로 가는 품목)"
+            revenue = usage_fee(params, pallets)
         else:
             rule = f"절감액 × {fee_rate:.0%}({PROPOSAL} 8-1)"
             revenue = round(pallets * per_pallet * fee_rate)
@@ -235,6 +248,7 @@ def business(
         scenario, plan, forwarder_share, ops_cost_per_voyage, variable_cost_per_pallet
     )
     fee_rate = scenario.cost_params.platform_fee_rate
+    usage = scenario.cost_params.billing.usage_fee_per_pallet_krw
     assumptions = [
         Assumption(
             key="platform_fee_rate", value=fee_rate.value, unit="비율", source=fee_rate.source
@@ -243,7 +257,7 @@ def business(
             key="forwarder_share",
             value=forwarder_share,
             unit="수수료 대비 비율",
-            source="가정: 문서에 포워더 배분 수치 없음. 1년 차는 포워더 명의 운송(기획서 8-1)",
+            source=FORWARDER_SHARE_SOURCE,
         ),
         Assumption(
             key="ops_cost_per_voyage",
@@ -253,9 +267,9 @@ def business(
         ),
         Assumption(
             key="usage_fee_per_pallet",
-            value=USAGE_FEE_PER_PALLET,
-            unit="원/파렛트",
-            source=f"{PROPOSAL} 8-1: 포도는 성과보수 없이 파렛트 이용료 2만 원",
+            value=usage.value,
+            unit=usage.unit,
+            source=usage.source,
         ),
         Assumption(
             key="variable_cost_per_pallet",
@@ -294,12 +308,12 @@ def savings_per_pallet(plan: Plan) -> dict[str, int]:
     return {pid: round(total / pallets) for pid, (total, pallets) in totals.items() if pallets}
 
 
-def _proposal_revenue(pallets: dict[str, int], per_pallet: dict[str, int], fee_rate: float) -> int:
+def _proposal_revenue(
+    params: CostParams, pallets: dict[str, int], per_pallet: dict[str, int], fee_rate: float
+) -> int:
     return round(
         sum(
-            n * USAGE_FEE_PER_PALLET
-            if pid in USAGE_FEE_PRODUCTS
-            else n * per_pallet[pid] * fee_rate
+            usage_fee(params, n) if uses_usage_fee(params, pid) else n * per_pallet[pid] * fee_rate
             for pid, n in pallets.items()
         )
     )
@@ -312,7 +326,6 @@ def basis_comparison(
     if pallets is None:
         return []
     fee_rate = scenario.cost_params.platform_fee_rate.value
-    keep = fee_rate * (1 - forwarder_share)
     measured = savings_per_pallet(plan)
     if not all(pid in measured for pid in pallets):
         return []
@@ -337,7 +350,8 @@ def basis_comparison(
     for basis, label, source, per_pallet in bases:
         total = sum(pallets.values())
         performance = round(sum(n * per_pallet[pid] * fee_rate for pid, n in pallets.items()))
-        per_pallet_keep = sum(n * per_pallet[pid] for pid, n in pallets.items()) / total * keep
+        proposal = _proposal_revenue(scenario.cost_params, pallets, per_pallet, fee_rate)
+        per_pallet_keep = proposal / total * (1 - forwarder_share)
         result.append(
             BasisComparison(
                 basis=basis,
@@ -349,7 +363,7 @@ def basis_comparison(
                 ],
                 fee_rate=fee_rate,
                 season_revenue_performance=performance,
-                season_revenue_proposal_rule=_proposal_revenue(pallets, per_pallet, fee_rate),
+                season_revenue_proposal_rule=proposal,
                 breakeven_pallets=round(ANNUAL_FIXED_COST / per_pallet_keep)
                 if per_pallet_keep > 0
                 else None,
@@ -359,8 +373,9 @@ def basis_comparison(
 
 
 def _grape_solo_savings(scenario: Scenario, plan: Plan) -> int | None:
+    params = scenario.cost_params
     grape_shippers = {
-        lot.shipper_id for lot in scenario.lots if lot.product_id in USAGE_FEE_PRODUCTS
+        lot.shipper_id for lot in scenario.lots if uses_usage_fee(params, lot.product_id)
     }
     if not grape_shippers:
         return None
@@ -373,7 +388,7 @@ def _grape_solo_savings(scenario: Scenario, plan: Plan) -> int | None:
     pallets = sum(
         a.pallets
         for a in plan.assignments
-        if a.shipper_id in grape_shippers and a.product_id in USAGE_FEE_PRODUCTS
+        if a.shipper_id in grape_shippers and uses_usage_fee(params, a.product_id)
     )
     return round((solo_cost - shared) / pallets) if pallets else None
 
@@ -414,6 +429,7 @@ def _per_pallet(performance: float, base_fee: int, mode: BaseFeeMode) -> float:
 
 
 def _product_revenue(
+    params: CostParams,
     product_id: str,
     regime: AirRegime,
     fee_rate: float,
@@ -421,9 +437,9 @@ def _product_revenue(
     mode: BaseFeeMode,
     grape_rule: GrapeRule,
 ) -> float:
-    if product_id in USAGE_FEE_PRODUCTS:
+    if uses_usage_fee(params, product_id):
         if grape_rule == "usage_fee":
-            return max(USAGE_FEE_PER_PALLET, base_fee)
+            return max(usage_fee(params, 1), base_fee)
         if grape_rule == "solo_baseline":
             savings = max(0, regime.grape_solo_savings_per_pallet or 0)
             return _per_pallet(fee_rate * savings, base_fee, mode)
@@ -438,7 +454,9 @@ def _needs(row: dict) -> list[str]:
     if row["base_fee_per_pallet"] != BASELINE["base_fee_per_pallet"]:
         needs.append(f"기본 이용료 파렛트당 {row['base_fee_per_pallet']:,}원")
     if row["forwarder_share"] != BASELINE["forwarder_share"]:
-        needs.append(f"포워더 배분 {row['forwarder_share']:.0%}(SaaS형)")
+        needs.append(
+            f"포워더 배분 {row['forwarder_share']:.0%}({FORWARDER_SHARE_SENSITIVITY_LABEL})"
+        )
     if row["fixed_level"] != BASELINE["fixed_level"]:
         needs.append(f"고정비 MVP 현금 연 {MVP_CASH_FIXED_COST:,}원(가정)")
     if row["air_regime"] != BASELINE["air_regime"]:
@@ -499,6 +517,8 @@ def business_matrix(
     if pallets is None:
         return None
     total_pallets = sum(pallets.values())
+    params = scenario.cost_params
+    per_pallet_fee = usage_fee(params, 1)
     regimes = _air_regimes(scenario)
     rows: list[MatrixRow] = []
     for regime_and_sub, fee_rate, base_fee, share, level in product(
@@ -507,7 +527,10 @@ def business_matrix(
         regime = regime_and_sub[0]
         revenue = round(
             sum(
-                n * _product_revenue(pid, regime, fee_rate, base_fee, base_fee_mode, grape_rule)
+                n
+                * _product_revenue(
+                    params, pid, regime, fee_rate, base_fee, base_fee_mode, grape_rule
+                )
                 for pid, n in pallets.items()
             )
         )
@@ -546,8 +569,7 @@ def business_matrix(
         ),
         {
             "usage_fee": (
-                f"포도: 이용료 {USAGE_FEE_PER_PALLET:,}원(기획서 8-1). "
-                "기본 이용료가 더 크면 기본 이용료"
+                f"포도: 이용료 {per_pallet_fee:,}원(기획서 8-1). 기본 이용료가 더 크면 기본 이용료"
             ),
             "performance": "포도: 딸기와 같이 항공 대비 절감 × 성과보수율",
             "solo_baseline": (
@@ -556,6 +578,10 @@ def business_matrix(
             ),
         }[grape_rule],
         "공헌이익 = 매출 − 포워더 배분 − 변동비. 순이익 = 공헌이익 − 연 고정비",
+        (
+            f"포워더 배분 기본 {DEFAULT_FORWARDER_SHARE:.0%}({FORWARDER_SHARE_SOURCE}). "
+            f"40%는 민감도용 {FORWARDER_SHARE_SENSITIVITY_LABEL}"
+        ),
         "손익분기 파렛트 = 연 고정비 ÷ 파렛트당 공헌이익(같은 품목 구성)",
     ]
     return BusinessMatrix(

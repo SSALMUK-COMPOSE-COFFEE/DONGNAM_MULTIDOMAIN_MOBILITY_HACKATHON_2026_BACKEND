@@ -1,7 +1,7 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from freshswitch_backend.api.auth import current_org_id
 from freshswitch_backend.domain.models import ContainerSettlement, TariffSheet
@@ -31,6 +31,14 @@ class SettlementView(BaseModel):
     total_refund: int
     total_fee: int
     total_savings: int
+    total_performance_fee: int = Field(
+        default=0,
+        description="환급 전 금액. total_fee_before_refund = total_performance_fee + total_usage_fee(시범 항차 제외)",
+    )
+    total_usage_fee: int = Field(
+        default=0,
+        description="환급 전 금액. total_fee_before_refund = total_performance_fee + total_usage_fee(시범 항차 제외)",
+    )
     containers: list[ContainerSettlement]
     tariffs: list[TariffSheet]
     assumed_items: list[str]
@@ -51,6 +59,8 @@ def read_settlement(plan_id: str, org_id: OrgId) -> SettlementView:
         total_refund=sum(s.quality_refund for s in settlements),
         total_fee=sum(s.fee for s in settlements),
         total_savings=sum(s.savings for s in settlements),
+        total_performance_fee=sum(s.performance_fee for s in settlements),
+        total_usage_fee=sum(s.usage_fee for s in settlements),
         containers=session.plan.container_settlements,
         tariffs=session.plan.settlement_tariffs,
         assumed_items=sorted(

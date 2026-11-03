@@ -3,10 +3,14 @@ from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 
-from freshswitch_backend.domain.models import Scenario
+from freshswitch_backend.domain.models import (
+    Scenario,
+    SettlementBaselineKind,
+    SettlementBillingRule,
+)
 from freshswitch_backend.execution.models import ExecutionOrder, ShipperConfirmation
 from freshswitch_backend.execution.orders import short_name
 from freshswitch_backend.execution.quality import QualitySettlement, adjusted_settlements
@@ -113,6 +117,21 @@ class PlatformShipperShare(BaseModel):
     shipper_org_name: str | None
     saving_krw: int
     fee_krw: int
+    billing_rule: SettlementBillingRule = "performance"
+    performance_fee_krw: int = Field(
+        default=0,
+        description="환급 전 금액. fee_before_refund_krw = performance_fee_krw + usage_fee_krw(시범 항차 제외)",
+    )
+    usage_fee_krw: int = Field(
+        default=0,
+        description="환급 전 금액. fee_before_refund_krw = performance_fee_krw + usage_fee_krw(시범 항차 제외)",
+    )
+    fee_before_refund_krw: int = 0
+    quality_refund_krw: int = 0
+    baseline_kind: SettlementBaselineKind = "air_solo"
+    baseline_label: str = ""
+    savings_baseline_label: str = ""
+    pilot: bool = False
 
 
 class PlatformSettlement(BaseModel):
@@ -122,6 +141,17 @@ class PlatformSettlement(BaseModel):
     total_saving_krw: int
     platform_fee_krw: int
     shippers: list[PlatformShipperShare]
+    performance_fee_krw: int = Field(
+        default=0,
+        description="환급 전 금액. fee_before_refund_krw = performance_fee_krw + usage_fee_krw(시범 항차 제외)",
+    )
+    usage_fee_krw: int = Field(
+        default=0,
+        description="환급 전 금액. fee_before_refund_krw = performance_fee_krw + usage_fee_krw(시범 항차 제외)",
+    )
+    fee_before_refund_krw: int = 0
+    quality_refund_krw: int = 0
+    pilot: bool = False
 
 
 OTHER_SHIPPER_LABEL = "다른 화주"
@@ -201,12 +231,26 @@ def platform_settlement(session: PlanSession, org_names: dict[str, str]) -> Plat
         departure=departure,
         total_saving_krw=sum(r.savings for r in rows),
         platform_fee_krw=sum(r.fee for r in rows),
+        performance_fee_krw=sum(r.performance_fee for r in rows),
+        usage_fee_krw=sum(r.usage_fee for r in rows),
+        fee_before_refund_krw=sum(r.fee_before_refund for r in rows),
+        quality_refund_krw=sum(r.quality_refund for r in rows),
+        pilot=any(r.pilot for r in rows),
         shippers=[
             PlatformShipperShare(
                 shipper_id=r.shipper_id,
                 shipper_org_name=org_names.get(r.shipper_id),
                 saving_krw=r.savings,
                 fee_krw=r.fee,
+                billing_rule=r.billing_rule,
+                performance_fee_krw=r.performance_fee,
+                usage_fee_krw=r.usage_fee,
+                fee_before_refund_krw=r.fee_before_refund,
+                quality_refund_krw=r.quality_refund,
+                baseline_kind=r.baseline_kind,
+                baseline_label=r.baseline_label,
+                savings_baseline_label=r.savings_baseline_label,
+                pilot=r.pilot,
             )
             for r in rows
         ],

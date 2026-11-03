@@ -1,7 +1,7 @@
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field, model_validator
 
 KST = timezone(timedelta(hours=9))
 
@@ -145,6 +145,28 @@ class PalletTariff(BaseModel):
     air_rate_basis_per_kg: Quantity
 
 
+BillingRule = Literal["performance", "usage_fee"]
+BaselineKind = Literal["air_solo", "sea_solo"]
+SettlementBillingRule = Literal["performance", "usage_fee", "mixed"]
+SettlementBaselineKind = Literal["air_solo", "sea_solo", "mixed"]
+
+
+class BillingParams(BaseModel):
+    usage_fee_per_pallet_krw: Quantity = _q(
+        20_000,
+        "원/파렛트",
+        "가정: 기획서 ㅍ3 8-1 파렛트 이용료 2만 원(이미 배로 가는 품목은 성과보수 대신 이용료)",
+    )
+    usage_fee_products: list[str] = Field(default_factory=lambda: ["grape_so2"])
+    usage_fee_source: str = (
+        "기획서 ㅍ3 8-1: 포도처럼 이미 배로 가는 품목은 성과보수 없이 파렛트 이용료만 받는다"
+    )
+    pilot: bool = False
+    pilot_source: str = (
+        "기획서 ㅍ3 8-1: 첫 항차 무료 시범. 켜면 수수료 0원, 원래 금액은 함께 싣는다"
+    )
+
+
 class CostParams(BaseModel):
     sea_freight_per_container_krw: Quantity = _q(4_560_000, "원/컨테이너")
     sea_ancillary_per_container_krw: Quantity = _q(4_500_000, "원/컨테이너")
@@ -165,6 +187,7 @@ class CostParams(BaseModel):
     default_product_cost: ProductCostParams = Field(default_factory=_default_product_cost)
     loss_adjustments: list[LossAdjustment] = Field(default_factory=list)
     pallet_tariffs: dict[str, PalletTariff] = Field(default_factory=dict)
+    billing: BillingParams = Field(default_factory=BillingParams)
 
     def for_product(self, product_id: str) -> ProductCostParams:
         return self.product_costs.get(product_id, self.default_product_cost)
@@ -260,6 +283,12 @@ class ShipperCost(BaseModel):
 SettlementBasis = Literal["tariff", "operational", "mixed"]
 
 
+def backfill_fee_split[T: "Settlement | ContainerShipperSettlement"](row: T) -> T:
+    if row.performance_fee == 0 and row.usage_fee == 0 and row.fee > 0 and not row.pilot:
+        row.performance_fee = row.fee
+    return row
+
+
 class Settlement(BaseModel):
     shipper_id: str
     baseline_cost: int
@@ -270,6 +299,15 @@ class Settlement(BaseModel):
     sea_pallets: int = 0
     air_pallets: int = 0
     basis: SettlementBasis = "operational"
+    billing_rule: SettlementBillingRule = "performance"
+    performance_fee: int = 0
+    usage_fee: int = 0
+    baseline_kind: SettlementBaselineKind = "air_solo"
+    baseline_label: str = "단독 항공 대비"
+    savings_baseline_label: str = "단독 항공 대비"
+    pilot: bool = False
+
+    _legacy_fee_split = model_validator(mode="after")(backfill_fee_split)
 
 
 class ContainerShipperSettlement(BaseModel):
@@ -281,6 +319,15 @@ class ContainerShipperSettlement(BaseModel):
     fee: int
     shipper_gain: int
     basis: SettlementBasis
+    billing_rule: SettlementBillingRule = "performance"
+    performance_fee: int = 0
+    usage_fee: int = 0
+    baseline_kind: SettlementBaselineKind = "air_solo"
+    baseline_label: str = "단독 항공 대비"
+    savings_baseline_label: str = "단독 항공 대비"
+    pilot: bool = False
+
+    _legacy_fee_split = model_validator(mode="after")(backfill_fee_split)
 
 
 class ContainerSettlement(BaseModel):
@@ -315,6 +362,8 @@ class TariffSheet(BaseModel):
     fee_rate: float
     fee_per_pallet: int
     shipper_share_per_pallet: int
+    billing_rule: BillingRule = "performance"
+    pilot: bool = False
     sea_loss_risk_short_window: int
     sea_total_short_window: int
     short_window_rule: str

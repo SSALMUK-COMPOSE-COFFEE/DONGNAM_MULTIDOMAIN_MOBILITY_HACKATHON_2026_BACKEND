@@ -200,7 +200,7 @@ def test_business_matrix_rows_and_highlights(scenario):
         for r in matrix.rows
         if r.fee_rate == 0.25
         and r.base_fee_per_pallet == 0
-        and r.forwarder_share == 0.4
+        and r.forwarder_share == 0.0
         and r.fixed_level == "full"
         and r.air_regime == "normal"
     )

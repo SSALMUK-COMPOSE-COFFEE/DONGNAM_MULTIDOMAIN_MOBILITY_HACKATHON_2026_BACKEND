@@ -1,6 +1,5 @@
 import json
 
-import pytest
 from fastapi.testclient import TestClient
 from saas_fixtures import FORWARDER_ORG_ID, SAAS_CSRF, login_client
 
@@ -302,7 +301,8 @@ def test_settlement_views(
     assert row["plan_id"] == saas["plan_id"]
     assert row["total_saving_krw"] == sum(s["savings"] for s in demo["plan"]["settlements"])
     assert row["platform_fee_krw"] == sum(s["fee"] for s in demo["plan"]["settlements"])
-    assert row["platform_fee_krw"] == pytest.approx(row["total_saving_krw"] * 0.25, abs=10)
+    assert row["platform_fee_krw"] == row["performance_fee_krw"] + row["usage_fee_krw"]
+    assert row["usage_fee_krw"] == 20_000 * 18
     names = {s["shipper_id"]: s["shipper_org_name"] for s in row["shippers"]}
     assert names["sh-jinju"] == "진주 딸기 수출농가 A"
 
