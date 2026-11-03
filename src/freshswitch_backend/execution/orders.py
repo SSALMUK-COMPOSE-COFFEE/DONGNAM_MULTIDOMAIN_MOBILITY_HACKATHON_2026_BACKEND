@@ -1,12 +1,16 @@
 import re
 import uuid
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from typing import TYPE_CHECKING
 
 from freshswitch_backend.domain.models import KST, Lot, Plan, Scenario
 from freshswitch_backend.execution.card import (
     DEFAULT_PALLET_KG,
+    ExecutionCard,
+    GensetInstruction,
     cutoff_timeline,
     gross_cargo_kg,
     mock_booking_no,
@@ -16,12 +20,16 @@ from freshswitch_backend.execution.models import (
     AutomaticAction,
     ConfirmationReason,
     Deadlines,
+    DocumentAction,
     ExecutionOrder,
     ExternalRequest,
     OrderLogEntry,
     ShipperConfirmation,
 )
 from freshswitch_backend.execution.params import ExecutionParams
+
+if TYPE_CHECKING:
+    from freshswitch_backend.coldchain.models import GensetCandidate
 
 CONSOLIDATOR_LABEL = {"platform": "플랫폼(혼재 주관)", "forwarder": "포워더(혼재 주관)"}
 from freshswitch_backend.optimize.costs import CostModel
@@ -606,6 +614,62 @@ def build_order(
 
 
 SAAS_REQUEST_KINDS = ("booking_amendment", "booking_cancel", "booking_new")
+CONTAINER_COUNT_DELTA = {"booking_new": 1, "booking_cancel": -1}
+DOCUMENT_ACTION_LABEL: dict[DocumentAction, str] = {
+    "si_vgm_correction": "SI·VGM 정정",
+    "booking_change": "부킹 변경",
+}
+PLAIN_GLOSSARY: tuple[tuple[str, str], ...] = (
+    ("부킹", "배 자리 예약"),
+    ("SI(선적지시서)", "배에 싣는 짐 목록 서류"),
+    ("VGM", "컨테이너째 잰 총무게 신고"),
+    ("SI·VGM 정정", "배 예약은 그대로 두고 짐 목록·무게 신고만 고침"),
+    ("부킹 변경", "배에 싣는 컨테이너 대수를 늘리거나 줄임"),
+    ("CY 반입", "항구 컨테이너 장치장에 트럭으로 들여놓기"),
+    ("리퍼 전원 연결", "냉장 컨테이너에 전기를 꽂아 냉장 유지"),
+    ("항공 예약", "비행기 화물칸 자리 예약"),
+    ("배터리 젯셋", "전기가 없는 동안 냉장을 이어 주는 배터리 냉각 장치"),
+)
+PLAIN_TEXT: dict[str, str] = {
+    "si_vgm_correction": (
+        "배에 싣는 짐 목록과 무게 신고만 고칩니다. 배 자리 예약과 컨테이너 대수는 그대로입니다."
+    ),
+    "booking_new": (
+        "배에 싣는 냉장 컨테이너를 1대 늘립니다. 선사가 받아 주면 늘어난 컨테이너에 실어 보냅니다."
+    ),
+    "booking_cancel": (
+        "배에 싣던 냉장 컨테이너 1대를 뺍니다. 짐이 어디로 옮겨 가는지는 변경 내용에서 확인하세요."
+    ),
+    "reefer_plug": "항구에 들어온 냉장 컨테이너에 바로 전기를 꽂아 달라고 터미널에 요청합니다.",
+    "reefer_plug_extension": (
+        "배가 늦게 떠서 항구에서 기다리는 동안 냉장 컨테이너 전기를 계속 켜 두도록 요청합니다."
+    ),
+    "cy_entry": "트럭이 항구 장치장에 짐을 들여놓는 예약 시간을 바꿉니다.",
+    "air_booking": "이 출하를 비행기로 보내려고 항공사에 화물칸 자리를 예약합니다.",
+    "air_cancel": "잡아 둔 비행기 화물칸 자리를 취소합니다. 이 출하는 비행기로 가지 않습니다.",
+    "genset": (
+        "항구 게이트에서 전기가 끊기는 시간이 길어 보여 배터리 냉각 장치를 미리 붙입니다. "
+        "냉장은 그대로 이어집니다."
+    ),
+}
+
+
+def container_count_delta(request: ExternalRequest) -> int:
+    return CONTAINER_COUNT_DELTA.get(request.kind, 0)
+
+
+def document_action(request: ExternalRequest) -> DocumentAction | None:
+    if request.kind not in SAAS_REQUEST_KINDS:
+        return None
+    return "si_vgm_correction" if container_count_delta(request) == 0 else "booking_change"
+
+
+def plain_text(request: ExternalRequest) -> str:
+    if document_action(request) == "si_vgm_correction":
+        return PLAIN_TEXT["si_vgm_correction"]
+    if request.kind == "reefer_plug" and request.text.startswith("[리퍼 전원 연결 연장"):
+        return PLAIN_TEXT["reefer_plug_extension"]
+    return PLAIN_TEXT[request.kind]
 
 
 def _net_per_pallet(scenario: Scenario, lot_ids: list[str]) -> float:
@@ -658,7 +722,8 @@ def saas_request_text(
     containers = {c.id: c for c in scenario.containers}
     voyage = voyages.get(request.voyage_id or "")
     container = containers.get(request.container_id or "")
-    if request.kind not in SAAS_REQUEST_KINDS or voyage is None or container is None:
+    action = document_action(request)
+    if action is None or voyage is None or container is None:
         return request.text
     ports = {port.id: port.name for port in scenario.ports}
     pb, pa = request.pallets_before, request.pallets_after
@@ -686,7 +751,7 @@ def saas_request_text(
         f"SI 마감 {fmt(cutoffs.si_cutoff)}, VGM 마감 {fmt(cutoffs.vgm_cutoff)}, "
         f"CY 반입 마감 {fmt(cutoffs.cy_cutoff)}"
     )
-    if request.kind == "booking_amendment":
+    if action == "si_vgm_correction":
         return (
             f"[SI 정정 + VGM 재제출 요청] {head} 부킹 {booking}(모의)의 컨테이너 {cid}"
             f"({container.kind}) 적재를 {pb}→{pa}파렛트, 화물 총중량 {gb:,}→{ga:,}kg"
@@ -695,7 +760,7 @@ def saas_request_text(
             f"부킹은 그대로 둡니다. 대상 출하: {lots}. {timeline}. "
             f"회신 기한 {fmt(request.deadline)}."
         )
-    if request.kind == "booking_cancel":
+    if container_count_delta(request) < 0:
         return (
             f"[부킹 변경 요청: 컨테이너 1대 취소] {head} 부킹 {booking}(모의)의 컨테이너 {cid}"
             f"({container.kind}, {pb}파렛트·화물 총중량 {gb:,}kg)를 취소합니다. "
@@ -717,10 +782,68 @@ def saas_requests(
     scenario: Scenario,
     params: ExecutionParams | None = None,
 ) -> list[ExternalRequest]:
-    return [
-        r.model_copy(update={"text": saas_request_text(plan_id, r, scenario, params)})
-        for r in requests
-    ]
+    out = []
+    for r in requests:
+        action = document_action(r)
+        out.append(
+            r.model_copy(
+                update={
+                    "text": saas_request_text(plan_id, r, scenario, params),
+                    "document_action": action,
+                    "document_action_label": DOCUMENT_ACTION_LABEL[action] if action else None,
+                    "plain_text": plain_text(r),
+                }
+            )
+        )
+    return out
+
+
+def genset_instructions(
+    candidates: Iterable["GensetCandidate"],
+    card: ExecutionCard,
+    visible_lot_ids: set[str] | None = None,
+) -> list[GensetInstruction]:
+    numbers = {c.container_id: c.container_no for c in card.containers}
+    out: list[GensetInstruction] = []
+    for candidate in candidates:
+        lot_ids = [x for x in candidate.lot_ids if visible_lot_ids is None or x in visible_lot_ids]
+        if not lot_ids:
+            continue
+        nos = [numbers.get(cid, cid) for cid in candidate.container_ids]
+        where = f"{candidate.truck_id} {candidate.trip}회차" if candidate.truck_id else "트럭 미정"
+        window = (
+            f"{fmt(candidate.window_start)}~{fmt(candidate.window_end)}"
+            if candidate.window_start and candidate.window_end
+            else "시각 미정"
+        )
+        units = ", ".join(
+            f"{cid}({no})" for cid, no in zip(candidate.container_ids, nos, strict=True)
+        )
+        out.append(
+            GensetInstruction(
+                key=candidate.key,
+                equipment=candidate.equipment,
+                voyage_id=candidate.voyage_id,
+                container_ids=candidate.container_ids,
+                container_nos=nos,
+                truck_id=candidate.truck_id,
+                trip=candidate.trip,
+                lot_ids=lot_ids,
+                window_start=candidate.window_start,
+                window_end=candidate.window_end,
+                unpowered_minutes=candidate.unpowered_minutes,
+                threshold_minutes=candidate.threshold_minutes,
+                text=(
+                    f"[배터리 젯셋 사전 배정] {candidate.voyage_id} {where} {units} "
+                    f"로트 {', '.join(lot_ids)}: 무전원 예상 {window} "
+                    f"{candidate.unpowered_minutes:.0f}분(기준 {candidate.threshold_minutes:.0f}분). "
+                    f"{candidate.equipment}를 게이트 도착 전에 배정·연결합니다. "
+                    f"근거: {candidate.reason}"
+                ),
+                plain_text=PLAIN_TEXT["genset"],
+            )
+        )
+    return out
 
 
 def _automatic_actions(

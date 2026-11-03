@@ -28,6 +28,7 @@ RequestKind = Literal[
     "air_cancel",
 ]
 CounterpartyRole = Literal["carrier", "terminal", "airline"]
+DocumentAction = Literal["si_vgm_correction", "booking_change"]
 RequestStatus = Literal["pending", "accepted", "declined"]
 Actor = Literal["shipper", "forwarder", "system"]
 CandidateSource = Literal["shipper_rejected", "request_declined"]
@@ -77,6 +78,9 @@ class ExternalRequest(BaseModel):
     lot_pallets_before: dict[str, int] = Field(default_factory=dict)
     lot_pallets_after: dict[str, int] = Field(default_factory=dict)
     text: str
+    document_action: DocumentAction | None = None
+    document_action_label: str | None = None
+    plain_text: str | None = None
     status: RequestStatus = "pending"
     note: str | None = None
     answered_at: datetime | None = None

@@ -2,7 +2,7 @@ import hashlib
 import re
 from datetime import datetime, timedelta
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from freshswitch_backend.domain.models import KST, Plan, Product, Scenario, Voyage
 from freshswitch_backend.execution.params import ExecutionParams
@@ -26,6 +26,13 @@ ISO6346_LETTERS = {
 }
 
 
+class VgmItem(BaseModel):
+    name: str
+    kg: int
+    assumed: bool
+    source: str
+
+
 class VgmWeight(BaseModel):
     pallets: int
     net_kg: int
@@ -34,6 +41,27 @@ class VgmWeight(BaseModel):
     container_tare_kg: int
     vgm_kg: int
     basis: str
+    pallet_tare_kg: int = 0
+    packaging_kg: int = 0
+    items: list[VgmItem] = Field(default_factory=list)
+    calculation: str = ""
+
+
+class GensetInstruction(BaseModel):
+    key: str
+    equipment: str
+    voyage_id: str
+    container_ids: list[str]
+    container_nos: list[str]
+    truck_id: str | None
+    trip: int | None
+    lot_ids: list[str]
+    window_start: datetime | None
+    window_end: datetime | None
+    unpowered_minutes: float
+    threshold_minutes: float
+    text: str
+    plain_text: str
 
 
 class Setpoint(BaseModel):
@@ -91,6 +119,7 @@ class ExecutionCard(BaseModel):
     mock: bool
     mock_note: str
     containers: list[ContainerExecution]
+    genset_instructions: list[GensetInstruction] = Field(default_factory=list)
 
 
 class EnteredNumbers(BaseModel):
@@ -208,6 +237,64 @@ def weight_basis(params: ExecutionParams) -> str:
     )
 
 
+NET_SOURCE = "품목 데이터 파렛트당 순중량(pallet_kg) × 로트별 파렛트"
+NET_ASSUMED_SOURCE = (
+    "가정: 품목 데이터에 파렛트당 순중량이 없어 기본 {kg:g}kg/파렛트로 본다. 출하 실측 확인 필요"
+)
+
+
+def vgm_weight(
+    net_kg: float, pallets: int, params: ExecutionParams, net_assumed: bool = True
+) -> VgmWeight:
+    net = round(net_kg)
+    gross = gross_cargo_kg(net_kg, pallets, params)
+    pallet_tare = round(pallets * params.pallet_tare_kg.value)
+    packaging = gross - net - pallet_tare
+    tare = round(params.container_tare_kg.value)
+    total = vgm_kg(gross, params)
+    net_source = NET_ASSUMED_SOURCE.format(kg=DEFAULT_PALLET_KG) if net_assumed else NET_SOURCE
+    items = [
+        VgmItem(name="화물 순중량", kg=net, assumed=net_assumed, source=net_source),
+        VgmItem(
+            name="파렛트",
+            kg=pallet_tare,
+            assumed=params.pallet_tare_kg.source.startswith("가정"),
+            source=params.pallet_tare_kg.source,
+        ),
+        VgmItem(
+            name="포장",
+            kg=packaging,
+            assumed=params.packaging_kg_per_pallet.source.startswith("가정"),
+            source=params.packaging_kg_per_pallet.source,
+        ),
+        VgmItem(
+            name="컨테이너 자중",
+            kg=tare,
+            assumed=params.container_tare_kg.source.startswith("가정"),
+            source=params.container_tare_kg.source,
+        ),
+    ]
+    marks = " + ".join(
+        f"{item.name} {item.kg:,}kg" + ("(가정)" if item.assumed else "") for item in items
+    )
+    return VgmWeight(
+        pallets=pallets,
+        net_kg=net,
+        pallet_packaging_kg=gross - net,
+        gross_cargo_kg=gross,
+        container_tare_kg=tare,
+        vgm_kg=total,
+        basis=weight_basis(params),
+        pallet_tare_kg=pallet_tare,
+        packaging_kg=packaging,
+        items=items,
+        calculation=(
+            f"VGM {total:,}kg = {marks}. 파렛트 {pallets}개 × (파렛트 "
+            f"{params.pallet_tare_kg.value:g}kg + 포장 {params.packaging_kg_per_pallet.value:g}kg)"
+        ),
+    )
+
+
 def cutoff_timeline(voyage: Voyage, params: ExecutionParams) -> CutoffTimeline:
     si_lead = params.booking_amendment_lead_hours
     vgm_lead = params.vgm_cutoff_lead_hours
@@ -307,12 +394,14 @@ def build_execution_card(
             a for a in plan.assignments if a.mode == "sea" and a.container_id == load.container_id
         ]
         net = 0.0
+        net_assumed = False
         for a in assignments:
             lot = lots.get(a.lot_id)
             product = products.get(lot.product_id) if lot else None
             net += a.pallets * (product.pallet_kg if product else DEFAULT_PALLET_KG)
+            if product is None or "pallet_kg" not in product.model_fields_set:
+                net_assumed = True
         pallets = sum(a.pallets for a in assignments)
-        gross = gross_cargo_kg(net, pallets, p)
         found = [products[pid] for pid in load.product_ids if pid in products]
         actual = known.get(load.container_id, EnteredNumbers())
         booking = actual.booking_no or mock_booking_no(plan_id, load.container_id)
@@ -334,15 +423,7 @@ def build_execution_card(
                 container_no_mock=actual.container_no is None,
                 seal_no_mock=actual.seal_no is None,
                 entered_at=actual.updated_at,
-                weight=VgmWeight(
-                    pallets=pallets,
-                    net_kg=round(net),
-                    pallet_packaging_kg=gross - round(net),
-                    gross_cargo_kg=gross,
-                    container_tare_kg=round(p.container_tare_kg.value),
-                    vgm_kg=vgm_kg(gross, p),
-                    basis=weight_basis(p),
-                ),
+                weight=vgm_weight(net, pallets, p, net_assumed),
                 setpoint=setpoint(found, sorted(load.product_ids)),
                 empty_pickup=empty_pickup(voyage),
                 cutoffs=cutoff_timeline(voyage, p),

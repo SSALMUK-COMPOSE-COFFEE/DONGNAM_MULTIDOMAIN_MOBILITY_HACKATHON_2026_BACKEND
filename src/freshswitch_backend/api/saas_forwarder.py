@@ -14,6 +14,7 @@ from freshswitch_backend.api.saas_views import (
     plan_item,
     without_settlement,
 )
+from freshswitch_backend.coldchain.power_plan import power_plan
 from freshswitch_backend.domain.models import Scenario
 from freshswitch_backend.execution.card import (
     ContainerExecution,
@@ -31,7 +32,7 @@ from freshswitch_backend.execution.numbers import (
     entered_numbers,
     save_numbers,
 )
-from freshswitch_backend.execution.orders import saas_requests
+from freshswitch_backend.execution.orders import genset_instructions, saas_requests
 from freshswitch_backend.notifications import notify_order_committed
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.tables import PlanRow
@@ -59,13 +60,15 @@ def _order_view(order: ExecutionOrder, scenario: Scenario) -> ForwarderOrder:
 
 
 def _card(session: PlanSession) -> ExecutionCard:
-    return build_execution_card(
+    card = build_execution_card(
         session.plan_id,
         session.version,
         session.scenario,
         session.plan,
         entered=entered_numbers(session.plan_id),
     )
+    card.genset_instructions = genset_instructions(power_plan(session).candidates, card)
+    return card
 
 
 @router.get("/plans")
