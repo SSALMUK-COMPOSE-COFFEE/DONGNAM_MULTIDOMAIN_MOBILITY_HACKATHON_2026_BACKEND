@@ -7,7 +7,12 @@ from saas_fixtures import FORWARDER_ORG_ID
 from test_saas_api import REDUCE, _assign, _platform_plan
 
 from freshswitch_backend.data.loader import get_scenario
-from freshswitch_backend.execution.card import iso6346_check_digit, mock_container_no
+from freshswitch_backend.domain.models import Assignment, ContainerLoad, Plan
+from freshswitch_backend.execution.card import (
+    build_execution_card,
+    iso6346_check_digit,
+    mock_container_no,
+)
 from freshswitch_backend.execution.models import ExternalRequest
 from freshswitch_backend.execution.orders import saas_request_text
 from freshswitch_backend.execution.params import ExecutionParams
@@ -183,3 +188,116 @@ def _keys(value):
     elif isinstance(value, list):
         for item in value:
             yield from _keys(item)
+
+
+def _mixed_scenario():
+    scenario = _scenario()
+    products = [
+        p.model_copy(update={"pallet_kg": 600.0}) if p.id == "grape_so2" else p
+        for p in scenario.products
+    ]
+    return scenario.model_copy(update={"products": products})
+
+
+def _mixed_plan(scenario, composition: dict[str, int]) -> Plan:
+    lots = {lot.id: lot for lot in scenario.lots}
+    assignments = [
+        Assignment(
+            lot_id=lot_id,
+            shipper_id=lots[lot_id].shipper_id,
+            product_id=lots[lot_id].product_id,
+            pallets=n,
+            mode="sea",
+            container_id="CA-01",
+            voyage_id="V-2611A",
+        )
+        for lot_id, n in composition.items()
+    ]
+    load = ContainerLoad(
+        container_id="CA-01",
+        voyage_id="V-2611A",
+        used=True,
+        pallets=sum(composition.values()),
+        capacity_pallets=20,
+        utilization=0.75,
+        lot_ids=list(composition),
+        product_ids=sorted({lots[x].product_id for x in composition}),
+        shipper_ids=sorted({lots[x].shipper_id for x in composition}),
+        container_cost=0,
+    )
+    return Plan(
+        scenario_id="default",
+        status="optimal",
+        objective=0,
+        solve_ms=0,
+        assignments=assignments,
+        unassigned=[],
+        containers=[load],
+        shipper_costs=[],
+        settlements=[],
+        total_baseline_cost=0,
+        total_shared_cost=0,
+        total_savings=0,
+        total_fee=0,
+    )
+
+
+def test_gross_weight_follows_lot_composition() -> None:
+    scenario = _mixed_scenario()
+    before = {"lot-jinju-sb-1": 10, "lot-sangju-gr-1": 5}
+    after = {"lot-jinju-sb-1": 5, "lot-sangju-gr-1": 10}
+    request = _request("booking_amendment", 15, 15).model_copy(
+        update={
+            "lot_ids": sorted(before),
+            "lot_pallets_before": before,
+            "lot_pallets_after": after,
+        }
+    )
+    text = saas_request_text("plan-x", request, scenario)
+    gross = [
+        build_execution_card("plan-x", 1, scenario, _mixed_plan(scenario, c))
+        .containers[0]
+        .weight.gross_cargo_kg
+        for c in (before, after)
+    ]
+    assert gross[0] != gross[1]
+    assert f"화물 총중량 {gross[0]:,}→{gross[1]:,}kg" in text
+
+
+def test_saas_texts_keep_shipper_breakdown() -> None:
+    breakdown = "진주 8→6, 산청 5→3"
+    for kind, before, after in (
+        ("booking_amendment", 13, 9),
+        ("booking_cancel", 13, 0),
+        ("booking_new", 0, 9),
+    ):
+        request = _request(kind, before, after).model_copy(
+            update={"text": f"[원문] 화주별 파렛트: {breakdown}. 회신 부탁드립니다."}
+        )
+        text = saas_request_text("plan-x", request, _scenario())
+        assert f"화주별 파렛트: {breakdown}." in text
+
+
+def test_shipper_and_forwarder_see_same_saas_wording(
+    platform_client: TestClient,
+    saas_login,
+    forwarder_client: TestClient,
+    shipper_client: TestClient,
+) -> None:
+    plan_id = _saas_plan(platform_client, saas_login)
+    assert (
+        platform_client.post(f"/api/plans/{plan_id}/events", json={"event": REDUCE}).status_code
+        == 200
+    )
+    applied = platform_client.post(
+        f"/api/plans/{plan_id}/apply", json={"alternative_id": "pull_forward"}
+    )
+    assert applied.status_code == 200, applied.text
+    forwarder = forwarder_client.get(f"/api/saas/forwarder/plans/{plan_id}/orders").json()
+    shipper = shipper_client.get(f"/api/saas/shipper/plans/{plan_id}/orders").json()
+    sent = next(r for r in forwarder[0]["requests"] if r["kind"] == "booking_amendment")
+    seen = next(r for r in shipper[0]["requests"] if r["request_id"] == sent["request_id"])
+    assert seen["text"].startswith("[SI 정정 + VGM 재제출 요청]")
+    assert "화주별 파렛트:" in seen["text"] and "화주별 파렛트:" in sent["text"]
+    head = sent["text"].split(" 대상 출하:")[0]
+    assert seen["text"].split(" 대상 출하:")[0] == head

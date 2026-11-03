@@ -73,6 +73,8 @@ class ExternalRequest(BaseModel):
     lot_ids: list[str] = Field(default_factory=list)
     pallets_before: int = 0
     pallets_after: int = 0
+    lot_pallets_before: dict[str, int] = Field(default_factory=dict)
+    lot_pallets_after: dict[str, int] = Field(default_factory=dict)
     text: str
     status: RequestStatus = "pending"
     note: str | None = None

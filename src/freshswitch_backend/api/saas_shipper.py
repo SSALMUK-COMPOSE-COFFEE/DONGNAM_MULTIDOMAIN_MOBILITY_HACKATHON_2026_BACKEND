@@ -24,7 +24,12 @@ from freshswitch_backend.api.saas_views import (
     shipper_plan_item,
     shipper_settlements,
 )
-from freshswitch_backend.execution.models import ConfirmRequest, RequestResultBody
+from freshswitch_backend.execution.models import (
+    ConfirmRequest,
+    ExecutionOrder,
+    RequestResultBody,
+)
+from freshswitch_backend.execution.orders import saas_requests
 from freshswitch_backend.intake.models import IntakePreview, IntakeRequest
 from freshswitch_backend.lots import LotFilter, LotPatch, LotStatus, RegisteredLot, lot_store
 from freshswitch_backend.persistence import database
@@ -71,6 +76,11 @@ def _own_shipper(principal: Principal, requested: str | None) -> str:
 
 def _access(plan_id: str, principal: Principal) -> PlanAccess:
     return plan_for(plan_id, principal)
+
+
+def _saas_order(order: ExecutionOrder, session: PlanSession) -> ExecutionOrder:
+    requests = saas_requests(order.plan_id, order.requests, session.scenario)
+    return order.model_copy(update={"requests": requests})
 
 
 @router.get("/lots")
@@ -137,7 +147,9 @@ def read_plan(plan_id: str, principal: ShipperPrincipal) -> dict[str, Any]:
 @router.get("/plans/{plan_id}/orders")
 def list_orders(plan_id: str, principal: ShipperPrincipal) -> list[dict[str, Any]]:
     access = _access(plan_id, principal)
-    orders = store.orders(plan_id, org_id=access.owner_org_id)
+    orders = [
+        _saas_order(o, access.session) for o in store.orders(plan_id, org_id=access.owner_org_id)
+    ]
     return anonymized_orders(access.session, orders, access.viewer.shipper_ids)
 
 
@@ -169,7 +181,9 @@ def answer_request(
     except SessionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     orders = store.orders(plan_id, org_id=owner)
-    return shipper_order_view(access.session, updated, access.viewer.shipper_ids, orders)
+    return shipper_order_view(
+        access.session, _saas_order(updated, access.session), access.viewer.shipper_ids, orders
+    )
 
 
 @router.post("/plans/{plan_id}/orders/{order_id}/confirm")
@@ -203,7 +217,7 @@ def confirm_order(
     except SessionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     orders = store.orders(plan_id, org_id=owner)
-    return shipper_order_view(access.session, updated, own, orders)
+    return shipper_order_view(access.session, _saas_order(updated, access.session), own, orders)
 
 
 @router.get("/settlements")

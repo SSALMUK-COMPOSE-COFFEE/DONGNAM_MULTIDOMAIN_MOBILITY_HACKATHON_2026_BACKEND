@@ -1,3 +1,4 @@
+import re
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
@@ -205,7 +206,6 @@ def build_order(
     event: Event,
     now: datetime,
     params: ExecutionParams | None = None,
-    saas: bool = False,
 ) -> ExecutionOrder:
     ctx = _Ctx(
         scenario_before,
@@ -286,6 +286,8 @@ def build_order(
             "lot_ids": lot_ids,
             "pallets_before": pallets_before,
             "pallets_after": pallets_after,
+            "lot_pallets_before": dict(before),
+            "lot_pallets_after": dict(after),
         }
         if before and after:
             requests.add(
@@ -464,8 +466,6 @@ def build_order(
                 ),
             )
 
-    if saas:
-        requests.items = saas_requests(plan_id, requests.items, scenario_after, p)
     request_deadlines = [r.deadline for r in requests.items]
     forwarder = min([dispatch, *request_deadlines])
     shipper_deadline = forwarder - timedelta(hours=p.forwarder_processing_hours.value)
@@ -621,6 +621,17 @@ def _net_per_pallet(scenario: Scenario, lot_ids: list[str]) -> float:
     return weighted / pallets if pallets else DEFAULT_PALLET_KG
 
 
+def _net_kg(scenario: Scenario, composition: dict[str, int]) -> float:
+    products = {p.id: p for p in scenario.products}
+    lots = {lot.id: lot for lot in scenario.lots}
+    total = 0.0
+    for lot_id, pallets in composition.items():
+        lot = lots.get(lot_id)
+        product = products.get(lot.product_id) if lot else None
+        total += pallets * (product.pallet_kg if product else DEFAULT_PALLET_KG)
+    return total
+
+
 def _scenario_setting(scenario: Scenario, lot_ids: list[str]) -> str:
     products = {p.id: p for p in scenario.products}
     found = sorted({lot.product_id for lot in scenario.lots if lot.id in lot_ids})
@@ -650,10 +661,14 @@ def saas_request_text(
     if request.kind not in SAAS_REQUEST_KINDS or voyage is None or container is None:
         return request.text
     ports = {port.id: port.name for port in scenario.ports}
-    per_pallet = _net_per_pallet(scenario, request.lot_ids)
     pb, pa = request.pallets_before, request.pallets_after
-    gb = gross_cargo_kg(per_pallet * pb, pb, p)
-    ga = gross_cargo_kg(per_pallet * pa, pa, p)
+    if request.lot_pallets_before or request.lot_pallets_after:
+        gb = gross_cargo_kg(_net_kg(scenario, request.lot_pallets_before), pb, p)
+        ga = gross_cargo_kg(_net_kg(scenario, request.lot_pallets_after), pa, p)
+    else:
+        per_pallet = _net_per_pallet(scenario, request.lot_ids)
+        gb = gross_cargo_kg(per_pallet * pb, pb, p)
+        ga = gross_cargo_kg(per_pallet * pa, pa, p)
     tare = p.container_tare_kg.value
     cid = request.container_id
     booking = mock_booking_no(plan_id, cid)
@@ -664,6 +679,9 @@ def saas_request_text(
         f"{ports.get(voyage.destination, voyage.destination)}"
     )
     lots = ", ".join(request.lot_ids) or "없음"
+    found = re.search(r"화주별 파렛트: (.+?)\. ", request.text)
+    if found:
+        lots = f"{lots}. 화주별 파렛트: {found.group(1)}"
     timeline = (
         f"SI 마감 {fmt(cutoffs.si_cutoff)}, VGM 마감 {fmt(cutoffs.vgm_cutoff)}, "
         f"CY 반입 마감 {fmt(cutoffs.cy_cutoff)}"
