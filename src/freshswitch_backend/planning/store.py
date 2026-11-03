@@ -29,7 +29,7 @@ from freshswitch_backend.execution.quality import (
     planned_loss_rate,
 )
 from freshswitch_backend.explain.models import Explanation
-from freshswitch_backend.lots import ANY_ORG, mark_planned, release_lots
+from freshswitch_backend.lots import ANY_ORG, mark_planned, release_lots, sync_committed_lots
 from freshswitch_backend.persistence import Database, database
 from freshswitch_backend.persistence.tables import (
     DEMO_ORG,
@@ -748,11 +748,18 @@ class SessionStore:
             state = self._require(db, plan_id, org_id)
             order = state.orders[order_id]
             now = self.clock()
+            committed = state.session.committed_version
             if body.actor == "shipper":
                 result = self._confirm_shipper(state, order, body, now)
             else:
                 result = self._confirm_forwarder(state, order, body, now)
             self._save(db, state)
+            session = state.session
+            if (
+                session.committed_version != committed
+                and _plan_row(db, plan_id, ANY_ORG).org_id != DEMO_ORG
+            ):
+                sync_committed_lots(db, session.registered_lot_ids, session.scenario.lots, now)
             return result
 
     def _confirm_shipper(

@@ -7,6 +7,7 @@ from freshswitch_backend.lots.store import (
     lot_store,
     mark_planned,
     release_lots,
+    sync_committed_lots,
 )
 
 __all__ = [
@@ -21,4 +22,5 @@ __all__ = [
     "lot_store",
     "mark_planned",
     "release_lots",
+    "sync_committed_lots",
 ]

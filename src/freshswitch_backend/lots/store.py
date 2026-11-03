@@ -55,6 +55,26 @@ def release_lots(
     db.execute(statement.values(status="registered", updated_at=now))
 
 
+def sync_committed_lots(db: Session, lot_ids: list[str], lots: list[Lot], now: datetime) -> None:
+    registered = set(lot_ids)
+    if not registered:
+        return
+    pallets = {lot.id: lot.pallets for lot in lots if lot.id in registered}
+    for lot_id, count in pallets.items():
+        db.execute(
+            update(LotRow)
+            .where(LotRow.id == lot_id, LotRow.status == "planned", LotRow.pallets != count)
+            .values(pallets=count, updated_at=now)
+        )
+    removed = registered - set(pallets)
+    if removed:
+        db.execute(
+            update(LotRow)
+            .where(LotRow.id.in_(removed), LotRow.status == "planned")
+            .values(status="cancelled", updated_at=now)
+        )
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 

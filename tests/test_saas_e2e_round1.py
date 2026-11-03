@@ -170,3 +170,114 @@ def test_shipper_plan_detail_holds_only_own_settlement(
     assert sum(c["pallets"] for c in plan["containers"]) == sum(
         c["pallets"] for c in full["plan"]["containers"]
     )
+
+
+def _confirm_all(
+    platform_client: TestClient,
+    saas_login,
+    forwarder_client: TestClient,
+    plan_id: str,
+    order_id: str,
+) -> None:
+    order = platform_client.get(f"/api/plans/{plan_id}/orders/{order_id}").json()
+    for confirmation in order["shipper_confirmations"]:
+        shipper = saas_login(shipper_org_id(confirmation["shipper_id"]))
+        answered = shipper.post(
+            f"/api/saas/shipper/plans/{plan_id}/orders/{order_id}/confirm",
+            json={"accept": True, "shipper_id": confirmation["shipper_id"]},
+        )
+        assert answered.status_code == 200, answered.text
+    done = forwarder_client.post(
+        f"/api/saas/forwarder/plans/{plan_id}/orders/{order_id}/confirm", json={"accept": True}
+    )
+    assert done.status_code == 200, done.text
+
+
+def _pallets(client: TestClient, path: str, lot_id: str) -> tuple[int, str]:
+    lot = next(x for x in client.get(path).json() if x["id"] == lot_id)
+    return lot["pallets"], lot["status"]
+
+
+def test_confirmed_reduce_updates_lot_record(
+    platform_client: TestClient, saas_login, forwarder_client: TestClient
+) -> None:
+    plan_id, order_id = _reduced_plan(platform_client, saas_login)
+    pohang = saas_login("shipper-pohang")
+    lot_id = POHANG_REDUCE["lot_id"]
+    assert _pallets(pohang, "/api/saas/shipper/lots", lot_id) == (5, "planned")
+
+    _confirm_all(platform_client, saas_login, forwarder_client, plan_id, order_id)
+
+    assert _pallets(pohang, "/api/saas/shipper/lots", lot_id) == (2, "planned")
+    assert _pallets(platform_client, "/api/saas/platform/lots", lot_id) == (2, "planned")
+    sangju = saas_login("shipper-sangju")
+    assert _pallets(sangju, "/api/saas/shipper/lots", "lot-sangju-gr-1") == (13, "planned")
+
+
+def test_rejected_reduce_keeps_lot_record(platform_client: TestClient, saas_login) -> None:
+    plan_id, order_id = _reduced_plan(platform_client, saas_login)
+    order = platform_client.get(f"/api/plans/{plan_id}/orders/{order_id}").json()
+    first = order["shipper_confirmations"][0]["shipper_id"]
+    shipper = saas_login(shipper_org_id(first))
+    rejected = shipper.post(
+        f"/api/saas/shipper/plans/{plan_id}/orders/{order_id}/confirm",
+        json={"accept": False, "shipper_id": first},
+    )
+    assert rejected.status_code == 200, rejected.text
+    pohang = saas_login("shipper-pohang")
+    assert _pallets(pohang, "/api/saas/shipper/lots", POHANG_REDUCE["lot_id"]) == (5, "planned")
+
+
+def test_confirmed_cancel_marks_lot_cancelled(
+    platform_client: TestClient, saas_login, forwarder_client: TestClient
+) -> None:
+    plan_id, order_id = _reduced_plan(platform_client, saas_login)
+    _confirm_all(platform_client, saas_login, forwarder_client, plan_id, order_id)
+    cancel = {"type": "cancel", "lot_id": "lot-jinju-sb-1"}
+    event = platform_client.post(f"/api/plans/{plan_id}/events", json={"event": cancel})
+    assert event.status_code == 200, event.text
+    alternative = next(a["id"] for a in event.json()["alternatives"] if a["feasible"])
+    applied = platform_client.post(
+        f"/api/plans/{plan_id}/apply", json={"alternative_id": alternative}
+    )
+    assert applied.status_code == 200, applied.text
+    _confirm_all(
+        platform_client, saas_login, forwarder_client, plan_id, applied.json()["active_order_id"]
+    )
+    jinju = saas_login("shipper-jinju")
+    assert _pallets(jinju, "/api/saas/shipper/lots", "lot-jinju-sb-1") == (8, "cancelled")
+
+
+def test_demo_confirm_leaves_demo_lots_alone(client: TestClient) -> None:
+    scenario = get_scenario("default")
+    assert scenario is not None
+    lot = scenario.lots[-1]
+    saved = client.post(
+        "/api/intake/lots",
+        json={
+            **_lot_body(lot),
+            "lot_id": "lot-demo-sync-1",
+            "shipper": lot.shipper_id,
+            "save": True,
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    created = client.post("/api/plans", json={"lot_ids": ["lot-demo-sync-1"]})
+    assert created.status_code == 201, created.text
+    plan_id = created.json()["plan_id"]
+    reduce = {"type": "reduce", "lot_id": "lot-demo-sync-1", "new_pallets": 1}
+    event = client.post(f"/api/plans/{plan_id}/events", json={"event": reduce})
+    assert event.status_code == 200, event.text
+    alternative = next(a["id"] for a in event.json()["alternatives"] if a["feasible"])
+    applied = client.post(f"/api/plans/{plan_id}/apply", json={"alternative_id": alternative})
+    assert applied.status_code == 200, applied.text
+    order_id = applied.json()["active_order_id"]
+    order = client.get(f"/api/plans/{plan_id}/orders/{order_id}").json()
+    path = f"/api/plans/{plan_id}/orders/{order_id}/confirm"
+    for confirmation in order["shipper_confirmations"]:
+        body = {"actor": "shipper", "shipper_id": confirmation["shipper_id"], "accept": True}
+        assert client.post(path, json=body).status_code == 200
+    done = client.post(path, json={"actor": "forwarder", "accept": True})
+    assert done.status_code == 200, done.text
+    assert done.json()["status"] in ("forwarder_confirmed", "executed")
+    assert client.get("/api/lots/lot-demo-sync-1").json()["pallets"] == lot.pallets
