@@ -2,6 +2,7 @@ import json
 import threading
 import uuid
 from pathlib import Path
+from typing import Literal
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
@@ -12,7 +13,8 @@ from freshswitch_backend.domain.models import KST, Scenario
 from freshswitch_backend.execution.quality import ArrivalSettlementResult
 from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.persistence import Database, database, get_meta, set_meta
-from freshswitch_backend.persistence.tables import DEMO_ORG, ObservationRow
+from freshswitch_backend.persistence.orgs import org_sandbox
+from freshswitch_backend.persistence.tables import DEMO_ORG, DEMO_SCOPE, ObservationRow
 from freshswitch_backend.planning.store import PlanSession
 from freshswitch_backend.planning.store import store as plan_store
 from freshswitch_backend.quality.learning import condition_uplift, outage_bucket, prior_model_rate
@@ -28,6 +30,23 @@ SEED_PATH = Path(__file__).resolve().parent.parent / "data" / "quality" / "seed-
 MAX_OBSERVATIONS = 5000
 SEEDED_KEY = "quality_seeded"
 RESET_ORG_TYPES = frozenset({"platform"})
+LearningScope = Literal["demo", "sandbox", "live"]
+SEEDED_SCOPES = frozenset({"demo", "sandbox"})
+LIVE_LABEL = "실측: 이 범위의 도착 검수·수동 관측만 학습한다(시드 관측 없음)"
+
+
+def learning_scope(org_id: str | None) -> LearningScope:
+    if org_id is None or org_id == DEMO_ORG:
+        return "demo"
+    return "sandbox" if org_sandbox(org_id) else "live"
+
+
+def _seeded_key(scope: LearningScope) -> str:
+    return SEEDED_KEY if scope == DEMO_SCOPE else f"{SEEDED_KEY}:{scope}"
+
+
+def _seed_id(item_id: str, scope: LearningScope) -> str:
+    return item_id if scope == DEMO_SCOPE else f"{scope}-{item_id}"
 
 
 class QualityInputError(ValueError):
@@ -59,9 +78,12 @@ def _container_outage(plan_id: str, container_id: str, org_id: str = DEMO_ORG) -
         return None
 
 
-def _row(observation: Observation, inspection_revision: int | None = None) -> ObservationRow:
+def _row(
+    observation: Observation, scope: LearningScope, inspection_revision: int | None = None
+) -> ObservationRow:
     return ObservationRow(
         id=observation.id,
+        scope=scope,
         origin=observation.origin,
         product_id=observation.product_id,
         plan_id=observation.plan_id,
@@ -78,6 +100,9 @@ class QualityHistory:
         self._db = db or database
         self._lock = threading.RLock()
         self.seed_label, self._seed = _load_seed()
+
+    def seed_label_for(self, scope: LearningScope = "demo") -> str:
+        return self.seed_label if scope in SEEDED_SCOPES else LIVE_LABEL
 
     def reference_scenario(self) -> Scenario:
         scenario = get_scenario("default")
@@ -120,70 +145,90 @@ class QualityHistory:
             note=body.note,
         )
 
-    def _seed_rows(self, db: Session, scenario: Scenario) -> int:
+    def _seed_rows(self, db: Session, scenario: Scenario, scope: LearningScope) -> int:
+        set_meta(db, _seeded_key(scope), True)
+        if scope not in SEEDED_SCOPES:
+            return 0
         for item in self._seed:
-            db.add(_row(self._from_input(item, "seed", item.id, scenario)))
-        set_meta(db, SEEDED_KEY, True)
+            db.add(_row(self._from_input(item, "seed", _seed_id(item.id, scope), scenario), scope))
         return len(self._seed)
 
-    def _ensure_seeded(self, db: Session) -> None:
-        if get_meta(db, SEEDED_KEY):
+    def _ensure_seeded(self, db: Session, scope: LearningScope) -> None:
+        if get_meta(db, _seeded_key(scope)):
             return
-        self._seed_rows(db, self.reference_scenario())
+        self._seed_rows(db, self.reference_scenario(), scope)
         db.flush()
 
-    def reset(self, seed: bool = True, org_type: str | None = None) -> tuple[int, int]:
+    def reset(
+        self, seed: bool = True, org_type: str | None = None, scope: LearningScope = "demo"
+    ) -> tuple[int, int]:
         _check_reset(org_type)
         scenario = self.reference_scenario()
+        in_scope = ObservationRow.scope == scope
         with self._lock, self._db.begin() as db:
-            cleared = db.scalar(select(func.count()).select_from(ObservationRow)) or 0
-            db.execute(delete(ObservationRow))
+            cleared = db.scalar(select(func.count()).select_from(ObservationRow).where(in_scope))
+            db.execute(delete(ObservationRow).where(in_scope))
             if seed:
-                return cleared, self._seed_rows(db, scenario)
-            set_meta(db, SEEDED_KEY, True)
-            return cleared, 0
+                return cleared or 0, self._seed_rows(db, scenario, scope)
+            set_meta(db, _seeded_key(scope), True)
+            return cleared or 0, 0
 
-    def observations(self) -> list[Observation]:
+    def observations(self, scope: LearningScope = "demo") -> list[Observation]:
         with self._lock, self._db.begin() as db:
-            self._ensure_seeded(db)
-            rows = db.scalars(select(ObservationRow).order_by(ObservationRow.seq))
+            self._ensure_seeded(db, scope)
+            rows = db.scalars(
+                select(ObservationRow)
+                .where(ObservationRow.scope == scope)
+                .order_by(ObservationRow.seq)
+            )
             return [Observation.model_validate(row.payload) for row in rows]
 
-    def get(self, obs_id: str) -> Observation | None:
+    def get(self, obs_id: str, scope: LearningScope = "demo") -> Observation | None:
         with self._lock, self._db.begin() as db:
-            self._ensure_seeded(db)
+            self._ensure_seeded(db, scope)
             row = db.get(ObservationRow, obs_id)
-            return Observation.model_validate(row.payload) if row is not None else None
+            if row is None or row.scope != scope:
+                return None
+            return Observation.model_validate(row.payload)
 
-    def delete(self, obs_id: str, org_type: str | None = None) -> bool:
+    def delete(
+        self, obs_id: str, org_type: str | None = None, scope: LearningScope = "demo"
+    ) -> bool:
         _check_reset(org_type)
         with self._lock, self._db.begin() as db:
-            self._ensure_seeded(db)
-            return (
-                db.execute(delete(ObservationRow).where(ObservationRow.id == obs_id)).rowcount > 0
+            self._ensure_seeded(db, scope)
+            target = delete(ObservationRow).where(
+                ObservationRow.id == obs_id, ObservationRow.scope == scope
             )
+            return db.execute(target).rowcount > 0
 
     def _append(
-        self, db: Session, observation: Observation, inspection_revision: int | None = None
+        self,
+        db: Session,
+        observation: Observation,
+        scope: LearningScope,
+        inspection_revision: int | None = None,
     ) -> None:
-        db.add(_row(observation, inspection_revision))
+        db.add(_row(observation, scope, inspection_revision))
         db.flush()
+        in_scope = ObservationRow.scope == scope
         cutoff = db.scalar(
             select(ObservationRow.seq)
+            .where(in_scope)
             .order_by(ObservationRow.seq.desc())
             .offset(MAX_OBSERVATIONS)
             .limit(1)
         )
         if cutoff is not None:
-            db.execute(delete(ObservationRow).where(ObservationRow.seq <= cutoff))
+            db.execute(delete(ObservationRow).where(in_scope, ObservationRow.seq <= cutoff))
 
-    def add(self, body: ObservationIn) -> Observation:
+    def add(self, body: ObservationIn, scope: LearningScope = "demo") -> Observation:
         observation = self._from_input(
             body, "manual", f"obs-{uuid.uuid4().hex[:12]}", self.reference_scenario()
         )
         with self._lock, self._db.begin() as db:
-            self._ensure_seeded(db)
-            self._append(db, observation)
+            self._ensure_seeded(db, scope)
+            self._append(db, observation, scope)
         return observation
 
     def record_arrival(
@@ -230,8 +275,9 @@ class QualityHistory:
         uplift = baseline - reference
         actual = result.inspected_loss_rate
         now = plan_store.clock()
+        scope = learning_scope(org_id)
         with self._lock, self._db.begin() as db:
-            self._ensure_seeded(db)
+            self._ensure_seeded(db, scope)
             existing = db.scalars(
                 select(ObservationRow).where(
                     ObservationRow.origin == "arrival",
@@ -275,12 +321,13 @@ class QualityHistory:
                 note=result.note,
             )
             if existing is not None:
+                existing.scope = scope
                 existing.product_id = observation.product_id
                 existing.recorded_at = observation.recorded_at
                 existing.inspection_revision = session.inspection_revision
                 existing.payload = observation.model_dump(mode="json")
             else:
-                self._append(db, observation, session.inspection_revision)
+                self._append(db, observation, scope, session.inspection_revision)
             return observation
 
 

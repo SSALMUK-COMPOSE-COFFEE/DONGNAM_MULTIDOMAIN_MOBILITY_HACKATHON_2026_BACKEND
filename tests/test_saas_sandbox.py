@@ -327,7 +327,7 @@ def test_sandbox_platform_sees_only_sandbox_plan_observations(worlds) -> None:
         json={"lot_id": worlds["real_lot"], "inspected_loss_pct": 9, "note": "실제 메모"},
     )
     assert arrival.status_code == 200, arrival.text
-    real_obs = next(o for o in quality_history.observations() if o.plan_id == plan_id)
+    real_obs = next(o for o in quality_history.observations("live") if o.plan_id == plan_id)
     real_list = real.get("/api/quality/observations").json()["observations"]
     assert real_obs.id in {o["id"] for o in real_list}
     demo = worlds["demo_platform"]

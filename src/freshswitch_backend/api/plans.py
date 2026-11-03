@@ -46,7 +46,7 @@ from freshswitch_backend.planning.store import (
     SessionConflict,
     store,
 )
-from freshswitch_backend.quality import with_learned_loss
+from freshswitch_backend.quality import learning_scope, with_learned_loss
 from freshswitch_backend.replan import DelayEvent, Event, ReplanResult, replan
 from freshswitch_backend.replan.explanation import explain_replan, llm_enabled
 from freshswitch_backend.replan.models import AlternativeId
@@ -249,7 +249,7 @@ def create_tenant_plan(body: CreatePlanRequest, org_id: str) -> PlanSession:
     if not registered_ids:
         raise HTTPException(status_code=422, detail="계획에 넣을 등록 출하가 없습니다")
     if body.use_learned_loss:
-        scenario = with_learned_loss(scenario)
+        scenario = with_learned_loss(scenario, scope=learning_scope(org_id))
     return store.create(scenario, registered_ids, org_id=org_id, lot_org_id=ANY_ORG)
 
 

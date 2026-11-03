@@ -64,12 +64,25 @@ def test_saas_real_platform_can_reset_quality(saas_client: TestClient) -> None:
         json={"email": REAL_PLATFORM_EMAIL, "password": REAL_PLATFORM_PASSWORD},
     )
     assert login.status_code == 200, login.text
-    target = _first_observation(saas_client)
+    demo_before = len(quality_history.observations())
+    demo_target = _first_observation(saas_client)
+    other = saas_client.delete(f"/api/quality/observations/{demo_target}", headers=CSRF)
+    assert other.status_code == 404
+    added = saas_client.post(
+        "/api/quality/observations",
+        json={"product_id": "strawberry", "pallets": 2, "actual_loss_pct": 3},
+        headers=CSRF,
+    )
+    assert added.status_code == 201
+    target = added.json()["id"]
     deleted = saas_client.delete(f"/api/quality/observations/{target}", headers=CSRF)
     assert deleted.status_code == 204
     reset = saas_client.post("/api/quality/reset", params={"seed": False}, headers=CSRF)
     assert reset.status_code == 200
-    assert quality_history.observations() == []
+    assert quality_history.observations("live") == []
+    assert len(quality_history.observations()) == demo_before
+    crossed = saas_client.post("/api/quality/reset", params={"scope": "demo"}, headers=CSRF)
+    assert crossed.status_code == 403
 
 
 def test_saas_admin_token_can_reset_quality(saas_client: TestClient, reset_admin_headers) -> None:

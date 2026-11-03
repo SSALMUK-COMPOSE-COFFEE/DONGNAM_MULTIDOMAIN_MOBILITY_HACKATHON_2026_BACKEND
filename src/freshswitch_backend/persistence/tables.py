@@ -23,6 +23,8 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 Json = dict[str, Any]
 
 DEMO_ORG = "demo"
+DEMO_SCOPE = "demo"
+LEARNING_SCOPES = ("demo", "sandbox", "live")
 ORG_TYPES = ("platform", "shipper", "forwarder", "demo")
 MEMBERSHIP_ROLES = ("admin", "member")
 
@@ -310,10 +312,17 @@ class RunRow(Base):
 
 class ObservationRow(Base):
     __tablename__ = "quality_observations"
-    __table_args__ = (Index("ix_quality_observations_plan_lot", "plan_id", "lot_id"),)
+    __table_args__ = (
+        Index("ix_quality_observations_plan_lot", "plan_id", "lot_id"),
+        Index("ix_quality_observations_scope_seq", "scope", "seq"),
+        CheckConstraint(
+            "scope IN ('demo', 'sandbox', 'live')", name="quality_observations_scope_check"
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     seq: Mapped[int] = mapped_column(BigInteger, Identity(), unique=True)
+    scope: Mapped[str] = mapped_column(String(20), server_default=DEMO_SCOPE)
     origin: Mapped[str] = mapped_column(String(20), index=True)
     product_id: Mapped[str] = mapped_column(String(100), index=True)
     plan_id: Mapped[str | None] = mapped_column(String(64))

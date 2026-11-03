@@ -8,11 +8,13 @@ from freshswitch_backend.api.access import bearer, require_demo_reset
 from freshswitch_backend.api.auth import OptionalPrincipal, Principal, app_settings
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import Scenario
-from freshswitch_backend.persistence.orgs import org_sandbox, plan_owner_sandboxes
+from freshswitch_backend.persistence.orgs import org_sandbox
 from freshswitch_backend.quality import (
+    LearningScope,
     QualityAccessDenied,
     QualityInputError,
     learned_table,
+    learning_scope,
     quality_history,
 )
 from freshswitch_backend.quality.impact import learning_impact
@@ -29,63 +31,76 @@ router = APIRouter(prefix="/quality", tags=["quality"])
 
 PLATFORM_ONLY = "품질 관측 원본은 플랫폼 조직만 다룰 수 있습니다"
 SANDBOX_WRITE = "데모 플랫폼은 품질 관측을 추가·삭제·초기화할 수 없습니다"
+OTHER_SCOPE = "다른 학습 범위의 품질 관측은 다룰 수 없습니다"
 
 
-class ObservationViewer:
-    def __init__(self, principal: Principal | None) -> None:
-        self.sandbox = org_sandbox(principal.org_id) if principal is not None else None
-
-    def filter(self, observations: list[Observation]) -> list[Observation]:
-        if self.sandbox is None:
-            return observations
-        owners = plan_owner_sandboxes({o.plan_id for o in observations if o.plan_id})
-        return [
-            o for o in observations if o.plan_id is None or owners.get(o.plan_id) == self.sandbox
-        ]
+def _principal_scope(principal: Principal | None) -> LearningScope:
+    return learning_scope(principal.org_id if principal is not None else None)
 
 
-def observation_viewer(request: Request, principal: OptionalPrincipal) -> ObservationViewer:
+def caller_scope(principal: OptionalPrincipal) -> LearningScope:
+    return _principal_scope(principal)
+
+
+Scope = Annotated[LearningScope, Depends(caller_scope)]
+
+
+def observation_viewer(request: Request, principal: OptionalPrincipal) -> LearningScope:
     if not app_settings(request).saas_mode:
-        return ObservationViewer(None)
+        return _principal_scope(principal)
     if principal is None:
         raise HTTPException(status_code=401, detail="로그인이 필요합니다")
     if principal.org_type != "platform":
         raise HTTPException(status_code=403, detail=PLATFORM_ONLY)
-    return ObservationViewer(principal)
+    return _principal_scope(principal)
 
 
-Viewer = Annotated[ObservationViewer, Depends(observation_viewer)]
+ViewerScope = Annotated[LearningScope, Depends(observation_viewer)]
 
 
-def observation_writer(request: Request, principal: OptionalPrincipal) -> None:
+def observation_writer(request: Request, principal: OptionalPrincipal) -> LearningScope:
     if not app_settings(request).saas_mode:
-        return
+        return _principal_scope(principal)
     if principal is None:
         raise HTTPException(status_code=401, detail="로그인이 필요합니다")
     if principal.org_type != "platform":
         raise HTTPException(status_code=403, detail=PLATFORM_ONLY)
     if org_sandbox(principal.org_id):
         raise HTTPException(status_code=403, detail=SANDBOX_WRITE)
+    return _principal_scope(principal)
 
 
-def reset_org_type(
+WriterScope = Annotated[LearningScope, Depends(observation_writer)]
+
+
+class ResetTarget:
+    def __init__(self, org_type: str | None, scope: LearningScope) -> None:
+        self.org_type = org_type
+        self.scope = scope
+
+
+def reset_target(
     request: Request,
     principal: OptionalPrincipal,
     credential: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
-) -> str | None:
+    scope: Annotated[LearningScope | None, Query()] = None,
+) -> ResetTarget:
     if principal is None and not app_settings(request).saas_mode:
-        return None
+        return ResetTarget(None, "demo")
     if credential is not None:
         require_demo_reset(credential)
-        return None
+        return ResetTarget(None, scope or "demo")
     if principal is None:
         raise HTTPException(status_code=401, detail="로그인이 필요합니다")
     if app_settings(request).saas_mode and org_sandbox(principal.org_id):
         raise HTTPException(status_code=403, detail=SANDBOX_WRITE)
-    return principal.org_type
+    own = _principal_scope(principal)
+    if scope is not None and scope != own:
+        raise HTTPException(status_code=403, detail=OTHER_SCOPE)
+    return ResetTarget(principal.org_type, own)
 
 
-ResetOrgType = Annotated[str | None, Depends(reset_org_type)]
+Target = Annotated[ResetTarget, Depends(reset_target)]
 
 
 def _scenario(scenario_id: str) -> Scenario:
@@ -96,40 +111,40 @@ def _scenario(scenario_id: str) -> Scenario:
 
 
 @router.get("/loss-rates")
-def loss_rates(scenario_id: Annotated[str, Query()] = "default") -> LossTable:
-    return learned_table(_scenario(scenario_id))
+def loss_rates(scope: Scope, scenario_id: Annotated[str, Query()] = "default") -> LossTable:
+    return learned_table(_scenario(scenario_id), scope=scope)
 
 
 @router.get("/observations")
-def list_observations(viewer: Viewer) -> ObservationList:
-    observations = viewer.filter(quality_history.observations())
+def list_observations(scope: ViewerScope) -> ObservationList:
+    observations = quality_history.observations(scope)
     return ObservationList(
-        seed_label=quality_history.seed_label,
+        seed_label=quality_history.seed_label_for(scope),
         count=len(observations),
         observations=observations,
     )
 
 
-@router.post("/observations", status_code=201, dependencies=[Depends(observation_writer)])
-def add_observation(body: ObservationIn) -> Observation:
+@router.post("/observations", status_code=201)
+def add_observation(body: ObservationIn, scope: WriterScope) -> Observation:
     try:
-        return quality_history.add(body)
+        return quality_history.add(body, scope)
     except QualityInputError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/observations/{obs_id}")
-def read_observation(obs_id: str, viewer: Viewer) -> Observation:
-    observation = quality_history.get(obs_id)
-    if observation is None or not viewer.filter([observation]):
+def read_observation(obs_id: str, scope: ViewerScope) -> Observation:
+    observation = quality_history.get(obs_id, scope)
+    if observation is None:
         raise HTTPException(status_code=404, detail="관측을 찾을 수 없습니다")
     return observation
 
 
 @router.delete("/observations/{obs_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_observation(obs_id: str, org_type: ResetOrgType) -> None:
+def delete_observation(obs_id: str, target: Target) -> None:
     try:
-        deleted = quality_history.delete(obs_id, org_type=org_type)
+        deleted = quality_history.delete(obs_id, org_type=target.org_type, scope=target.scope)
     except QualityAccessDenied as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     if not deleted:
@@ -137,17 +152,19 @@ def delete_observation(obs_id: str, org_type: ResetOrgType) -> None:
 
 
 @router.post("/reset")
-def reset(org_type: ResetOrgType, seed: Annotated[bool, Query()] = True) -> ResetResult:
+def reset(target: Target, seed: Annotated[bool, Query()] = True) -> ResetResult:
     try:
-        cleared, seeded = quality_history.reset(seed=seed, org_type=org_type)
+        cleared, seeded = quality_history.reset(
+            seed=seed, org_type=target.org_type, scope=target.scope
+        )
     except QualityAccessDenied as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     return ResetResult(cleared=cleared, seeded=seeded)
 
 
 @router.get("/impact")
-async def impact(scenario_id: Annotated[str, Query()] = "default") -> ImpactResult:
+async def impact(scope: Scope, scenario_id: Annotated[str, Query()] = "default") -> ImpactResult:
     scenario = _scenario(scenario_id)
-    table = await run_in_threadpool(learned_table, scenario)
+    table = await run_in_threadpool(learned_table, scenario, quality_history, scope)
     cells = [c for c in table.cells if c.observations]
     return await run_in_threadpool(learning_impact, scenario, table.adjustments, cells)

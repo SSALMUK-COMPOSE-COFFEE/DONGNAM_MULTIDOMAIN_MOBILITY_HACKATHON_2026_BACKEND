@@ -83,7 +83,7 @@ def test_codex2_anonymous_cannot_read_raw_observations(saas_app) -> None:
 @pytest.mark.parametrize("org_id", [SHIPPER_ORG_ID, FORWARDER_ORG_ID])
 def test_codex2_only_platform_reads_raw_observations(saas_app, org_id: str) -> None:
     client = login_client(org_id, saas_app)
-    target = quality_history.observations()[0].id
+    target = quality_history.observations("sandbox")[0].id
     assert client.get("/api/quality/observations").status_code == 403
     assert client.get(f"/api/quality/observations/{target}").status_code == 403
     platform = login_client(PLATFORM_ORG_ID, saas_app)
