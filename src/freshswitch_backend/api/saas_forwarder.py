@@ -15,11 +15,21 @@ from freshswitch_backend.api.saas_views import (
     without_settlement,
 )
 from freshswitch_backend.domain.models import Scenario
-from freshswitch_backend.execution.card import ExecutionCard, build_execution_card
+from freshswitch_backend.execution.card import (
+    ContainerExecution,
+    ExecutionCard,
+    ExecutionNumbersInput,
+    build_execution_card,
+)
 from freshswitch_backend.execution.models import (
     ConfirmRequest,
     ExecutionOrder,
     RequestResultBody,
+)
+from freshswitch_backend.execution.numbers import (
+    DuplicateContainerNo,
+    entered_numbers,
+    save_numbers,
 )
 from freshswitch_backend.execution.orders import saas_requests
 from freshswitch_backend.notifications import notify_order_committed
@@ -49,7 +59,13 @@ def _order_view(order: ExecutionOrder, scenario: Scenario) -> ForwarderOrder:
 
 
 def _card(session: PlanSession) -> ExecutionCard:
-    return build_execution_card(session.plan_id, session.version, session.scenario, session.plan)
+    return build_execution_card(
+        session.plan_id,
+        session.version,
+        session.scenario,
+        session.plan,
+        entered=entered_numbers(session.plan_id),
+    )
 
 
 @router.get("/plans")
@@ -82,6 +98,34 @@ def read_plan(plan_id: str, principal: ForwarderPrincipal) -> dict[str, Any]:
 @router.get("/plans/{plan_id}/execution-card")
 def read_execution_card(plan_id: str, principal: ForwarderPrincipal) -> ExecutionCard:
     return _card(plan_for(plan_id, principal).session)
+
+
+@router.put("/plans/{plan_id}/execution-card/containers/{container_id}")
+def save_container_numbers(
+    plan_id: str,
+    container_id: str,
+    body: ExecutionNumbersInput,
+    principal: ForwarderPrincipal,
+) -> ContainerExecution:
+    session = plan_for(plan_id, principal).session
+    active = {
+        c.container_id
+        for c in build_execution_card(
+            session.plan_id, session.version, session.scenario, session.plan
+        ).containers
+    }
+    if container_id not in active:
+        raise HTTPException(status_code=404, detail="계획에 없는 컨테이너입니다")
+    changes = body.model_dump(include=body.model_fields_set)
+    if not changes:
+        raise HTTPException(
+            status_code=422, detail="booking_no·container_no·seal_no 중 하나 이상을 입력하세요"
+        )
+    try:
+        save_numbers(plan_id, container_id, changes, active, principal.user_id, store.clock())
+    except DuplicateContainerNo as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return next(c for c in _card(session).containers if c.container_id == container_id)
 
 
 @router.get("/plans/{plan_id}/orders")

@@ -1,7 +1,8 @@
 import hashlib
+import re
 from datetime import datetime, timedelta
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from freshswitch_backend.domain.models import KST, Plan, Product, Scenario, Voyage
 from freshswitch_backend.execution.params import ExecutionParams
@@ -11,6 +12,9 @@ MOCK_NOTE = (
     "모의값: 부킹·컨테이너·씰 번호는 실제 선사 발급 전이라 계획 id·컨테이너 id로 결정적으로 만든 값이다. "
     "컨테이너 번호는 ISO 6346 형식(소유자 코드 + U + 일련번호 6자리 + 검사 숫자)"
 )
+CONTAINER_NO_PATTERN = re.compile(r"[A-Z]{3}[UJZ]\d{7}")
+BOOKING_NO_PATTERN = re.compile(r"[A-Z0-9][A-Z0-9-]{3,29}")
+SEAL_NO_PATTERN = re.compile(r"[A-Z0-9][A-Z0-9-]{3,19}")
 DEFAULT_PALLET_KG = Product.model_fields["pallet_kg"].default
 ISO6346_LETTERS = {
     letter: value
@@ -71,6 +75,10 @@ class ContainerExecution(BaseModel):
     container_no: str
     seal_no: str
     mock: bool
+    booking_no_mock: bool = True
+    container_no_mock: bool = True
+    seal_no_mock: bool = True
+    entered_at: datetime | None = None
     weight: VgmWeight
     setpoint: Setpoint
     empty_pickup: EmptyPickup
@@ -83,6 +91,70 @@ class ExecutionCard(BaseModel):
     mock: bool
     mock_note: str
     containers: list[ContainerExecution]
+
+
+class EnteredNumbers(BaseModel):
+    booking_no: str | None = None
+    container_no: str | None = None
+    seal_no: str | None = None
+    updated_at: datetime | None = None
+
+
+def _normalized(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = re.sub(r"\s+", "", value).upper()
+    return cleaned or None
+
+
+class ExecutionNumbersInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    booking_no: str | None = None
+    container_no: str | None = None
+    seal_no: str | None = None
+
+    @field_validator("booking_no")
+    @classmethod
+    def _booking(cls, value: str | None) -> str | None:
+        cleaned = _normalized(value)
+        if cleaned is not None and not BOOKING_NO_PATTERN.fullmatch(cleaned):
+            raise ValueError("부킹 번호는 영문 대문자·숫자·하이픈 4~30자여야 합니다")
+        return cleaned
+
+    @field_validator("seal_no")
+    @classmethod
+    def _seal(cls, value: str | None) -> str | None:
+        cleaned = _normalized(value)
+        if cleaned is not None and not SEAL_NO_PATTERN.fullmatch(cleaned):
+            raise ValueError("씰 번호는 영문 대문자·숫자·하이픈 4~20자여야 합니다")
+        return cleaned
+
+    @field_validator("container_no")
+    @classmethod
+    def _container(cls, value: str | None) -> str | None:
+        cleaned = _normalized(value)
+        if cleaned is None:
+            return None
+        error = container_no_error(cleaned)
+        if error:
+            raise ValueError(error)
+        return cleaned
+
+
+def container_no_error(number: str) -> str | None:
+    if not CONTAINER_NO_PATTERN.fullmatch(number):
+        return (
+            "컨테이너 번호는 ISO 6346 형식(소유자 코드 영문 3자 + 장비 구분 U/J/Z + "
+            "일련번호 6자리 + 체크디지트 1자리, 예: CSQU3054383)이어야 합니다"
+        )
+    expected = iso6346_check_digit(number[:10])
+    if int(number[10]) != expected:
+        return (
+            f"컨테이너 번호 체크디지트가 틀립니다: {number[:10]}의 체크디지트는 {expected}입니다"
+            f"(올바른 번호 {number[:10]}{expected})"
+        )
+    return None
 
 
 def iso6346_check_digit(code: str) -> int:
@@ -218,8 +290,10 @@ def build_execution_card(
     scenario: Scenario,
     plan: Plan,
     params: ExecutionParams | None = None,
+    entered: dict[str, EnteredNumbers] | None = None,
 ) -> ExecutionCard:
     p = params or ExecutionParams()
+    known = entered or {}
     lots = {lot.id: lot for lot in scenario.lots}
     products = {product.id: product for product in scenario.products}
     voyages = {voyage.id: voyage for voyage in scenario.voyages}
@@ -240,6 +314,10 @@ def build_execution_card(
         pallets = sum(a.pallets for a in assignments)
         gross = gross_cargo_kg(net, pallets, p)
         found = [products[pid] for pid in load.product_ids if pid in products]
+        actual = known.get(load.container_id, EnteredNumbers())
+        booking = actual.booking_no or mock_booking_no(plan_id, load.container_id)
+        container_no = actual.container_no or mock_container_no(plan_id, load.container_id)
+        seal = actual.seal_no or mock_seal_no(plan_id, load.container_id)
         cards.append(
             ContainerExecution(
                 container_id=load.container_id,
@@ -248,10 +326,14 @@ def build_execution_card(
                 terminal=voyage.terminal,
                 kind=kinds.get(load.container_id, "40RH-CA"),
                 lot_ids=sorted(a.lot_id for a in assignments),
-                booking_no=mock_booking_no(plan_id, load.container_id),
-                container_no=mock_container_no(plan_id, load.container_id),
-                seal_no=mock_seal_no(plan_id, load.container_id),
-                mock=True,
+                booking_no=booking,
+                container_no=container_no,
+                seal_no=seal,
+                mock=None in (actual.booking_no, actual.container_no, actual.seal_no),
+                booking_no_mock=actual.booking_no is None,
+                container_no_mock=actual.container_no is None,
+                seal_no_mock=actual.seal_no is None,
+                entered_at=actual.updated_at,
                 weight=VgmWeight(
                     pallets=pallets,
                     net_kg=round(net),
@@ -267,5 +349,9 @@ def build_execution_card(
             )
         )
     return ExecutionCard(
-        plan_id=plan_id, version=version, mock=True, mock_note=MOCK_NOTE, containers=cards
+        plan_id=plan_id,
+        version=version,
+        mock=any(card.mock for card in cards) or not cards,
+        mock_note=MOCK_NOTE,
+        containers=cards,
     )
