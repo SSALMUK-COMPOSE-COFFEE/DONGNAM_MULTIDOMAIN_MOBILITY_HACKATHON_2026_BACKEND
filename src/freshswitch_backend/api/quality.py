@@ -5,9 +5,10 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.security import HTTPAuthorizationCredentials
 
 from freshswitch_backend.api.access import bearer, require_demo_reset
-from freshswitch_backend.api.auth import OptionalPrincipal, app_settings
+from freshswitch_backend.api.auth import OptionalPrincipal, Principal, app_settings
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import Scenario
+from freshswitch_backend.persistence.orgs import org_sandbox, plan_owner_sandboxes
 from freshswitch_backend.quality import (
     QualityAccessDenied,
     QualityInputError,
@@ -26,6 +27,46 @@ from freshswitch_backend.quality.models import (
 
 router = APIRouter(prefix="/quality", tags=["quality"])
 
+PLATFORM_ONLY = "품질 관측 원본은 플랫폼 조직만 다룰 수 있습니다"
+SANDBOX_WRITE = "데모 플랫폼은 품질 관측을 추가·삭제·초기화할 수 없습니다"
+
+
+class ObservationViewer:
+    def __init__(self, principal: Principal | None) -> None:
+        self.sandbox = org_sandbox(principal.org_id) if principal is not None else None
+
+    def filter(self, observations: list[Observation]) -> list[Observation]:
+        if self.sandbox is None:
+            return observations
+        owners = plan_owner_sandboxes({o.plan_id for o in observations if o.plan_id})
+        return [
+            o for o in observations if o.plan_id is None or owners.get(o.plan_id) == self.sandbox
+        ]
+
+
+def observation_viewer(request: Request, principal: OptionalPrincipal) -> ObservationViewer:
+    if not app_settings(request).saas_mode:
+        return ObservationViewer(None)
+    if principal is None:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다")
+    if principal.org_type != "platform":
+        raise HTTPException(status_code=403, detail=PLATFORM_ONLY)
+    return ObservationViewer(principal)
+
+
+Viewer = Annotated[ObservationViewer, Depends(observation_viewer)]
+
+
+def observation_writer(request: Request, principal: OptionalPrincipal) -> None:
+    if not app_settings(request).saas_mode:
+        return
+    if principal is None:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다")
+    if principal.org_type != "platform":
+        raise HTTPException(status_code=403, detail=PLATFORM_ONLY)
+    if org_sandbox(principal.org_id):
+        raise HTTPException(status_code=403, detail=SANDBOX_WRITE)
+
 
 def reset_org_type(
     request: Request,
@@ -39,6 +80,8 @@ def reset_org_type(
         return None
     if principal is None:
         raise HTTPException(status_code=401, detail="로그인이 필요합니다")
+    if app_settings(request).saas_mode and org_sandbox(principal.org_id):
+        raise HTTPException(status_code=403, detail=SANDBOX_WRITE)
     return principal.org_type
 
 
@@ -58,8 +101,8 @@ def loss_rates(scenario_id: Annotated[str, Query()] = "default") -> LossTable:
 
 
 @router.get("/observations")
-def list_observations() -> ObservationList:
-    observations = quality_history.observations()
+def list_observations(viewer: Viewer) -> ObservationList:
+    observations = viewer.filter(quality_history.observations())
     return ObservationList(
         seed_label=quality_history.seed_label,
         count=len(observations),
@@ -67,7 +110,7 @@ def list_observations() -> ObservationList:
     )
 
 
-@router.post("/observations", status_code=201)
+@router.post("/observations", status_code=201, dependencies=[Depends(observation_writer)])
 def add_observation(body: ObservationIn) -> Observation:
     try:
         return quality_history.add(body)
@@ -76,9 +119,9 @@ def add_observation(body: ObservationIn) -> Observation:
 
 
 @router.get("/observations/{obs_id}")
-def read_observation(obs_id: str) -> Observation:
+def read_observation(obs_id: str, viewer: Viewer) -> Observation:
     observation = quality_history.get(obs_id)
-    if observation is None:
+    if observation is None or not viewer.filter([observation]):
         raise HTTPException(status_code=404, detail="관측을 찾을 수 없습니다")
     return observation
 
