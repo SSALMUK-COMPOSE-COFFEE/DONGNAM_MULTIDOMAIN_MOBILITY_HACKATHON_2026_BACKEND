@@ -15,10 +15,12 @@ from freshswitch_backend.api.saas_access import (
     visible_plans,
 )
 from freshswitch_backend.api.saas_views import (
+    ShipperContainerNumbers,
     ShipperPlanItem,
     ShipperSettlementRow,
     anonymized_orders,
     anonymized_session,
+    shipper_container_numbers,
     shipper_lot_ids,
     shipper_order_view,
     shipper_plan_item,
@@ -29,6 +31,7 @@ from freshswitch_backend.execution.models import (
     ExecutionOrder,
     RequestResultBody,
 )
+from freshswitch_backend.execution.numbers import entered_numbers
 from freshswitch_backend.execution.orders import saas_requests
 from freshswitch_backend.intake.models import IntakePreview, IntakeRequest
 from freshswitch_backend.lots import LotFilter, LotPatch, LotStatus, RegisteredLot, lot_store
@@ -141,7 +144,22 @@ def list_plans(principal: ShipperPrincipal) -> list[ShipperPlanItem]:
 def read_plan(plan_id: str, principal: ShipperPrincipal) -> dict[str, Any]:
     access = _access(plan_id, principal)
     orders = store.orders(plan_id, org_id=access.owner_org_id)
-    return anonymized_session(access.session, access.viewer.shipper_ids, orders)
+    payload = anonymized_session(access.session, access.viewer.shipper_ids, orders)
+    payload["container_numbers"] = [n.model_dump(mode="json") for n in _container_numbers(access)]
+    return payload
+
+
+def _container_numbers(access: PlanAccess) -> list[ShipperContainerNumbers]:
+    return shipper_container_numbers(
+        access.session, access.viewer.shipper_ids, entered_numbers(access.session.plan_id)
+    )
+
+
+@router.get("/plans/{plan_id}/containers")
+def read_container_numbers(
+    plan_id: str, principal: ShipperPrincipal
+) -> list[ShipperContainerNumbers]:
+    return _container_numbers(_access(plan_id, principal))
 
 
 @router.get("/plans/{plan_id}/orders")
