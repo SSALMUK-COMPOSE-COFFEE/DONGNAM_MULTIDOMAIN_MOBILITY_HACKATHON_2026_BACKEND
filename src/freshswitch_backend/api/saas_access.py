@@ -1,0 +1,96 @@
+from dataclasses import dataclass
+from typing import Annotated, Any
+
+from fastapi import Depends, HTTPException
+from sqlalchemy import exists, func, select
+
+from freshswitch_backend.api.auth import AuthPrincipal, Principal
+from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.tables import (
+    LotRow,
+    PlanForwarderRow,
+    PlanRow,
+    ShipperProfileRow,
+)
+from freshswitch_backend.planning.store import PlanSession, store
+
+NOT_FOUND = "계획을 찾을 수 없습니다"
+
+
+@dataclass(frozen=True)
+class Viewer:
+    org_type: str
+    org_id: str
+    shipper_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PlanAccess:
+    session: PlanSession
+    viewer: Viewer
+    owner_org_id: str = ""
+
+
+def org_shipper_ids(org_id: str) -> tuple[str, ...]:
+    with database.begin() as db:
+        return tuple(
+            db.scalars(
+                select(ShipperProfileRow.id)
+                .where(ShipperProfileRow.org_id == org_id)
+                .order_by(ShipperProfileRow.created_at, ShipperProfileRow.id)
+            )
+        )
+
+
+def viewer_of(principal: Principal) -> Viewer:
+    shipper_ids = org_shipper_ids(principal.org_id) if principal.org_type == "shipper" else ()
+    return Viewer(org_type=principal.org_type, org_id=principal.org_id, shipper_ids=shipper_ids)
+
+
+def shipper_lot_included(org_id: str) -> Any:
+    return exists().where(
+        LotRow.shipper_org_id == org_id,
+        PlanRow.payload["registered_lot_ids"].contains(func.jsonb_build_array(LotRow.id)),
+    )
+
+
+def forwarder_assigned(org_id: str) -> Any:
+    return exists().where(
+        PlanForwarderRow.plan_id == PlanRow.plan_id,
+        PlanForwarderRow.forwarder_org_id == org_id,
+    )
+
+
+def visible_plans(principal: Principal) -> Any:
+    if principal.org_type == "platform":
+        return PlanRow.org_id == principal.org_id
+    if principal.org_type == "forwarder":
+        return forwarder_assigned(principal.org_id)
+    if principal.org_type == "shipper":
+        return shipper_lot_included(principal.org_id)
+    return None
+
+
+def _owner_if_visible(plan_id: str, principal: Principal) -> str | None:
+    condition = visible_plans(principal)
+    if condition is None:
+        return None
+    with database.begin() as db:
+        return db.scalar(select(PlanRow.org_id).where(PlanRow.plan_id == plan_id, condition))
+
+
+def plan_for(plan_id: str, principal: Principal) -> PlanAccess:
+    owner = _owner_if_visible(plan_id, principal)
+    if owner is None:
+        raise HTTPException(status_code=404, detail=NOT_FOUND)
+    session = store.get(plan_id, org_id=owner)
+    if session is None:
+        raise HTTPException(status_code=404, detail=NOT_FOUND)
+    return PlanAccess(session=session, viewer=viewer_of(principal), owner_org_id=owner)
+
+
+def plan_access(plan_id: str, principal: AuthPrincipal) -> PlanAccess:
+    return plan_for(plan_id, principal)
+
+
+PlanAccessDep = Annotated[PlanAccess, Depends(plan_access)]

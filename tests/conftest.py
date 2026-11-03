@@ -21,6 +21,8 @@ from freshswitch_backend.persistence.orgs import ensure_demo_org
 from freshswitch_backend.persistence.seed import run as seed_demo_tenants
 from freshswitch_backend.planning.store import store
 
+pytest_plugins = ["saas_fixtures"]
+
 FROZEN_NOW = datetime(2026, 11, 10, 0, 0, tzinfo=UTC)
 POSTGRES_IMAGE = "postgres:17-alpine"
 STARTUP_TIMEOUT = 60
