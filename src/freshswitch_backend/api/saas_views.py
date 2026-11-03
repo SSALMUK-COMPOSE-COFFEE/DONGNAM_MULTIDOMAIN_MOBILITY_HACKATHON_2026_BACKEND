@@ -1060,6 +1060,19 @@ def _scope_routes(payload: dict[str, Any], own_lots: set[str]) -> None:
         }
 
 
+def _scope_parties(payload: dict[str, Any], own: set[str]) -> None:
+    scenario = payload["scenario"]
+    scenario["description"] = ""
+    kept = (
+        own
+        | {lot["shipper_id"] for lot in scenario["lots"]}
+        | {a["shipper_id"] for a in payload["plan"]["assignments"]}
+    )
+    scenario["shippers"] = [s for s in scenario["shippers"] if s["id"] in kept]
+    sites = {s["packhouse_id"] for s in scenario["shippers"]}
+    scenario["packhouses"] = [p for p in scenario["packhouses"] if p["id"] in sites]
+
+
 def anonymized_session(
     session: PlanSession,
     own_shipper_ids: Iterable[str],
@@ -1076,6 +1089,7 @@ def anonymized_session(
     payload["arrival_inspections"] = [
         row for row in payload["arrival_inspections"] if row["shipper_id"] in own
     ]
+    _scope_parties(payload, own)
     return anonymizer.session(payload)
 
 
@@ -1317,6 +1331,7 @@ def without_settlement(session: PlanSession) -> dict[str, Any]:
             entry[name] = None
     _scope_explanations(payload, set())
     payload["arrival_inspections"] = _operational_inspections(payload["arrival_inspections"])
+    _scope_parties(payload, set())
     return payload
 
 

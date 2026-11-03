@@ -528,6 +528,26 @@ def _waive_fee(session: PlanSession, result: ReplanResult, payer: str) -> None:
         )
 
 
+def _excused_lots(
+    db: Session, row: PlanRow, session: PlanSession, order: ExecutionOrder
+) -> set[str]:
+    if not row.confirmation_round:
+        return set()
+    rejected = {
+        c.shipper_id
+        for c in _round_rows(db, row.plan_id, row.confirmation_round)
+        if c.status == "rejected"
+    }
+    excused = set(order.notified_shipper_ids) & rejected - _shippers_of(session.scenario)
+    planned = {lot.id for lot in session.scenario.lots}
+    gone = [i for i in session.registered_lot_ids if i not in planned]
+    if not excused or not gone:
+        return set()
+    return set(
+        db.scalars(select(LotRow.id).where(LotRow.id.in_(gone), LotRow.shipper_id.in_(excused)))
+    )
+
+
 def _excuse(order: ExecutionOrder, shipper_id: str, now: datetime) -> None:
     kept = [c for c in order.shipper_confirmations if c.shipper_id != shipper_id]
     if len(kept) == len(order.shipper_confirmations):
@@ -1554,13 +1574,17 @@ class SessionStore:
                 result = self._confirm_shipper(state, order, body, now)
             else:
                 result = self._confirm_forwarder(state, order, body, now)
-            self._save(db, state)
             session = state.session
-            if (
-                session.committed_version != committed
-                and _plan_row(db, plan_id, ANY_ORG).org_id != DEMO_ORG
-            ):
-                sync_committed_lots(db, session.registered_lot_ids, session.scenario.lots, now)
+            registered = list(session.registered_lot_ids)
+            row = _plan_row(db, plan_id, ANY_ORG)
+            settled = session.committed_version != committed and row.org_id != DEMO_ORG
+            if settled:
+                excused = _excused_lots(db, row, session, order)
+                if excused:
+                    session.registered_lot_ids = [i for i in registered if i not in excused]
+            self._save(db, state)
+            if settled:
+                sync_committed_lots(db, registered, session.scenario.lots, now)
             return result
 
     def _confirm_shipper(
