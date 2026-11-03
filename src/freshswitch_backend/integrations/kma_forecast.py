@@ -3,7 +3,7 @@ import json
 import re
 import sys
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, Self
@@ -49,6 +49,10 @@ WarningKind = Literal["typhoon", "wind_wave", "other"]
 WeatherSource = Literal["live", "snapshot", "unavailable"]
 SEVERITY: dict[Weather, int] = {"normal": 0, "strong_wind": 1, "typhoon": 2}
 _SEGMENT = re.compile(r"[·,ㆍ]")
+_ARROW = re.compile(r"→|->")
+_DECOR = re.compile(r"[()*]")
+_ACTION = re.compile(r"\s*(발표|해제|변경|연장).*$")
+_GRADE = re.compile(r"(주의보|경보)$")
 
 
 class KmaApiError(Exception):
@@ -77,6 +81,10 @@ class WeatherWarning(BaseModel):
     name: str
     lifted: bool
 
+    @property
+    def phenomenon(self) -> str:
+        return _GRADE.sub("", self.name)
+
 
 class KmaSnapshot(BaseModel):
     fetched_at: datetime
@@ -103,6 +111,7 @@ class WeatherAssessment(BaseModel):
     max_wave_height_m: float | None = None
     active_warnings: list[str] = []
     reasons: list[str] = []
+    warning_note: str | None = None
 
 
 def base_time(now: datetime) -> datetime:
@@ -150,18 +159,27 @@ def _items(payload: str | bytes) -> list[dict[str, Any]]:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
         raise KmaApiError("99", "응답 파싱 실패") from exc
+    if not isinstance(data, dict):
+        raise KmaApiError("99", "응답 파싱 실패")
     root = data.get("response", data)
-    header = root.get("header") or {}
+    if not isinstance(root, dict):
+        raise KmaApiError("99", "응답 파싱 실패")
+    header = root.get("header")
+    header = header if isinstance(header, dict) else {}
     code = str(header.get("resultCode", "00"))
     if code == NO_DATA:
         return []
     if code not in ("00", "0"):
         raise KmaApiError(code, header.get("resultMsg"))
-    items = ((root.get("body") or {}).get("items") or {}) or []
+    body = root.get("body")
+    body = body if isinstance(body, dict) else {}
+    items = body.get("items") or []
     if isinstance(items, dict):
         items = items.get("item") or []
     if isinstance(items, dict):
         items = [items]
+    if not isinstance(items, list):
+        return []
     return [i for i in items if isinstance(i, dict)]
 
 
@@ -208,16 +226,18 @@ def parse_warnings(payload: str | bytes) -> list[WeatherWarning]:
             continue
         body = title.split("/", 1)[-1]
         for segment in _SEGMENT.split(body):
-            name = segment.strip()
-            if "주의보" not in name and "경보" not in name:
+            text = _ARROW.split(segment)[-1]
+            lifted = "해제" in text
+            name = _ACTION.sub("", _DECOR.sub("", text).strip()).strip()
+            if not name.endswith(("주의보", "경보")):
                 continue
             warnings.append(
                 WeatherWarning(
                     title=title,
                     issued_at=issued,
                     kind=_warning_kind(name),
-                    name=re.sub(r"\s*(발표|해제|변경|연장).*$", "", name).strip(),
-                    lifted="해제" in name,
+                    name=name,
+                    lifted=lifted,
                 )
             )
     return sorted(warnings, key=lambda w: w.issued_at)
@@ -226,7 +246,7 @@ def parse_warnings(payload: str | bytes) -> list[WeatherWarning]:
 def active_warnings(warnings: Iterable[WeatherWarning]) -> list[WeatherWarning]:
     latest: dict[str, WeatherWarning] = {}
     for warning in sorted(warnings, key=lambda w: w.issued_at):
-        latest[warning.name] = warning
+        latest[warning.phenomenon] = warning
     return [w for w in latest.values() if not w.lifted and w.kind != "other"]
 
 
@@ -291,10 +311,14 @@ class KmaForecastClient:
     async def fetch(self, now: datetime) -> KmaSnapshot:
         issued = base_time(now)
         points, reported = await self.fetch_forecast(issued)
+        if not points:
+            points, reported = await self.fetch_forecast(base_time(issued - timedelta(minutes=1)))
+        if not points:
+            raise KmaApiError(NO_DATA, "단기예보 자료 없음")
         warnings = await self.fetch_warnings(now - WARNING_LOOKBACK, now)
         return KmaSnapshot(
             fetched_at=datetime.now(UTC),
-            issued_at=reported or issued,
+            issued_at=reported,
             warning_checked_at=now,
             points=points,
             warnings=warnings,
@@ -369,13 +393,31 @@ class WeatherProvider:
         )
 
 
+def _recent_warnings(feed: KmaSnapshot, now: datetime) -> tuple[list[WeatherWarning], str | None]:
+    checked = feed.warning_checked_at or feed.fetched_at
+    if now - checked > WARNING_LOOKBACK:
+        stale = active_warnings(feed.warnings)
+        if not stale:
+            return [], None
+        names = ", ".join(w.name for w in stale)
+        return [], f"스냅샷 특보({names}, {checked.astimezone(KST):%m-%d} 확인) 만료로 미반영"
+    recent = [w for w in feed.warnings if now - WARNING_LOOKBACK <= w.issued_at <= now]
+    kept = active_warnings(recent)
+    expired = [w for w in active_warnings(feed.warnings) if w not in kept]
+    if not expired:
+        return recent, None
+    names = ", ".join(f"{w.name}({w.issued_at.astimezone(KST):%m-%d} 발표)" for w in expired)
+    return recent, f"발표 {WARNING_LOOKBACK.days}일 지난 특보 {names} 미반영"
+
+
 def assess(feed: KmaSnapshot, etds: Iterable[datetime], now: datetime) -> WeatherAssessment:
     times = sorted(etds)
     horizon = max((p.at for p in feed.points), default=None)
     if not times:
         return WeatherAssessment(level="normal", covered=False, horizon_end=horizon)
-    start, end = times[0] - WINDOW_BEFORE, times[-1] + WINDOW_AFTER
-    window = [p for p in feed.points if start <= p.at <= end]
+    window = [
+        p for p in feed.points if any(t - WINDOW_BEFORE <= p.at <= t + WINDOW_AFTER for t in times)
+    ]
     winds = [p.wind_speed_ms for p in window if p.wind_speed_ms is not None]
     waves = [p.wave_height_m for p in window if p.wave_height_m is not None]
     level: Weather = "normal"
@@ -393,7 +435,8 @@ def assess(feed: KmaSnapshot, etds: Iterable[datetime], now: datetime) -> Weathe
         raise_to("strong_wind", f"예보 풍속 최대 {wind:g}m/s ≥ {STRONG_WIND_MS:g}m/s")
     if wave is not None and wave >= HIGH_WAVE_M:
         raise_to("strong_wind", f"예보 파고 최대 {wave:g}m ≥ {HIGH_WAVE_M:g}m")
-    active = active_warnings(feed.warnings)
+    recent, warning_note = _recent_warnings(feed, now)
+    active = active_warnings(recent)
     if times[0] - now <= WARNING_HORIZON:
         for warning in active:
             value: Weather = "typhoon" if warning.kind == "typhoon" else "strong_wind"
@@ -406,6 +449,35 @@ def assess(feed: KmaSnapshot, etds: Iterable[datetime], now: datetime) -> Weathe
         max_wave_height_m=wave,
         active_warnings=[w.name for w in active],
         reasons=reasons,
+        warning_note=warning_note,
+    )
+
+
+def assess_each(
+    feed: KmaSnapshot, etds: Mapping[str, datetime], now: datetime
+) -> dict[str, WeatherAssessment]:
+    return {voyage_id: assess(feed, [etd], now) for voyage_id, etd in etds.items()}
+
+
+def combine(assessments: Mapping[str, WeatherAssessment]) -> WeatherAssessment:
+    items = list(assessments.items())
+    if not items:
+        return WeatherAssessment(level="normal", covered=False)
+    level = max((a.level for _, a in items), key=lambda w: SEVERITY[w])
+    winds = [a.max_wind_speed_ms for _, a in items if a.max_wind_speed_ms is not None]
+    waves = [a.max_wave_height_m for _, a in items if a.max_wave_height_m is not None]
+    names = list(dict.fromkeys(n for _, a in items for n in a.active_warnings))
+    many = len(items) > 1
+    reasons = [f"{vid}: {r}" if many else r for vid, a in items for r in a.reasons]
+    return WeatherAssessment(
+        level=level,
+        covered=any(a.covered for _, a in items),
+        horizon_end=items[0][1].horizon_end,
+        max_wind_speed_ms=max(winds, default=None),
+        max_wave_height_m=max(waves, default=None),
+        active_warnings=names,
+        reasons=reasons,
+        warning_note=next((a.warning_note for _, a in items if a.warning_note), None),
     )
 
 

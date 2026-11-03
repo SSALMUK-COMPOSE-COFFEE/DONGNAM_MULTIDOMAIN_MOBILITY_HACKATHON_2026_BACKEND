@@ -1,4 +1,5 @@
 import math
+from collections.abc import Mapping
 from datetime import date, datetime, timedelta
 from typing import Literal
 
@@ -328,12 +329,16 @@ def weather_use(
     )
     if feed.source == "unavailable":
         note = "기상청 예보·스냅샷을 못 읽어 평시(normal)로 계산"
+    elif assessment.horizon_end is None and not assessment.reasons:
+        note = f"{basis} 기준. 단기예보 자료가 없어 평시(normal)로 계산"
     elif not assessment.covered and not assessment.reasons:
         note = f"{basis} 기준. 출항 예정이 단기예보 범위 밖이라 평시(normal)로 계산"
     else:
         found = "; ".join(assessment.reasons) or "기준 넘는 예보·특보 없음"
         source = "스냅샷" if feed.source == "snapshot" else "실시간"
         note = f"{basis} {source} 기준: {found} → {assessment.level}. {rule}"
+    if assessment.warning_note:
+        note += f". {assessment.warning_note}"
     return WeatherUse(
         mode=mode,
         level=assessment.level,
@@ -358,6 +363,7 @@ def forecast_voyages(
     plan: Plan,
     options: ForecastOptions,
     port: PortCongestionSummary | None = None,
+    weather_by_voyage: Mapping[str, Weather] | None = None,
 ) -> list[VoyageForecast]:
     options = options.resolved()
     model = CostModel(scenario)
@@ -365,9 +371,10 @@ def forecast_voyages(
     used = {c.voyage_id for c in plan.containers if c.used}
     voyages = [v for v in scenario.voyages if v.id in used] or scenario.voyages
     result = []
-    weather: Weather = options.weather if options.weather != "auto" else "normal"
+    fixed: Weather = options.weather if options.weather != "auto" else "normal"
     for voyage in sorted(voyages, key=lambda v: v.etd):
         congestion, scope = voyage_congestion(voyage, options, port)
+        weather = (weather_by_voyage or {}).get(voyage.id, fixed)
         forecast = predictor.predict(_query(voyage), weather, congestion)
         raw = forecast.p90_hours if options.quantile == "p90" else forecast.p50_hours
         delay = _round_hours(raw)

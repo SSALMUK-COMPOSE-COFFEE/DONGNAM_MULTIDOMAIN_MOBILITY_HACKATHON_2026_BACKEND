@@ -19,7 +19,7 @@ from freshswitch_backend.api.vessels import (
 )
 from freshswitch_backend.config import get_settings
 from freshswitch_backend.execution.cancellation import annotate_cancellations
-from freshswitch_backend.forecast.history import DepartureRecord, merge
+from freshswitch_backend.forecast.history import KST, DepartureRecord, merge
 from freshswitch_backend.forecast.observations import OWN_SOURCE, own_records
 from freshswitch_backend.forecast.port_congestion import PortCongestionSummary
 from freshswitch_backend.forecast.predictor import DelayPredictor, default_predictor
@@ -44,8 +44,10 @@ from freshswitch_backend.integrations.kma_forecast import (
 from freshswitch_backend.integrations.kma_forecast import (
     KmaForecastClient,
     MissingKmaKey,
+    Weather,
     WeatherProvider,
-    assess,
+    assess_each,
+    combine,
 )
 from freshswitch_backend.integrations.ulsan_position import PositionsUnavailable
 from freshswitch_backend.planning.store import store
@@ -118,7 +120,7 @@ def _predictor(own: list[DepartureRecord]) -> tuple[DelayPredictor, int]:
 
 def _history(predictor: DelayPredictor, own: int) -> HistoryInfo:
     records = predictor.records
-    days = [r.departure_at.date() for r in records]
+    days = [r.departure_at.astimezone(KST).date() for r in records]
     return HistoryInfo(
         record_count=len(records),
         start=min(days, default=None),
@@ -154,14 +156,16 @@ def _summary(
 
 
 async def _weather(
-    factory: KmaClientFactory, options: ForecastOptions, etds: list[datetime]
-) -> WeatherUse:
+    factory: KmaClientFactory, options: ForecastOptions, etds: dict[str, datetime]
+) -> tuple[WeatherUse, dict[str, Weather] | None]:
     if weather_mode(options) != "auto":
-        return weather_use(options)
+        return weather_use(options), None
     now = clock()
     provider = WeatherProvider(factory, offline_mode=get_settings().offline_mode)
     feed = await provider.get(now)
-    return weather_use(options, feed, assess(feed, etds, now))
+    each = assess_each(feed, etds, now)
+    levels = {voyage_id: a.level for voyage_id, a in each.items()}
+    return weather_use(options, feed, combine(each)), levels
 
 
 @router.post("/{plan_id}/delay-forecast")
@@ -186,14 +190,14 @@ async def delay_forecast(
         except PositionsUnavailable as exc:
             unavailable = str(exc)
     used = {c.voyage_id for c in session.plan.containers if c.used}
-    etds = [v.etd for v in session.scenario.voyages if v.id in used] or [
-        v.etd for v in session.scenario.voyages
-    ]
-    weather = await _weather(kma_factory, options, etds)
+    sailing = [v for v in session.scenario.voyages if v.id in used] or session.scenario.voyages
+    weather, levels = await _weather(kma_factory, options, {v.id: v.etd for v in sailing})
     own = await run_in_threadpool(own_records, org_id)
     predictor, own_count = _predictor(own)
     effective = options.model_copy(update={"weather": weather.level})
-    voyages = forecast_voyages(predictor, session.scenario, session.plan, effective, port)
+    voyages = forecast_voyages(
+        predictor, session.scenario, session.plan, effective, port, weather_by_voyage=levels
+    )
     event = delay_event(voyages)
     remaining = remaining_risks(voyages, event)
     replan_response = None
