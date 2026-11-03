@@ -62,6 +62,7 @@ from freshswitch_backend.planning.store import store as plan_store
 
 DEVICE_TOKEN_HEADER = "X-Device-Token"
 STREAM_RECHECK_SECONDS = 5.0
+MAX_ALERT_SEQ = 2**63 - 1
 UNREGISTERED_DEVICE = "등록되지 않은 장치입니다. 조직 기기로 먼저 등록하세요"
 REGISTERED_DEVICE_REQUIRED = "조직에 등록된 장치와 X-Device-Token이 필요합니다"
 SIMULATOR_SANDBOX_ONLY = "시뮬레이터는 데모 세계(sandbox) 조직에서만 쓸 수 있습니다"
@@ -518,7 +519,7 @@ def read_power_plan(plan_id: str, principal: OptionalPrincipal) -> PowerPlan:
 @router.get("/alerts")
 def read_alerts(
     scope: Scope,
-    since: int = Query(0, ge=0),
+    since: int = Query(0, ge=0, le=MAX_ALERT_SEQ),
     container_id: str | None = None,
     limit: int = Query(100, ge=1, le=1000),
     plan_id: str | None = None,
@@ -548,7 +549,7 @@ async def stream_alerts(
     request: Request,
     scope: Scope,
     principal: OptionalPrincipal,
-    since: int = Query(0, ge=0),
+    since: int = Query(0, ge=0, le=MAX_ALERT_SEQ),
     container_id: str | None = None,
     timeout: float = Query(300, ge=0, le=3600),
     plan_id: str | None = None,
