@@ -360,11 +360,24 @@ def test_order_flow_with_server_decided_actors(
         for r in forwarder_orders[0]["requests"]
         if set(r["lot_ids"]) & {"lot-miryang-sb-1", "lot-miryang-sb-2"}
     )
-    answer = miryang.post(
+    shipper_answer = miryang.post(
         f"/api/saas/shipper/plans/{plan_id}/orders/{order_id}/requests/{request['request_id']}",
         json={"accepted": True},
     )
+    assert shipper_answer.status_code == 403
+    request_path = (
+        f"/api/saas/forwarder/plans/{plan_id}/orders/{order_id}/requests/{request['request_id']}"
+    )
+    assert outsider.post(request_path, json={"accepted": True}).status_code == 404
+    answer = forwarder_client.post(request_path, json={"accepted": True})
     assert answer.status_code == 200, answer.text
+    answered = next(
+        r for r in answer.json()["requests"] if r["request_id"] == request["request_id"]
+    )
+    assert answered["status"] == "accepted"
+    shipper_view = miryang.get(f"/api/saas/shipper/plans/{plan_id}/orders").json()
+    seen = next(r for r in shipper_view[0]["requests"] if r["request_id"] == request["request_id"])
+    assert seen["status"] == "accepted"
     jinju = saas_login("shipper-jinju")
     foreign = jinju.post(
         f"/api/saas/shipper/plans/{plan_id}/orders/{order_id}/requests/missing",

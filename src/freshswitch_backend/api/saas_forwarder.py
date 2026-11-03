@@ -14,7 +14,7 @@ from freshswitch_backend.api.saas_views import (
     plan_item,
     without_settlement,
 )
-from freshswitch_backend.execution.models import ConfirmRequest
+from freshswitch_backend.execution.models import ConfirmRequest, RequestResultBody
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.tables import PlanRow
 from freshswitch_backend.planning.store import (
@@ -76,6 +76,28 @@ def confirm_order(
         raise HTTPException(status_code=404, detail="실행 지시를 찾을 수 없습니다") from exc
     except OrderInputError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except SessionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return forwarder_order_view(order)
+
+
+@router.post("/plans/{plan_id}/orders/{order_id}/requests/{request_id}")
+def answer_request(
+    plan_id: str,
+    order_id: str,
+    request_id: str,
+    body: RequestResultBody,
+    principal: ForwarderPrincipal,
+) -> ForwarderOrder:
+    access = plan_for(plan_id, principal)
+    try:
+        order = store.answer_request(
+            plan_id, order_id, request_id, body, org_id=access.owner_org_id
+        )
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404, detail="실행 지시 또는 요청을 찾을 수 없습니다"
+        ) from exc
     except SessionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return forwarder_order_view(order)

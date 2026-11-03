@@ -36,6 +36,9 @@ from freshswitch_backend.planning.store import (
     store,
 )
 
+THIRD_PARTY_ROLES = frozenset({"carrier", "terminal", "airline"})
+THIRD_PARTY_ANSWER_FORBIDDEN = "선사·터미널·항공사 요청의 회신은 배정된 포워더가 기록합니다"
+
 router = APIRouter(prefix="/saas/shipper", tags=["saas-shipper"])
 
 ShipperPrincipal = Annotated[Principal, Depends(require_role("shipper"))]
@@ -155,6 +158,8 @@ def answer_request(
     request = next((r for r in order.requests if r.request_id == request_id), None)
     if request is None or not my_lots & set(request.lot_ids):
         raise missing
+    if request.counterparty_role in THIRD_PARTY_ROLES:
+        raise HTTPException(status_code=403, detail=THIRD_PARTY_ANSWER_FORBIDDEN)
     try:
         updated = store.answer_request(plan_id, order_id, request_id, body, org_id=owner)
     except KeyError as exc:
