@@ -56,6 +56,7 @@ from freshswitch_backend.persistence.tables import (
     ContainerRow,
     IdempotencyRow,
     LotRow,
+    ObservationRow,
     OrderRow,
     OrganizationRow,
     PendingRow,
@@ -900,6 +901,11 @@ class SessionStore:
             binding.plan_id = None
             binding.payload = {**binding.payload, "plan_id": None}
         db.execute(delete(ContainerRow).where(ContainerRow.plan_id.in_(plan_ids)))
+        db.execute(
+            delete(ObservationRow).where(
+                ObservationRow.origin == "arrival", ObservationRow.plan_id.in_(plan_ids)
+            )
+        )
         release_lots(db, {lot_id for row in rows for lot_id in row[1] or []}, self.clock())
         return len(plan_ids)
 
