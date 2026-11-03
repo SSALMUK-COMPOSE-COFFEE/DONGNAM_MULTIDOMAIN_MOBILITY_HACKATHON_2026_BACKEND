@@ -1,7 +1,7 @@
 from collections import defaultdict
-from datetime import timedelta
+from datetime import date, datetime, timedelta
 
-from freshswitch_backend.domain.models import Lot, Plan, Product, Scenario
+from freshswitch_backend.domain.models import KST, Lot, Plan, Product, Scenario
 from freshswitch_backend.intake.models import (
     AirHint,
     FeasibilityHints,
@@ -18,6 +18,9 @@ from freshswitch_backend.optimize.settlement import tariff_sheet
 from freshswitch_backend.replan.models import AddLotEvent
 
 MAX_PULL_FORWARD_DAYS = 2
+READY_DATE_MAX_PAST_DAYS = 45
+READY_DATE_MAX_FUTURE_DAYS = 366
+SELL_BY_MAX_DAYS = 366
 SO2_WARNING = (
     "SO2 처리 품목은 딸기 등 비처리 품목과 같은 컨테이너에 실을 수 없어 별도 CA 컨테이너가 "
     "필요합니다(WFLO, 제안서 나-1)"
@@ -34,6 +37,52 @@ class IntakeError(ValueError):
     def __init__(self, errors: list[FieldError]) -> None:
         super().__init__("; ".join(f"{e.field}: {e.message}" for e in errors))
         self.errors = errors
+
+
+def ready_date_window(scenario: Scenario | None, today: date) -> tuple[date, date]:
+    sailings = [v.etd.astimezone(KST).date() for v in scenario.voyages] if scenario else []
+    earliest = min([today, *sailings])
+    latest = max([today, *sailings])
+    return (
+        earliest - timedelta(days=READY_DATE_MAX_PAST_DAYS),
+        latest + timedelta(days=READY_DATE_MAX_FUTURE_DAYS),
+    )
+
+
+def date_range_errors(
+    scenario: Scenario | None,
+    today: date,
+    ready_date: date | None = None,
+    sell_by_date: date | None = None,
+    sell_by_base: date | None = None,
+) -> list[FieldError]:
+    errors: list[FieldError] = []
+    if ready_date is not None:
+        earliest, latest = ready_date_window(scenario, today)
+        if not earliest <= ready_date <= latest:
+            errors.append(
+                FieldError(
+                    field="ready_date",
+                    message=(
+                        f"출하 가능일은 {earliest.isoformat()}부터 {latest.isoformat()}까지만 "
+                        "받습니다"
+                    ),
+                )
+            )
+            return errors
+    base = ready_date or sell_by_base
+    if (
+        sell_by_date is not None
+        and base is not None
+        and (sell_by_date - base).days > SELL_BY_MAX_DAYS
+    ):
+        errors.append(
+            FieldError(
+                field="sell_by_date",
+                message=f"판매기한은 출하 가능일로부터 {SELL_BY_MAX_DAYS}일 안이어야 합니다",
+            )
+        )
+    return errors
 
 
 def _match(query: str, candidates: list[tuple[str, list[str]]]) -> list[str]:
@@ -140,6 +189,7 @@ def preview_lot(
     reserved_ids: set[str] | None = None,
     *,
     check_season: bool = False,
+    today: date | None = None,
 ) -> IntakePreview:
     taken = {lot.id for lot in scenario.lots} | (taken_ids or set())
     resolved, errors = _resolve(scenario, body)
@@ -159,6 +209,14 @@ def preview_lot(
         errors.append(
             FieldError(field="sell_by_date", message="판매기한이 출하 가능일보다 빠릅니다")
         )
+    errors.extend(
+        date_range_errors(
+            scenario,
+            today or datetime.now(KST).date(),
+            ready_date=body.ready_date,
+            sell_by_date=body.sell_by_date,
+        )
+    )
     if errors or resolved is None:
         raise IntakeError(errors)
     products = {p.id: p for p in scenario.products}

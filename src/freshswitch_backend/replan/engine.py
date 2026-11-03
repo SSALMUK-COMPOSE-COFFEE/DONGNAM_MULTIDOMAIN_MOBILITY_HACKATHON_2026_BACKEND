@@ -45,6 +45,8 @@ DISPATCH_RELEASED = "실행된 배차를 고정하면 실행 가능한 대안이
 DISPATCH_REUSED = "이미 출발한 배차를 다른 화물에 쓸 수 없음"
 MAX_PULL_FORWARD_DAYS = 2
 SOLVED = ("OPTIMAL", "FEASIBLE")
+DELAY_MAX_ADVANCE = timedelta(days=7)
+DELAY_MAX_POSTPONE = timedelta(days=30)
 LABELS: dict[AlternativeId, str] = {
     "pull_forward": "당겨 채우기",
     "next_voyage": "다음 배 이월",
@@ -196,6 +198,14 @@ def route_changes(
     return changes
 
 
+def _check_shift(label: str, value: datetime, base: datetime, voyage_id: str) -> None:
+    if not base - DELAY_MAX_ADVANCE <= value <= base + DELAY_MAX_POSTPONE:
+        raise ReplanError(
+            f"{voyage_id} {label}은 원래 일정({base.astimezone(KST):%Y-%m-%d %H:%M}) 기준 "
+            f"{DELAY_MAX_ADVANCE.days}일 앞당김부터 {DELAY_MAX_POSTPONE.days}일 지연까지만 받습니다"
+        )
+
+
 def _delay_voyage(scenario: Scenario, delay: VoyageDelay) -> Scenario:
     voyage_id, new_etd, new_cutoff = delay.voyage_id, delay.new_etd, delay.new_cy_cutoff
     voyage = next((v for v in scenario.voyages if v.id == voyage_id), None)
@@ -205,6 +215,9 @@ def _delay_voyage(scenario: Scenario, delay: VoyageDelay) -> Scenario:
     base_cutoff = voyage.original_cy_cutoff or voyage.cy_cutoff
     if voyage.original_etd is not None and voyage.original_cy_cutoff is None:
         base_cutoff = voyage.cy_cutoff + max(base_etd - voyage.etd, timedelta(0))
+    _check_shift("출항 시각", new_etd, base_etd, voyage_id)
+    if new_cutoff is not None:
+        _check_shift("선적 마감", new_cutoff, base_cutoff, voyage_id)
     cutoff = new_cutoff or voyage.cy_cutoff
     if new_cutoff is None and new_etd < base_etd:
         cutoff = base_cutoff + (new_etd - base_etd)

@@ -261,7 +261,7 @@ def test_other_org_profile_and_packhouses_are_unreachable(demo_tenants) -> None:
 
 def test_out_of_season_lot_registers_with_warning() -> None:
     shipper, _ = _onboarded("owner@season.example.com", "시즌 농장")
-    summer = shipper.post("/api/saas/shipper/lots", json=_lot(ready="2026-07-01"))
+    summer = shipper.post("/api/saas/shipper/lots", json=_lot(ready="2027-07-01"))
     assert summer.status_code == 201, summer.text
     hints = summer.json()["hints"]
     assert hints["season"] == {
@@ -274,7 +274,7 @@ def test_out_of_season_lot_registers_with_warning() -> None:
     assert any("딸기 수출 시기(11~5월) 밖" in w and "가정" in w for w in hints["warnings"])
     assert summer.json()["registered"]["status"] == "registered"
 
-    grape = shipper.post("/api/saas/shipper/lots", json=_lot("grape_so2", "2026-04-10"))
+    grape = shipper.post("/api/saas/shipper/lots", json=_lot("grape_so2", "2027-04-10"))
     assert grape.status_code == 201, grape.text
     assert grape.json()["hints"]["season"]["in_season"] is False
     assert any("포도 수출 시기(10~3월) 밖" in w for w in grape.json()["hints"]["warnings"])
@@ -285,7 +285,7 @@ def test_out_of_season_lot_registers_with_warning() -> None:
 
 
 def test_demo_intake_preview_skips_season_check(client: TestClient) -> None:
-    for ready in ("2026-11-17", "2026-07-01"):
+    for ready in ("2026-11-17", "2027-07-01"):
         response = client.post(
             "/api/intake/lots", json={**_lot(ready=ready), "shipper": "sh-jinju"}
         )
@@ -300,11 +300,11 @@ def test_out_of_season_patch_returns_warning_without_blocking() -> None:
     assert created.status_code == 201, created.text
     lot_id = created.json()["registered"]["id"]
 
-    summer = shipper.patch(f"/api/saas/shipper/lots/{lot_id}", json={"ready_date": "2026-07-01"})
+    summer = shipper.patch(f"/api/saas/shipper/lots/{lot_id}", json={"ready_date": "2027-07-01"})
     assert summer.status_code == 200, summer.text
-    assert summer.json()["ready_date"] == "2026-07-01"
+    assert summer.json()["ready_date"] == "2027-07-01"
     expected = (
-        "딸기 수출 시기(11~5월) 밖의 출하일입니다(2026-07-01). 수정은 그대로 됩니다"
+        "딸기 수출 시기(11~5월) 밖의 출하일입니다(2027-07-01). 수정은 그대로 됩니다"
         "(출처: 가정(공식 품목별 수출 시기 자료 확인 필요))"
     )
     assert summer.json()["warnings"] == [expected]
@@ -317,7 +317,7 @@ def test_out_of_season_patch_returns_warning_without_blocking() -> None:
     assert winter.status_code == 200, winter.text
     assert "warnings" not in winter.json()
 
-    shared = shipper.patch(f"/api/lots/{lot_id}", json={"ready_date": "2026-08-03"})
+    shared = shipper.patch(f"/api/lots/{lot_id}", json={"ready_date": "2027-08-03"})
     assert shared.status_code == 200, shared.text
     assert any("딸기 수출 시기(11~5월) 밖" in w for w in shared.json()["warnings"])
     assert "warnings" not in shipper.get(f"/api/lots/{lot_id}").json()
@@ -328,7 +328,10 @@ def test_demo_lot_patch_skips_season_check(client: TestClient) -> None:
     assert created.status_code == 201, created.text
     registered = created.json()["registered"]
 
-    response = client.patch(f"/api/lots/{registered['id']}", json={"ready_date": "2026-07-01"})
+    response = client.patch(
+        f"/api/lots/{registered['id']}",
+        json={"ready_date": "2027-07-01", "sell_by_date": "2027-07-08"},
+    )
     assert response.status_code == 200, response.text
-    assert response.json()["ready_date"] == "2026-07-01"
+    assert response.json()["ready_date"] == "2027-07-01"
     assert set(response.json()) == set(registered)

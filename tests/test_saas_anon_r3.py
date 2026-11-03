@@ -248,8 +248,26 @@ def test_added_lot_keeps_anonymous_id_after_cancel(platform_client: TestClient, 
     full = platform_client.get(f"/api/plans/{plan_id}").json()
     base = next(lot for lot in full["scenario"]["lots"] if lot["shipper_id"] == "sh-miryang")
     extras = [f"lot-miryang-extra-{n}" for n in (1, 2)]
+    miryang = saas_login(shipper_org_id("sh-miryang"))
     for lot_id in extras:
-        _apply(platform_client, plan_id, {"type": "add_lot", "lot": {**base, "id": lot_id}})
+        body = {
+            "product": base["product_id"],
+            "pallets": base["pallets"],
+            "ready_date": base["ready_date"],
+            "destination": base["destination"],
+            "sell_by_date": base["sell_by_date"],
+            "lot_id": lot_id,
+        }
+        assert miryang.post("/api/saas/shipper/lots", json=body).status_code == 201
+        added = platform_client.post(
+            f"/api/saas/platform/plans/{plan_id}/add-lot", json={"lot_id": lot_id}
+        )
+        assert added.status_code == 200, added.text
+        alternative = next(a["id"] for a in added.json()["alternatives"] if a["feasible"])
+        applied = platform_client.post(
+            f"/api/plans/{plan_id}/apply", json={"alternative_id": alternative}
+        )
+        assert applied.status_code == 200, applied.text
     jinju = saas_login(shipper_org_id("sh-jinju"))
     before = _history_lots(jinju.get(f"/api/saas/shipper/plans/{plan_id}").json())
     first, second = (lot_id for _, lot_id in before)

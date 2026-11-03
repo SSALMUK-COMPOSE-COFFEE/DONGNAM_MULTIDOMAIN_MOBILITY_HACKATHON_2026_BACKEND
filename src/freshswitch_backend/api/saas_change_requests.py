@@ -16,7 +16,7 @@ from freshswitch_backend.api.plans import (
     ReplanResponse,
     _fingerprint,
     apply_alternative,
-    post_event,
+    replan_event,
     replan_inputs,
 )
 from freshswitch_backend.api.saas_access import PlanAccess, plan_for
@@ -481,7 +481,7 @@ async def replan_change_request(
     llm: Annotated[bool | None, Query()] = None,
 ) -> ChangeRequestReplan:
     request = await run_in_threadpool(_open_request, request_id, principal)
-    response = await post_event(
+    response = await replan_event(
         request.plan_id, EventRequest(event=request.event), org_id=principal.org_id, llm=llm
     )
     if not await run_in_threadpool(_update, request_id, replan_id=response.replan_id):

@@ -20,7 +20,7 @@ from freshswitch_backend.api.plans import (
     EventRequest,
     ReplanResponse,
     create_tenant_plan,
-    post_event,
+    replan_event,
     tenant_plan_scenario,
 )
 from freshswitch_backend.api.saas_plan_confirm import require_sandbox
@@ -184,7 +184,7 @@ async def add_registered_lot(
         raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")
     event = await run_in_threadpool(_addable, session, body, principal)
     request = EventRequest(event=event, idempotency_key=body.idempotency_key)
-    response = await post_event(plan_id, request, org_id=principal.org_id, llm=llm)
+    response = await replan_event(plan_id, request, org_id=principal.org_id, llm=llm)
     await run_in_threadpool(
         store.mark_registered_add, plan_id, response.replan_id, event.lot.id, principal.org_id
     )

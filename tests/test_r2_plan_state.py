@@ -1,9 +1,12 @@
+import asyncio
+
 from fastapi.testclient import TestClient
-from saas_fixtures import FORWARDER_ORG_ID
+from saas_fixtures import FORWARDER_ORG_ID, PLATFORM_ORG_ID
 from sqlalchemy import select, update
 from test_add_lot import _plan_with_spare, _reject_order
 from test_plan_confirm import PLATFORM, REDUCE, _decide, _plan, _state
 
+from freshswitch_backend.api.plans import EventRequest, replan_event
 from freshswitch_backend.lots import RegisteredLot
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.seed import shipper_org_id
@@ -295,8 +298,9 @@ def test_add_lot_event_is_marked_in_the_same_transaction_as_its_pending_row(
     plan_id, extra = _plan_with_spare(platform_client, saas_login)
     with database.begin() as db:
         row = RegisteredLot.model_validate(db.get(LotRow, extra), from_attributes=True)
-        lot = row.to_lot().model_dump(mode="json")
-    result = _event(platform_client, plan_id, {"type": "add_lot", "lot": lot})
+    request = EventRequest.model_validate({"event": {"type": "add_lot", "lot": row.to_lot()}})
+    response = asyncio.run(replan_event(plan_id, request, PLATFORM_ORG_ID, llm=False))
+    result = response.model_dump(mode="json")
     with database.begin() as db:
         assert db.get(PendingRow, result["replan_id"]).payload[REGISTERED_ADD] == extra
     feasible = next(a["id"] for a in result["alternatives"] if a["feasible"])

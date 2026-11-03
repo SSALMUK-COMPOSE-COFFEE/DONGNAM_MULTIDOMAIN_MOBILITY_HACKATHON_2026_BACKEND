@@ -5,11 +5,23 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import delete, select
 
 from freshswitch_backend.api.auth import OptionalPrincipal, current_org_id
-from freshswitch_backend.api.intake import DEMO_SCOPE, IntakeScope, Scope, intake_error, register
+from freshswitch_backend.api.intake import (
+    DEMO_SCOPE,
+    IntakeScope,
+    Scope,
+    intake_error,
+    intake_today,
+    register,
+)
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import Scenario
 from freshswitch_backend.intake.models import FieldError, IntakePreview, IntakeRequest
-from freshswitch_backend.intake.service import IntakeError, resolve_names, season_warnings
+from freshswitch_backend.intake.service import (
+    IntakeError,
+    date_range_errors,
+    resolve_names,
+    season_warnings,
+)
 from freshswitch_backend.lots import LotFilter, LotPatch, LotStatus, RegisteredLot, lot_store
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.tables import DEMO_ORG, LotRow
@@ -140,6 +152,10 @@ def _validate_patch(
                 )
             )
     ready = values.get("ready_date", lot.ready_date)
+    if changes.get("ready_date") is not None:
+        errors.extend(date_range_errors(scenario, intake_today(), ready_date=ready))
+        if errors:
+            raise IntakeError(errors)
     if (
         recompute_sell_by
         and scenario is not None
@@ -159,6 +175,15 @@ def _validate_patch(
         errors.append(
             FieldError(field="sell_by_date", message="판매기한이 출하 가능일보다 빠릅니다")
         )
+    dates_changed = any(changes.get(name) is not None for name in ("ready_date", "sell_by_date"))
+    errors.extend(
+        date_range_errors(
+            scenario,
+            intake_today(),
+            sell_by_date=sell_by if dates_changed else None,
+            sell_by_base=ready,
+        )
+    )
     if errors:
         raise IntakeError(errors)
     return values

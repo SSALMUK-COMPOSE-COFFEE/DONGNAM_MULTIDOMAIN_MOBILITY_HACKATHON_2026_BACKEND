@@ -13,6 +13,7 @@ from freshswitch_backend.api.computation import (
     request_deadline,
 )
 from freshswitch_backend.api.compute_limits import check_lot_count, compute_slot
+from freshswitch_backend.api.intake import intake_today
 from freshswitch_backend.api.vessels import (
     VesselClientFactory,
     fetch_busan_sourced,
@@ -29,6 +30,7 @@ from freshswitch_backend.execution.models import (
 from freshswitch_backend.execution.numbers import entered_numbers
 from freshswitch_backend.execution.orders import saas_requests, without_saas_basis
 from freshswitch_backend.forecast.observations import planned_voyages, record_schedule_check
+from freshswitch_backend.intake.service import date_range_errors
 from freshswitch_backend.intake.tenants import load_catalog, tenant_scenario
 from freshswitch_backend.integrations import (
     MAX_GAP_HOURS,
@@ -56,6 +58,7 @@ from freshswitch_backend.planning.store import (
 )
 from freshswitch_backend.quality import learning_scope, quality_history, with_learned_loss
 from freshswitch_backend.replan import (
+    AddLotEvent,
     DelayEvent,
     Event,
     ReplanResult,
@@ -69,6 +72,10 @@ router = APIRouter(prefix="/plans", tags=["plans"])
 
 OrgId = Annotated[str, Depends(current_org_id)]
 INLINE_LOTS_FORBIDDEN = "SaaS 계획은 등록 출하(lot_ids)로만 만들 수 있습니다"
+INLINE_ADD_LOT_FORBIDDEN = (
+    "SaaS 계획에는 등록 출하만 추가할 수 있습니다. "
+    "POST /saas/platform/plans/{plan_id}/add-lot 에 lot_id를 보내세요"
+)
 
 
 class CreatePlanRequest(BaseModel):
@@ -175,6 +182,17 @@ def _lot_errors(scenario: Scenario, lots: list[Lot]) -> list[str]:
     return errors
 
 
+def _date_errors(scenario: Scenario, lots: list[Lot]) -> list[str]:
+    today = intake_today()
+    return [
+        f"{lot.id}: {error.message}"
+        for lot in lots
+        for error in date_range_errors(
+            scenario, today, ready_date=lot.ready_date, sell_by_date=lot.sell_by_date
+        )
+    ]
+
+
 def _shipper_org_lots(lots: list[RegisteredLot], peer_of: str) -> list[RegisteredLot]:
     if not lots:
         return []
@@ -244,7 +262,7 @@ def _with_lots(
             status_code=422,
             detail=f"로트 ID가 겹칩니다(시나리오·등록·직접 입력 로트 중): {', '.join(clashes)}",
         )
-    errors = _lot_errors(scenario, added)
+    errors = [*_lot_errors(scenario, added), *_date_errors(scenario, body.lots)]
     if errors:
         raise HTTPException(status_code=422, detail=errors)
     merged = scenario.model_copy(update={"lots": [*scenario.lots, *added]})
@@ -367,6 +385,22 @@ async def post_event(
     body: EventRequest,
     org_id: OrgId,
     llm: Annotated[bool | None, Query()] = None,
+) -> ReplanResponse:
+    if isinstance(body.event, AddLotEvent):
+        if org_id != DEMO_ORG:
+            raise HTTPException(status_code=422, detail=INLINE_ADD_LOT_FORBIDDEN)
+        session = await run_in_threadpool(_session, plan_id, org_id)
+        errors = _date_errors(session.scenario, [body.event.lot])
+        if errors:
+            raise HTTPException(status_code=422, detail=errors)
+    return await replan_event(plan_id, body, org_id, llm)
+
+
+async def replan_event(
+    plan_id: str,
+    body: EventRequest,
+    org_id: str,
+    llm: bool | None = None,
 ) -> ReplanResponse:
     deadline = request_deadline()
     session = await run_in_threadpool(_session, plan_id, org_id)

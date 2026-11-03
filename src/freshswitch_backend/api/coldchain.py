@@ -37,6 +37,7 @@ from freshswitch_backend.coldchain.models import (
     Binding,
     BindingRequest,
     ColdchainAction,
+    IngestRejected,
     IngestResult,
     PowerPlan,
     PresetInfo,
@@ -46,6 +47,7 @@ from freshswitch_backend.coldchain.models import (
     SimulationRun,
     TwinState,
     TwinSummary,
+    reading_window_error,
 )
 from freshswitch_backend.coldchain.power_plan import power_plan
 from freshswitch_backend.coldchain.simulator import PRESETS
@@ -236,6 +238,29 @@ def _ingest_org(
     return orgs.pop()
 
 
+def _ingest_device(items: list[ReadingIn], org_id: str) -> IngestResult:
+    now = coldchain_store.clock()
+    sandbox = org_sandbox(org_id)
+    kept: list[int] = []
+    rejected: list[IngestRejected] = []
+    for index, item in enumerate(items):
+        reason = reading_window_error(item.ts, now, sandbox)
+        if reason is None:
+            kept.append(index)
+        else:
+            rejected.append(IngestRejected(index=index, device_id=item.device_id, reason=reason))
+    if not kept:
+        return IngestResult(
+            accepted=0, duplicates=0, rejected=rejected, containers=[], new_alerts=[]
+        )
+    result = coldchain_store.ingest([items[i] for i in kept], org_id, bound_only=True)
+    if not rejected:
+        return result
+    moved = [r.model_copy(update={"index": kept[r.index]}) for r in result.rejected]
+    merged = sorted([*rejected, *moved], key=lambda r: r.index)
+    return result.model_copy(update={"rejected": merged})
+
+
 @router.get("/params")
 def read_params() -> dict[str, Quantity]:
     return dict(coldchain_store.params)
@@ -268,8 +293,10 @@ def ingest(
     if len(items) > 2000:
         raise HTTPException(status_code=422, detail="한 번에 2,000건까지 보낼 수 있습니다")
     org_id = _ingest_org(items, device_token, principal, app_settings(request).saas_mode)
-    result = coldchain_store.ingest(items, org_id, bound_only=org_id != DEMO_ORG)
-    if org_id != DEMO_ORG:
+    if org_id == DEMO_ORG:
+        result = coldchain_store.ingest(items, org_id)
+    else:
+        result = _ingest_device(items, org_id)
         device_store.touch({item.device_id for item in items})
     if result.accepted == 0 and result.duplicates == 0:
         reason = result.rejected[0].reason

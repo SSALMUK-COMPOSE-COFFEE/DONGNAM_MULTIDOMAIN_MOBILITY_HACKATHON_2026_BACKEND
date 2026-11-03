@@ -1,9 +1,13 @@
+from datetime import datetime
+
 import pytest
 from fastapi.testclient import TestClient
 from saas_fixtures import demo_org_type
 
+from freshswitch_backend.coldchain import coldchain_store
 from freshswitch_backend.config import get_settings
 from freshswitch_backend.data.loader import get_scenario
+from freshswitch_backend.domain.models import KST
 from freshswitch_backend.lots import ANY_ORG, lot_store
 from freshswitch_backend.main import create_app
 from freshswitch_backend.planning.store import store
@@ -44,7 +48,8 @@ def _count(client: TestClient, plan_id: str) -> int:
     return response.json()["reading_count"]
 
 
-def test_coldchain1_token_reading_of_deleted_plan_binding_is_rejected(saas) -> None:
+def test_coldchain1_token_reading_of_deleted_plan_binding_is_rejected(saas, monkeypatch) -> None:
+    monkeypatch.setattr(coldchain_store, "clock", lambda: datetime(2026, 11, 17, 12, tzinfo=KST))
     first, second = _two_plans()
     platform = _login(saas, PLATFORM)
     run = platform.post(

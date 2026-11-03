@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import date
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -6,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from freshswitch_backend.api.auth import OptionalPrincipal, Principal
 from freshswitch_backend.api.saas_access import plan_for
 from freshswitch_backend.data.loader import get_scenario
-from freshswitch_backend.domain.models import Plan, Scenario
+from freshswitch_backend.domain.models import KST, Plan, Scenario
 from freshswitch_backend.intake.models import IntakePreview, IntakeRequest
 from freshswitch_backend.intake.savings import estimate_savings
 from freshswitch_backend.intake.service import IntakeError, preview_lot
@@ -71,6 +72,10 @@ def intake_scope(principal: OptionalPrincipal) -> IntakeScope:
 Scope = Annotated[IntakeScope, Depends(intake_scope)]
 
 
+def intake_today() -> date:
+    return lot_store.clock().astimezone(KST).date()
+
+
 def intake_error(exc: IntakeError) -> HTTPException:
     return HTTPException(status_code=422, detail=[e.model_dump() for e in exc.errors])
 
@@ -119,6 +124,7 @@ def build_preview(
             taken_ids=reservation.taken,
             reserved_ids=reservation.reserved,
             check_season=scope.org_id != DEMO_ORG,
+            today=intake_today(),
         )
     except IntakeError as exc:
         raise intake_error(exc) from exc

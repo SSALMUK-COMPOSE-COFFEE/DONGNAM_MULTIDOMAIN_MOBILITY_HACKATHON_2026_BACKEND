@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -24,6 +24,31 @@ HandlerRole = Literal["platform", "forwarder"]
 ResidualRiskKind = Literal["heat_accumulation", "temperature_swing", "door_open", "sensor_gap"]
 RiskLevel = Literal["info", "warning"]
 PowerStage = Literal["trucking", "gate", "plug"]
+READING_MAX_AGE = timedelta(days=30)
+READING_MAX_AHEAD = timedelta(minutes=10)
+SANDBOX_READING_MAX_AHEAD = timedelta(days=60)
+
+
+def _span(delta: timedelta) -> str:
+    minutes = int(delta.total_seconds() // 60)
+    if minutes % (24 * 60) == 0:
+        return f"{minutes // (24 * 60)}일"
+    if minutes % 60 == 0:
+        return f"{minutes // 60}시간"
+    return f"{minutes}분"
+
+
+def reading_window_error(ts: datetime | None, now: datetime, sandbox: bool = False) -> str | None:
+    if ts is None:
+        return None
+    ahead = SANDBOX_READING_MAX_AHEAD if sandbox else READING_MAX_AHEAD
+    if ts > now + ahead:
+        return f"측정 시각이 서버 시각보다 {_span(ahead)} 넘게 앞섭니다: {ts.isoformat()}"
+    if ts < now - READING_MAX_AGE:
+        return (
+            f"측정 시각이 서버 시각보다 {_span(READING_MAX_AGE)} 넘게 지났습니다: {ts.isoformat()}"
+        )
+    return None
 
 
 class ReadingIn(BaseModel):
