@@ -60,6 +60,8 @@ UNREGISTERED_DEVICE = "등록되지 않은 장치입니다. 조직 기기로 먼
 REGISTERED_DEVICE_REQUIRED = "조직에 등록된 장치와 X-Device-Token이 필요합니다"
 SIMULATOR_SANDBOX_ONLY = "시뮬레이터는 데모 세계(sandbox) 조직에서만 쓸 수 있습니다"
 ACTION_ROLE_FORBIDDEN = "콜드체인 조치의 수락·완료는 플랫폼이나 배정된 포워더가 기록합니다"
+RESET_ROLE_FORBIDDEN = "콜드체인 컨테이너 기록 초기화는 플랫폼이나 배정된 포워더가 합니다"
+CONTAINER_NOT_FOUND = "초기화할 컨테이너 기록이 없습니다"
 CSV_MEDIA = "text/csv; charset=utf-8"
 CSV_RESPONSE = {200: {"content": {"text/csv": {"schema": {"type": "string"}}}}}
 
@@ -256,11 +258,20 @@ def read_twin(
 
 
 @router.delete("/containers/{container_id}", status_code=status.HTTP_204_NO_CONTENT)
-def reset_container(container_id: str, org_id: OrgId, plan_id: str | None = None) -> None:
+def reset_container(
+    container_id: str, org_id: OrgId, principal: OptionalPrincipal, plan_id: str | None = None
+) -> None:
+    if principal is not None:
+        if plan_id is not None:
+            plan_for(plan_id, principal)
+        if principal.org_type not in ("platform", "forwarder"):
+            raise HTTPException(status_code=403, detail=RESET_ROLE_FORBIDDEN)
     try:
-        coldchain_store.reset_container(container_id, plan_id, org_id)
+        deleted = coldchain_store.reset_container(container_id, plan_id, org_id)
     except ColdchainError as exc:
         raise _http(exc) from exc
+    if principal is not None and not deleted:
+        raise HTTPException(status_code=404, detail=CONTAINER_NOT_FOUND)
 
 
 @router.get("/containers/{container_id}/settlement-preview")

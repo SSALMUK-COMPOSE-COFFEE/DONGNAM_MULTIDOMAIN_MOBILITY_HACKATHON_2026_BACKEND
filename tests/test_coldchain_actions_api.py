@@ -160,3 +160,22 @@ def test_residual_risks_in_twin_state(client: TestClient) -> None:
     assert risks["temperature_swing"]["level"] == "warning"
     assert risks["heat_accumulation"]["threshold"]["unit"] == "°C·시간"
     assert all(r["threshold"]["source"].startswith("가정") for r in risks.values())
+
+
+def test_saas_container_reset_scope(saas_app, saas_plan: str) -> None:
+    params = {"plan_id": saas_plan}
+    path = "/api/coldchain/containers/CA-01"
+    shipper = _login(saas_app, SHIPPER)
+    assert shipper.delete(path, params=params).status_code == 403
+    outsider = _login(saas_app, OUTSIDER_FORWARDER)
+    assert outsider.delete(path, params=params).status_code == 404
+    other_shipper = _login(saas_app, "shipper-sancheong")
+    assert other_shipper.delete(path, params=params).status_code == 404
+    forwarder = _login(saas_app, FORWARDER)
+    assert forwarder.delete(path, params=params).status_code == 404
+    platform = _login(saas_app, PLATFORM)
+    assert _state(platform, saas_plan)["reading_count"] > 0
+    assert platform.delete(path, params=params).status_code == 204
+    assert platform.delete(path, params=params).status_code == 404
+    rows = platform.get("/api/coldchain/containers", params=params).json()
+    assert all(row["container_id"] != "CA-01" for row in rows)

@@ -898,19 +898,19 @@ class ColdchainStore:
 
     def reset_container(
         self, container_id: str, plan_id: str | None = None, org_id: str = DEMO_ORG
-    ) -> None:
+    ) -> bool:
         with self._lock:
             with self._db.begin() as db:
                 matches = self._matches(db, container_id, plan_id, org_id)
                 if len(matches) > 1:
                     raise ColdchainError(AMBIGUOUS)
                 resolved = matches[0].plan_id if matches else plan_id
-                db.execute(
+                deleted = db.execute(
                     delete(ContainerRow).where(
                         ContainerRow.record_key == _record_key(resolved, container_id, org_id),
                         ContainerRow.org_id == org_id,
                     )
-                )
+                ).rowcount
             for run in self._runs.values():
                 if (
                     run.org_id == org_id
@@ -918,6 +918,7 @@ class ColdchainStore:
                     and run.info.plan_id == resolved
                 ):
                     run.stop.set()
+            return bool(deleted)
 
     def _last_seq(self, db: Session) -> int:
         row = db.execute(text(f"SELECT last_value, is_called FROM {ALERT_SEQ.name}")).one()
