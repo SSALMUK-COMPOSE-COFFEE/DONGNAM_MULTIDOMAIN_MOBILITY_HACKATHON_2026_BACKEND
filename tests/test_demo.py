@@ -132,9 +132,9 @@ def test_script_curl_format(client: TestClient, tmp_path) -> None:
     assert "capture delay_event -c '.events[0]'" in text
     assert '"event":\'"${delay_event}"\'}' in text
     script = tmp_path / "demo.sh"
-    script.write_text(text)
-    if shutil.which("bash"):
+    script.write_text(text, encoding="utf-8", newline="\n")
+    if bash := shutil.which("bash"):
         result = subprocess.run(
-            ["bash", "-n", str(script)], check=False, capture_output=True, text=True
+            [bash, "-n", str(script)], check=False, capture_output=True, text=True
         )
         assert result.returncode == 0, result.stderr

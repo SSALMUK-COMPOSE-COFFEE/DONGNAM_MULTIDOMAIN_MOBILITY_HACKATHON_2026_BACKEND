@@ -93,7 +93,10 @@ def llm_payload(summary: str, jinju_message: str) -> str:
         {
             "operator_summary": summary,
             "shipper_messages": [
-                {"shipper_id": "s-sancheong", "message": "비용이 2.3만 원 줄어듭니다."},
+                {
+                    "shipper_id": "s-sancheong",
+                    "message": render_template(make_context()).shipper_messages[0].message,
+                },
                 {"shipper_id": "s-jinju", "message": jinju_message},
             ],
         },
@@ -125,8 +128,8 @@ def test_payload_uses_unsigned_change_and_direction() -> None:
 def test_llm_success() -> None:
     completions = FakeCompletions(
         llm_payload(
-            "산청 화주 5→3파렛트 감축으로 CA-01을 18→20/20파렛트로 채웁니다.",
-            "비용이 250,000원에서 253,500원으로 +3,500원 늘어납니다.",
+            render_template(make_context()).operator_summary,
+            render_template(make_context()).shipper_messages[1].message,
         )
     )
     result = asyncio.run(
@@ -138,6 +141,123 @@ def test_llm_success() -> None:
     request = completions.calls[0]
     assert request["model"] == "fake-model"
     assert "253,500원" in request["messages"][1]["content"]
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        ("3,500원", "2.3만 원"),
+        ("늘어납니다", "줄어듭니다"),
+        ("250,000원에서 253,500원", "253,500원에서 250,000원"),
+        ("CA-01", "CA-02"),
+        ("화물은 CA-01(으)로 옮겨집니다.", "화물은 CA-01로 이동하지 않습니다."),
+        ("진주 파프리카", "산청 딸기농가"),
+        ("화물은 CA-01(으)로 옮겨집니다.", "화물은 CA-01(으)로 옮겨집니다. 출하를 1일 앞당깁니다."),
+    ],
+)
+def test_shipper_facts_are_scoped_and_grounded(old, new):
+    message = render_template(make_context()).shipper_messages[1].message.replace(old, new)
+    completions = FakeCompletions(
+        llm_payload(render_template(make_context()).operator_summary, message)
+    )
+    result = asyncio.run(
+        explain(make_context(), settings=SETTINGS, client=fake_client(completions))
+    )
+    assert result.generated_by == "template"
+    assert result.fallback_reason == "validation"
+
+
+@pytest.mark.parametrize(
+    "delta,moved,pull",
+    [
+        (0, None, 0),
+        (-3500, "CA-01", 2),
+        (3500, "항공", 0),
+    ],
+)
+def test_canonical_facts_pass_for_zero_decrease_air_and_pull(delta, moved, pull):
+    ctx = make_context()
+    shipper = ctx.shippers[1]
+    shipper.delta_krw = delta
+    shipper.cost_after_krw = shipper.cost_before_krw + delta
+    shipper.moved = moved
+    shipper.pull_forward_days = pull
+    payload = render_template(ctx).model_dump(include={"operator_summary", "shipper_messages"})
+    result = asyncio.run(
+        explain(ctx, settings=SETTINGS, client=fake_client(FakeCompletions(json.dumps(payload))))
+    )
+    assert result.generated_by == "llm"
+
+
+def test_duplicate_shipper_is_rejected():
+    ctx = make_context()
+    payload = json.loads(llm_payload(render_template(ctx).operator_summary, "message"))
+    payload["shipper_messages"].append(payload["shipper_messages"][0])
+    result = asyncio.run(
+        explain(ctx, settings=SETTINGS, client=fake_client(FakeCompletions(json.dumps(payload))))
+    )
+    assert result.fallback_reason == "validation"
+
+
+def test_changed_recommendation_is_rejected():
+    ctx = make_context()
+    payload = render_template(ctx).model_dump(include={"operator_summary", "shipper_messages"})
+    payload["operator_summary"] = payload["operator_summary"].replace(
+        "대기 화물 당겨 싣기", "다음 항차로 연기"
+    )
+    result = asyncio.run(
+        explain(ctx, settings=SETTINGS, client=fake_client(FakeCompletions(json.dumps(payload))))
+    )
+    assert result.fallback_reason == "validation"
+
+
+def test_missing_pull_forward_is_rejected():
+    ctx = make_context()
+    ctx.shippers[1].pull_forward_days = 2
+    payload = render_template(ctx).model_dump(include={"operator_summary", "shipper_messages"})
+    payload["shipper_messages"][1]["message"] = payload["shipper_messages"][1]["message"].replace(
+        "출하를 2일 앞당겨 주셔야 합니다.", ""
+    )
+    result = asyncio.run(
+        explain(ctx, settings=SETTINGS, client=fake_client(FakeCompletions(json.dumps(payload))))
+    )
+    assert result.fallback_reason == "validation"
+
+
+def test_slow_llm_is_cancelled_and_returns_template():
+    cancelled = []
+
+    class SlowCompletions:
+        async def create(self, **kwargs):
+            try:
+                await asyncio.sleep(60)
+            finally:
+                cancelled.append(True)
+
+    result = asyncio.run(
+        explain(
+            make_context(), settings=SETTINGS, client=fake_client(SlowCompletions()), timeout_s=0.01
+        )
+    )
+    assert result.generated_by == "template"
+    assert result.fallback_reason == "timeout"
+    assert cancelled == [True]
+
+
+def test_owned_llm_client_is_closed_after_validation_failure(monkeypatch):
+    from freshswitch_backend.explain import service
+
+    closed = []
+    client = fake_client(FakeCompletions("invalid-json"))
+
+    async def close():
+        closed.append(True)
+
+    client.close = close
+    monkeypatch.setattr(service, "AsyncOpenAI", lambda **kwargs: client)
+    result = asyncio.run(explain(make_context(), settings=SETTINGS))
+    assert result.fallback_reason == "validation"
+    assert closed == [True]
 
 
 def test_invented_number_falls_back_to_template() -> None:
