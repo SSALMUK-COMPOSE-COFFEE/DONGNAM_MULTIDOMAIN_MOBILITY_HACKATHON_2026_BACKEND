@@ -12,6 +12,7 @@ from freshswitch_backend.persistence import Database, database
 from freshswitch_backend.persistence.tables import DEMO_ORG, BindingRow, DeviceRow
 
 SIMULATOR_PREFIX = "sim-"
+SANDBOX_DEVICE_PREFIX = "demo-"
 
 
 class DeviceConflict(ValueError):
@@ -20,6 +21,17 @@ class DeviceConflict(ValueError):
 
 def is_simulator_device(device_id: str) -> bool:
     return device_id.startswith(SIMULATOR_PREFIX)
+
+
+def device_prefix_error(device_id: str, sandbox: bool) -> str | None:
+    lowered = device_id.lower()
+    if sandbox and not lowered.startswith(SANDBOX_DEVICE_PREFIX):
+        return f"데모 조직 기기 id는 '{SANDBOX_DEVICE_PREFIX}'로 시작해야 합니다"
+    if not sandbox and lowered.startswith(SANDBOX_DEVICE_PREFIX):
+        return f"'{SANDBOX_DEVICE_PREFIX}'로 시작하는 id는 데모 조직용이라 등록할 수 없습니다"
+    if not sandbox and lowered.startswith(SIMULATOR_PREFIX):
+        return f"'{SIMULATOR_PREFIX}'로 시작하는 id는 시뮬레이터용이라 등록할 수 없습니다"
+    return None
 
 
 class DeviceRequest(BaseModel):

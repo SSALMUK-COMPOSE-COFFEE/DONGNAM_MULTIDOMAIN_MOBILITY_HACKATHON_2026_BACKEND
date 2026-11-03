@@ -188,9 +188,9 @@ def test_simulator_ids_cannot_be_registered(app, plan_id: str) -> None:
 
 def test_logged_in_simulation_needs_registered_device(app, plan_id: str) -> None:
     platform = _login(app, PLATFORM)
-    body = {"plan_id": plan_id, "container_id": "CA-01", "device_id": "loose-01"}
+    body = {"plan_id": plan_id, "container_id": "CA-01", "device_id": "demo-loose-01"}
     assert platform.post("/api/coldchain/simulate", json=body, headers=CSRF).status_code == 422
-    platform.post("/api/saas/devices", json={"device_id": "loose-01"}, headers=CSRF)
+    platform.post("/api/saas/devices", json={"device_id": "demo-loose-01"}, headers=CSRF)
     assert platform.post("/api/coldchain/simulate", json=body, headers=CSRF).status_code == 200
 
 
@@ -221,24 +221,24 @@ def test_shipper_settlement_preview_only_has_own_lots(app, simulated: str) -> No
 def test_device_registration_returns_token_once_and_stores_hash(app) -> None:
     platform = _login(app, PLATFORM)
     created = platform.post(
-        "/api/saas/devices", json={"device_id": "dev-p1", "name": "1번 센서"}, headers=CSRF
+        "/api/saas/devices", json={"device_id": "demo-p1", "name": "1번 센서"}, headers=CSRF
     )
     assert created.status_code == 201
     token = created.json()["device_token"]
     assert len(token) >= 32
     with database.begin() as db:
-        row = db.get(DeviceRow, "dev-p1")
+        row = db.get(DeviceRow, "demo-p1")
         assert row.org_id == PLATFORM
         assert row.token_hash == hashlib.sha256(token.encode()).hexdigest()
     listed = platform.get("/api/saas/devices").json()
-    assert [d["device_id"] for d in listed] == ["dev-p1"]
+    assert [d["device_id"] for d in listed] == ["demo-p1"]
     assert "device_token" not in listed[0]
-    again = platform.post("/api/saas/devices", json={"device_id": "dev-p1"}, headers=CSRF)
+    again = platform.post("/api/saas/devices", json={"device_id": "demo-p1"}, headers=CSRF)
     assert again.status_code == 409
     other = _login(app, FORWARDER)
     assert other.get("/api/saas/devices").json() == []
-    assert other.delete("/api/saas/devices/dev-p1", headers=CSRF).status_code == 404
-    taken = other.post("/api/saas/devices", json={"device_id": "dev-p1"}, headers=CSRF)
+    assert other.delete("/api/saas/devices/demo-p1", headers=CSRF).status_code == 404
+    taken = other.post("/api/saas/devices", json={"device_id": "demo-p1"}, headers=CSRF)
     assert taken.status_code == 409
 
 
@@ -279,17 +279,17 @@ def test_registration_replaces_demo_binding(demo_tenants) -> None:
 
 def test_registered_device_readings_need_token(app, plan_id: str) -> None:
     platform = _login(app, PLATFORM)
-    token = platform.post("/api/saas/devices", json={"device_id": "dev-p1"}, headers=CSRF).json()[
+    token = platform.post("/api/saas/devices", json={"device_id": "demo-p1"}, headers=CSRF).json()[
         "device_token"
     ]
     bound = platform.post(
         "/api/coldchain/bindings",
-        json={"device_id": "dev-p1", "container_id": "CA-01", "plan_id": plan_id},
+        json={"device_id": "demo-p1", "container_id": "CA-01", "plan_id": plan_id},
         headers=CSRF,
     )
     assert bound.status_code == 201, bound.text
     device = _anonymous(app)
-    reading = {"device_id": "dev-p1", "temp_c": 1.5, "power_on": True}
+    reading = {"device_id": "demo-p1", "temp_c": 1.5, "power_on": True}
     missing = device.post("/api/coldchain/readings", json=reading)
     assert missing.status_code == 401
     wrong = device.post(
@@ -301,7 +301,7 @@ def test_registered_device_readings_need_token(app, plan_id: str) -> None:
     assert ok.json()["accepted"] == 1
     assert ok.json()["containers"][0]["plan_id"] == plan_id
     with database.begin() as db:
-        assert db.get(DeviceRow, "dev-p1").last_seen_at is not None
+        assert db.get(DeviceRow, "demo-p1").last_seen_at is not None
         keys = db.scalars(select(ContainerRow.org_id)).all()
     assert keys == [PLATFORM]
     assert device.get("/api/coldchain/containers").status_code == 401
@@ -311,21 +311,26 @@ def test_registered_device_readings_need_token(app, plan_id: str) -> None:
 
 def test_device_token_from_other_device_is_rejected(app) -> None:
     platform = _login(app, PLATFORM)
-    first = platform.post("/api/saas/devices", json={"device_id": "dev-a"}, headers=CSRF)
-    platform.post("/api/saas/devices", json={"device_id": "dev-b"}, headers=CSRF)
+    first = platform.post("/api/saas/devices", json={"device_id": "demo-a"}, headers=CSRF)
+    platform.post("/api/saas/devices", json={"device_id": "demo-b"}, headers=CSRF)
     token = first.json()["device_token"]
     device = _anonymous(app)
     wrong = device.post(
         "/api/coldchain/readings",
-        json={"device_id": "dev-b", "container_id": "CA-01", "temp_c": 1.0, "power_on": True},
+        json={"device_id": "demo-b", "container_id": "CA-01", "temp_c": 1.0, "power_on": True},
         headers={"X-Device-Token": token},
     )
     assert wrong.status_code == 401
     mixed = device.post(
         "/api/coldchain/readings",
         json=[
-            {"device_id": "dev-a", "container_id": "CA-01", "temp_c": 1.0, "power_on": True},
-            {"device_id": "loose-01", "container_id": "CA-01", "temp_c": 1.0, "power_on": True},
+            {"device_id": "demo-a", "container_id": "CA-01", "temp_c": 1.0, "power_on": True},
+            {
+                "device_id": "demo-loose-01",
+                "container_id": "CA-01",
+                "temp_c": 1.0,
+                "power_on": True,
+            },
         ],
         headers={"X-Device-Token": token},
     )
@@ -336,13 +341,18 @@ def test_logged_in_org_cannot_use_unregistered_device(app, plan_id: str) -> None
     platform = _login(app, PLATFORM)
     bound = platform.post(
         "/api/coldchain/bindings",
-        json={"device_id": "loose-01", "container_id": "CA-01", "plan_id": plan_id},
+        json={"device_id": "demo-loose-01", "container_id": "CA-01", "plan_id": plan_id},
         headers=CSRF,
     )
     assert bound.status_code == 422
     sent = platform.post(
         "/api/coldchain/readings",
-        json={"device_id": "loose-01", "container_id": "CA-01", "temp_c": 1.0, "power_on": True},
+        json={
+            "device_id": "demo-loose-01",
+            "container_id": "CA-01",
+            "temp_c": 1.0,
+            "power_on": True,
+        },
         headers=CSRF,
     )
     assert sent.status_code == 422
@@ -350,29 +360,29 @@ def test_logged_in_org_cannot_use_unregistered_device(app, plan_id: str) -> None
 
 def test_delete_device_removes_binding(app, plan_id: str) -> None:
     platform = _login(app, PLATFORM)
-    platform.post("/api/saas/devices", json={"device_id": "dev-p1"}, headers=CSRF)
+    platform.post("/api/saas/devices", json={"device_id": "demo-p1"}, headers=CSRF)
     platform.post(
         "/api/coldchain/bindings",
-        json={"device_id": "dev-p1", "container_id": "CA-01", "plan_id": plan_id},
+        json={"device_id": "demo-p1", "container_id": "CA-01", "plan_id": plan_id},
         headers=CSRF,
     )
-    assert platform.delete("/api/saas/devices/dev-p1", headers=CSRF).status_code == 204
+    assert platform.delete("/api/saas/devices/demo-p1", headers=CSRF).status_code == 204
     with database.begin() as db:
-        assert db.get(DeviceRow, "dev-p1") is None
-        assert db.get(BindingRow, "dev-p1") is None
+        assert db.get(DeviceRow, "demo-p1") is None
+        assert db.get(BindingRow, "demo-p1") is None
     assert platform.get("/api/coldchain/bindings").json() == []
 
 
 def test_store_rejects_foreign_registered_device(app) -> None:
     platform = _login(app, PLATFORM)
-    platform.post("/api/saas/devices", json={"device_id": "dev-p1"}, headers=CSRF)
+    platform.post("/api/saas/devices", json={"device_id": "demo-p1"}, headers=CSRF)
     with pytest.raises(DeviceDenied):
-        coldchain_store.bind(BindingRequest(device_id="dev-p1", container_id="CA-01"))
+        coldchain_store.bind(BindingRequest(device_id="demo-p1", container_id="CA-01"))
     result = coldchain_store.ingest(
-        [ReadingIn(device_id="dev-p1", container_id="CA-01", temp_c=1.0, power_on=True)]
+        [ReadingIn(device_id="demo-p1", container_id="CA-01", temp_c=1.0, power_on=True)]
     )
     assert result.accepted == 0
-    assert result.rejected[0].device_id == "dev-p1"
+    assert result.rejected[0].device_id == "demo-p1"
 
 
 def test_anonymous_demo_flow_unchanged(client: TestClient) -> None:

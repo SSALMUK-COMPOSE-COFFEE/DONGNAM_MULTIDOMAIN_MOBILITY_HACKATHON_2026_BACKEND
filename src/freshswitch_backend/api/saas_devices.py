@@ -1,13 +1,15 @@
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 
-from freshswitch_backend.api.auth import AuthPrincipal
+from freshswitch_backend.api.auth import AuthPrincipal, app_settings
 from freshswitch_backend.coldchain.devices import (
     Device,
     DeviceConflict,
     DeviceRequest,
     RegisteredDevice,
+    device_prefix_error,
     device_store,
 )
+from freshswitch_backend.persistence.orgs import org_sandbox
 
 router = APIRouter(prefix="/saas/devices", tags=["saas-devices"])
 
@@ -18,7 +20,13 @@ def list_devices(principal: AuthPrincipal) -> list[Device]:
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
-def register_device(body: DeviceRequest, principal: AuthPrincipal) -> RegisteredDevice:
+def register_device(
+    body: DeviceRequest, request: Request, principal: AuthPrincipal
+) -> RegisteredDevice:
+    if app_settings(request).saas_mode:
+        reason = device_prefix_error(body.device_id, org_sandbox(principal.org_id))
+        if reason is not None:
+            raise HTTPException(status_code=422, detail=reason)
     try:
         return device_store.register(body, principal.org_id)
     except DeviceConflict as exc:

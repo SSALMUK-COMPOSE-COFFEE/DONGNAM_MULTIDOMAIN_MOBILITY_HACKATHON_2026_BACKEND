@@ -159,11 +159,11 @@ def test_codex5_forwarder_plan_hides_inspection_money_and_notes(saas_app) -> Non
 
 
 def _registered_device(platform: TestClient, plan_id: str, container_id: str) -> str:
-    created = platform.post("/api/saas/devices", json={"device_id": "dev-codex"})
+    created = platform.post("/api/saas/devices", json={"device_id": "demo-codex"})
     assert created.status_code == 201, created.text
     bound = platform.post(
         "/api/coldchain/bindings",
-        json={"device_id": "dev-codex", "container_id": container_id, "plan_id": plan_id},
+        json={"device_id": "demo-codex", "container_id": container_id, "plan_id": plan_id},
     )
     assert bound.status_code == 201, bound.text
     return created.json()["device_token"]
@@ -180,7 +180,7 @@ def test_codex6_device_token_cannot_target_other_container(saas_app) -> None:
     token = _registered_device(platform, plan_id, bound)
     device = TestClient(saas_app, base_url="https://testserver")
     headers = {"X-Device-Token": token}
-    reading = {"device_id": "dev-codex", "temp_c": 40, "power_on": False}
+    reading = {"device_id": "demo-codex", "temp_c": 40, "power_on": False}
     forged = device.post(
         "/api/coldchain/readings",
         json={**reading, "plan_id": plan_id, "container_id": other},
@@ -213,13 +213,13 @@ def test_codex6_device_token_cannot_target_other_container(saas_app) -> None:
 def test_codex6_unbound_registered_device_is_rejected(saas_app) -> None:
     platform, plan_id = _world_plan(saas_app)
     container = _used_containers(platform, plan_id)[0]
-    created = platform.post("/api/saas/devices", json={"device_id": "dev-loose"})
+    created = platform.post("/api/saas/devices", json={"device_id": "demo-loose"})
     token = created.json()["device_token"]
     device = TestClient(saas_app, base_url="https://testserver")
     sent = device.post(
         "/api/coldchain/readings",
         json={
-            "device_id": "dev-loose",
+            "device_id": "demo-loose",
             "plan_id": plan_id,
             "container_id": container,
             "temp_c": 3,
