@@ -25,6 +25,7 @@ from freshswitch_backend.domain.models import Container, Lot, Plan, Scenario
 from freshswitch_backend.optimize import AIR
 from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.optimize.feasibility import air_rejection, products_compatible, sea_option
+from freshswitch_backend.optimize.settlement import lot_settle_cost
 from freshswitch_backend.planning.service import CUTOFF_REASON
 from freshswitch_backend.replan import replan
 
@@ -297,9 +298,35 @@ def tariff_empty_slot_cost(plan: Plan) -> int:
     )
 
 
+def _mixed_tariff_rows(scenario: Scenario, plan: Plan) -> tuple[int, int, int]:
+    mixed = {s.shipper_id for s in plan.settlements if s.basis == "mixed"}
+    if not mixed:
+        return 0, 0, 0
+    model = CostModel(scenario)
+    lots = {lot.id: lot for lot in scenario.lots}
+    container_pallets: defaultdict[str, int] = defaultdict(int)
+    for a in plan.assignments:
+        if a.mode == "sea" and a.container_id:
+            container_pallets[a.container_id] += a.pallets
+    pallets = sea_pallets = 0
+    savings = 0.0
+    for a in plan.assignments:
+        lot = lots.get(a.lot_id)
+        if a.shipper_id not in mixed or lot is None or model.tariff(lot) is None:
+            continue
+        pallets += lot.pallets
+        sea_pallets += lot.pallets if a.mode == "sea" else 0
+        settled = lot_settle_cost(model, lot, a, container_pallets)
+        savings += model.settle_air_cost(lot).total - settled.total
+    return pallets, sea_pallets, round(savings)
+
+
 def _basis_gap(result: MethodResult, parts: list[Part]) -> MethodBasisGap:
-    tariffed = [s for _, plan, _ in parts for s in plan.settlements if s.basis != "operational"]
-    pallets = sum(s.sea_pallets + s.air_pallets for s in tariffed)
+    tariffed = [s for _, plan, _ in parts for s in plan.settlements if s.basis == "tariff"]
+    mixed = [_mixed_tariff_rows(scenario, plan) for scenario, plan, _ in parts]
+    pallets = sum(s.sea_pallets + s.air_pallets for s in tariffed) + sum(m[0] for m in mixed)
+    sea_pallets = sum(s.sea_pallets for s in tariffed) + sum(m[1] for m in mixed)
+    tariff_savings = sum(s.savings for s in tariffed) + sum(m[2] for m in mixed)
     cost_gap = result.total_shipper_cost - result.total_operational_cost
     return MethodBasisGap(
         method=result.method,
@@ -309,10 +336,10 @@ def _basis_gap(result: MethodResult, parts: list[Part]) -> MethodBasisGap:
         baseline_gap=result.total_baseline_cost - result.total_operational_baseline_cost,
         settlement_cost_gap=cost_gap,
         tariff_pallets=pallets,
-        tariff_sea_pallets=sum(s.sea_pallets for s in tariffed),
+        tariff_sea_pallets=sea_pallets,
         settlement_cost_gap_per_tariff_pallet=round(cost_gap / pallets) if pallets else None,
         empty_slot_cost=sum(empty_slot_cost(plan) for _, plan, _ in parts),
-        tariff_settlement_savings=sum(s.savings for s in tariffed),
+        tariff_settlement_savings=tariff_savings,
         tariff_empty_slot_cost=sum(tariff_empty_slot_cost(plan) for _, plan, _ in parts),
     )
 

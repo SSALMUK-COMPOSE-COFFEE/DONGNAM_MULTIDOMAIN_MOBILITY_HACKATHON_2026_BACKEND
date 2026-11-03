@@ -3,12 +3,20 @@ from datetime import datetime
 
 from fastapi.testclient import TestClient
 from saas_fixtures import FORWARDER_ORG_ID
+from test_coldchain_power_plan import _with_peak
 from test_saas_api import REDUCE, _assign, _platform_plan
 
+from freshswitch_backend.analysis.benchmark import benchmark
+from freshswitch_backend.api.saas_forwarder import _card
+from freshswitch_backend.coldchain.power_plan import BATTERY_GENSET, power_plan
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import KST, Scenario
 from freshswitch_backend.execution.card import EnteredNumbers, mock_booking_no
-from freshswitch_backend.execution.orders import saas_requests
+from freshswitch_backend.execution.orders import (
+    genset_instructions,
+    saas_requests,
+    with_object_particle,
+)
 from freshswitch_backend.planning.store import store
 
 DELAY = {
@@ -163,3 +171,45 @@ def test_engine6_forwarder_orders_use_saved_booking_number(
         next(r["text"] for r in platform[-1]["requests"] if r["kind"] == "booking_amendment")
         == text
     )
+
+
+def test_engine8_mixed_shipper_counts_only_tariff_products() -> None:
+    scenario = _default()
+    lots = [
+        lot.model_copy(update={"shipper_id": "sh-jinju"}) if lot.id == "lot-pohang-gr-1" else lot
+        for lot in scenario.lots
+    ]
+    scenario = scenario.model_copy(update={"lots": lots})
+    result = benchmark(scenario)
+    gaps = {g.method: g for g in result.basis_gaps}
+    strawberry = sum(lot.pallets for lot in scenario.lots if lot.product_id == "strawberry")
+    assert strawberry == 19
+    for gap in gaps.values():
+        assert gap.tariff_pallets == 19
+    optimizer = gaps["optimizer"]
+    assert optimizer.tariff_sea_pallets == 17
+    assert optimizer.tariff_settlement_savings == 17 * 249_000
+    assert optimizer.settlement_cost_gap_per_tariff_pallet == round(
+        optimizer.settlement_cost_gap / 19
+    )
+    assert "정산표 화주 19파렛트" in result.settlement_fcfs_explanation
+    assert "24파렛트" not in result.settlement_fcfs_explanation
+
+
+def test_engine9_genset_line_uses_eul_after_jetset(client: TestClient) -> None:
+    plan_id = client.post("/api/plans", json={"scenario_id": "default"}).json()["plan_id"]
+    session = store.get(plan_id)
+    assert session is not None
+    peak = _with_peak(session, session.routes[0].pickup.routes[0].truck_id)
+    lines = genset_instructions(power_plan(peak).candidates, _card(peak))
+    assert lines
+    for line in lines:
+        assert "E-COOLPAC)을 게이트 도착 전에" in line.text
+        assert ")를 " not in line.text
+
+
+def test_engine9_genset_line_particle_follows_final_consonant() -> None:
+    assert with_object_particle(BATTERY_GENSET) == f"{BATTERY_GENSET}을"
+    assert with_object_particle("디젤 발전기") == "디젤 발전기를"
+    assert with_object_particle("젯셋 (A)(B)") == "젯셋 (A)(B)을"
+    assert with_object_particle("E-COOLPAC") == "E-COOLPAC을(를)"

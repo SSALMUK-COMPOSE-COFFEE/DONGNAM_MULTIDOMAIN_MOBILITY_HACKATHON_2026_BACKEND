@@ -959,6 +959,15 @@ def without_saas_basis(order: ExecutionOrder) -> ExecutionOrder:
     return order.model_copy(update={"requests": requests})
 
 
+def with_object_particle(word: str) -> str:
+    base = re.sub(r"(\s*\([^()]*\))+\s*$", "", word)
+    last = base[-1:] if base else ""
+    if not "가" <= last <= "힣":
+        return f"{word}을(를)"
+    has_final = (ord(last) - ord("가")) % 28 != 0
+    return f"{word}{'을' if has_final else '를'}"
+
+
 def genset_instructions(
     candidates: Iterable["GensetCandidate"],
     card: ExecutionCard,
@@ -998,7 +1007,7 @@ def genset_instructions(
                     f"[배터리 젯셋 사전 배정] {candidate.voyage_id} {where} {units} "
                     f"로트 {', '.join(lot_ids)}: 무전원 예상 {window} "
                     f"{candidate.unpowered_minutes:.0f}분(기준 {candidate.threshold_minutes:.0f}분). "
-                    f"{candidate.equipment}를 게이트 도착 전에 배정·연결합니다. "
+                    f"{with_object_particle(candidate.equipment)} 게이트 도착 전에 배정·연결합니다. "
                     + ("게이트 혼잡 시간대 도착." if candidate.gate_peak else "")
                 ).rstrip(),
                 plain_text=PLAIN_TEXT["genset"],
