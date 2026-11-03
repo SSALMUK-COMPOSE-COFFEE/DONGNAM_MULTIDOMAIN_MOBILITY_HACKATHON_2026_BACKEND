@@ -38,6 +38,7 @@ from freshswitch_backend.planning.store import (
 
 THIRD_PARTY_ROLES = frozenset({"carrier", "terminal", "airline"})
 THIRD_PARTY_ANSWER_FORBIDDEN = "선사·터미널·항공사 요청의 회신은 배정된 포워더가 기록합니다"
+ALREADY_DECIDED = "이미 확인한 실행 지시입니다"
 
 router = APIRouter(prefix="/saas/shipper", tags=["saas-shipper"])
 
@@ -129,7 +130,8 @@ def list_plans(principal: ShipperPrincipal) -> list[ShipperPlanItem]:
 @router.get("/plans/{plan_id}")
 def read_plan(plan_id: str, principal: ShipperPrincipal) -> dict[str, Any]:
     access = _access(plan_id, principal)
-    return anonymized_session(access.session, access.viewer.shipper_ids)
+    orders = store.orders(plan_id, org_id=access.owner_org_id)
+    return anonymized_session(access.session, access.viewer.shipper_ids, orders)
 
 
 @router.get("/plans/{plan_id}/orders")
@@ -166,7 +168,8 @@ def answer_request(
         raise missing from exc
     except SessionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return shipper_order_view(access.session, updated, access.viewer.shipper_ids)
+    orders = store.orders(plan_id, org_id=owner)
+    return shipper_order_view(access.session, updated, access.viewer.shipper_ids, orders)
 
 
 @router.post("/plans/{plan_id}/orders/{order_id}/confirm")
@@ -181,9 +184,12 @@ def confirm_order(
     except KeyError as exc:
         raise missing from exc
     own = access.viewer.shipper_ids
-    pending = [c.shipper_id for c in order.shipper_confirmations if c.shipper_id in own]
-    if not pending:
+    mine = {c.shipper_id: c.status for c in order.shipper_confirmations if c.shipper_id in own}
+    if not mine:
         raise missing
+    pending = [sid for sid, decision in mine.items() if decision == "pending"]
+    if mine.get(body.shipper_id or "", "pending") != "pending" or not pending:
+        raise HTTPException(status_code=409, detail=ALREADY_DECIDED)
     shipper_id = body.shipper_id if body.shipper_id in pending else pending[0]
     request = ConfirmRequest(
         actor="shipper", shipper_id=shipper_id, accept=body.accept, note=body.note
@@ -196,7 +202,8 @@ def confirm_order(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except SessionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return shipper_order_view(access.session, updated, own)
+    orders = store.orders(plan_id, org_id=owner)
+    return shipper_order_view(access.session, updated, own, orders)
 
 
 @router.get("/settlements")
