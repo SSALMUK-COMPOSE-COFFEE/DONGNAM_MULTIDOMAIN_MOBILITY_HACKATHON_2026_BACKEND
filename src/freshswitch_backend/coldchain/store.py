@@ -128,6 +128,16 @@ def _foreign_device(device_id: str) -> str:
     return f"다른 조직에 등록된 장치입니다: {device_id}"
 
 
+def _binding_mismatch(item: ReadingIn, binding: Binding | None) -> str | None:
+    if binding is None:
+        return f"장치가 컨테이너에 연결되어 있지 않습니다: {item.device_id}"
+    if item.container_id is not None and item.container_id != binding.container_id:
+        return f"장치에 연결된 컨테이너({binding.container_id})와 다릅니다: {item.container_id}"
+    if item.plan_id is not None and item.plan_id != binding.plan_id:
+        return f"장치에 연결된 계획과 다릅니다: {item.plan_id}"
+    return None
+
+
 def _record_key(plan_id: str | None, container_id: str, org_id: str = DEMO_ORG) -> str:
     if plan_id:
         return f"{plan_id}:{container_id}"
@@ -488,11 +498,15 @@ class ColdchainStore:
             open_actions=sum(1 for a in record.alerts.values() if a.action is not None),
         )
 
-    def ingest(self, items: list[ReadingIn], org_id: str = DEMO_ORG) -> IngestResult:
+    def ingest(
+        self, items: list[ReadingIn], org_id: str = DEMO_ORG, bound_only: bool = False
+    ) -> IngestResult:
         with self._lock, self._db.begin() as db:
-            return self._ingest(db, items, org_id)
+            return self._ingest(db, items, org_id, bound_only)
 
-    def _ingest(self, db: Session, items: list[ReadingIn], org_id: str) -> IngestResult:
+    def _ingest(
+        self, db: Session, items: list[ReadingIn], org_id: str, bound_only: bool = False
+    ) -> IngestResult:
         accepted = 0
         duplicates = 0
         rejected: list[IngestRejected] = []
@@ -518,6 +532,14 @@ class ColdchainStore:
             if item.device_id not in bindings:
                 bindings[item.device_id] = self._binding(db, item.device_id, org_id)
             binding = bindings[item.device_id]
+            if bound_only:
+                reason = _binding_mismatch(item, binding)
+                if reason is not None:
+                    rejected.append(
+                        IngestRejected(index=index, device_id=item.device_id, reason=reason)
+                    )
+                    continue
+                item = item.model_copy(update={"container_id": None, "plan_id": None})
             container_id = item.container_id or (binding.container_id if binding else None)
             if container_id is None:
                 rejected.append(

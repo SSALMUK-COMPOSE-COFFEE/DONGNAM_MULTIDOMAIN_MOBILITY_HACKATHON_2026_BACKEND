@@ -4,12 +4,18 @@ import time
 from collections.abc import AsyncIterator, Iterable
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 
-from freshswitch_backend.api.auth import OptionalPrincipal, Principal, current_org_id
+from freshswitch_backend.api.auth import (
+    OptionalPrincipal,
+    Principal,
+    app_settings,
+    current_org_id,
+    current_principal,
+)
 from freshswitch_backend.api.saas_access import plan_for
 from freshswitch_backend.coldchain import ColdchainError, DeviceDenied, NotFound, coldchain_store
 from freshswitch_backend.coldchain.devices import device_store, is_simulator_device
@@ -32,7 +38,9 @@ from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.tables import DEMO_ORG, ShipperProfileRow
 
 DEVICE_TOKEN_HEADER = "X-Device-Token"
+STREAM_RECHECK_SECONDS = 5.0
 UNREGISTERED_DEVICE = "등록되지 않은 장치입니다. 조직 기기로 먼저 등록하세요"
+REGISTERED_DEVICE_REQUIRED = "조직에 등록된 장치와 X-Device-Token이 필요합니다"
 
 router = APIRouter(prefix="/coldchain", tags=["coldchain"])
 OrgId = Annotated[str, Depends(current_org_id)]
@@ -137,12 +145,19 @@ def _device_org(device_id: str, org_id: str, principal: Principal | None) -> Non
         raise HTTPException(status_code=403, detail=f"다른 조직에 등록된 장치입니다: {device_id}")
 
 
-def _ingest_org(items: list[ReadingIn], token: str | None, principal: Principal | None) -> str:
+def _ingest_org(
+    items: list[ReadingIn],
+    token: str | None,
+    principal: Principal | None,
+    saas_mode: bool = False,
+) -> str:
     device_ids = {item.device_id for item in items}
     owners = device_store.owners(device_ids)
     if not owners:
         if principal is not None:
             raise HTTPException(status_code=422, detail=UNREGISTERED_DEVICE)
+        if saas_mode:
+            raise HTTPException(status_code=401, detail=REGISTERED_DEVICE_REQUIRED)
         return DEMO_ORG
     if not token:
         raise HTTPException(status_code=401, detail="등록된 장치는 X-Device-Token이 필요합니다")
@@ -181,6 +196,7 @@ def list_bindings(org_id: OrgId) -> list[Binding]:
 @router.post("/readings")
 def ingest(
     body: list[ReadingIn] | ReadingIn,
+    request: Request,
     principal: OptionalPrincipal,
     device_token: Annotated[str | None, Header(alias=DEVICE_TOKEN_HEADER)] = None,
 ) -> IngestResult:
@@ -189,8 +205,8 @@ def ingest(
         raise HTTPException(status_code=422, detail="측정값이 없습니다")
     if len(items) > 2000:
         raise HTTPException(status_code=422, detail="한 번에 2,000건까지 보낼 수 있습니다")
-    org_id = _ingest_org(items, device_token, principal)
-    result = coldchain_store.ingest(items, org_id)
+    org_id = _ingest_org(items, device_token, principal, app_settings(request).saas_mode)
+    result = coldchain_store.ingest(items, org_id, bound_only=org_id != DEMO_ORG)
     if org_id != DEMO_ORG:
         device_store.touch({item.device_id for item in items})
     if result.accepted == 0 and result.duplicates == 0:
@@ -249,9 +265,28 @@ def read_alerts(
     return coldchain_store.alerts(since, container_id, limit, plan_id, scope.org_id)
 
 
+def still_allowed(request: Request, principal: Principal | None, plan_id: str | None) -> bool:
+    if principal is None:
+        return True
+    try:
+        current = current_principal(request)
+        if current is None or (current.user_id, current.org_id) != (
+            principal.user_id,
+            principal.org_id,
+        ):
+            return False
+        if plan_id is not None:
+            plan_for(plan_id, current)
+    except HTTPException:
+        return False
+    return True
+
+
 @router.get("/alerts/stream")
 async def stream_alerts(
+    request: Request,
     scope: Scope,
+    principal: OptionalPrincipal,
     since: int = Query(0, ge=0),
     container_id: str | None = None,
     timeout: float = Query(300, ge=0, le=3600),
@@ -260,7 +295,12 @@ async def stream_alerts(
     async def events() -> AsyncIterator[str]:
         cursor = since
         deadline = time.monotonic() + timeout
+        recheck_at = time.monotonic() + STREAM_RECHECK_SECONDS
         while True:
+            if principal is not None and time.monotonic() >= recheck_at:
+                recheck_at = time.monotonic() + STREAM_RECHECK_SECONDS
+                if not await run_in_threadpool(still_allowed, request, principal, plan_id):
+                    break
             feed = await run_in_threadpool(
                 coldchain_store.alerts, cursor, container_id, 1000, plan_id, scope.org_id
             )
