@@ -2,7 +2,7 @@ from collections.abc import Iterable
 
 from pydantic import BaseModel
 
-from freshswitch_backend.domain.models import Plan, Scenario
+from freshswitch_backend.domain.models import DEFAULT_PALLET_KG, Plan, Scenario
 from freshswitch_backend.optimize.settlement import uses_usage_fee
 
 FACTOR_SOURCE_URL = (
@@ -70,7 +70,7 @@ def avoided_emissions(plans: Iterable[tuple[Scenario, Plan]]) -> EmissionResult:
                 skipped += pallets
                 continue
             product = products.get(product_of[lot_id])
-            tonnes = pallets * (product.pallet_kg if product else 415) / 1000
+            tonnes = pallets * (product.net_pallet_kg if product else DEFAULT_PALLET_KG) / 1000
             air = tonnes * (AIR_KM[destination] * AIR_G_PER_TKM + air_truck_km * ROAD_G_PER_TKM)
             sea = tonnes * (SEA_KM[destination] * SEA_G_PER_TKM + SEA_TRUCKING_KM * ROAD_G_PER_TKM)
             row = totals.setdefault(destination, [0, 0.0, 0.0, 0.0])

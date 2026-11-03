@@ -86,7 +86,7 @@ class CostModel:
         return self.products[lot.product_id]
 
     def lot_kg(self, lot: Lot) -> float:
-        return lot.pallets * self.product(lot).pallet_kg
+        return lot.pallets * self.product(lot).net_pallet_kg
 
     def lot_value(self, lot: Lot) -> float:
         rate = self.params.for_product(lot.product_id).value_per_kg_krw.value
@@ -178,7 +178,7 @@ class CostModel:
 
     def value_per_pallet(self, lot: Lot) -> float:
         rate = self.params.for_product(lot.product_id).value_per_kg_krw.value
-        return self.product(lot).pallet_kg * rate
+        return self.product(lot).net_pallet_kg * rate
 
     def delay_wait_days(self, lot: Lot, voyage: Voyage, pull_forward_days: int = 0) -> int:
         if voyage.original_etd is None:
@@ -190,7 +190,7 @@ class CostModel:
     def tariff_air_cost(self, lot: Lot) -> LotCost:
         t = self.tariff(lot)
         n = lot.pallets
-        kg = self.product(lot).pallet_kg
+        kg = self.product(lot).net_pallet_kg
         freight = t.air_freight.value + (self.air_rate_per_kg - t.air_rate_basis_per_kg.value) * kg
         delta = self.params.loss_delta(lot.product_id, lot.destination, "air")
         loss = n * t.air_loss_risk.value + self.lot_value(lot) * delta

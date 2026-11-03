@@ -4,7 +4,14 @@ from datetime import datetime, timedelta
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from freshswitch_backend.domain.models import KST, Plan, Product, Scenario, Voyage
+from freshswitch_backend.domain.models import (
+    DEFAULT_PALLET_KG,
+    KST,
+    Plan,
+    Product,
+    Scenario,
+    Voyage,
+)
 from freshswitch_backend.execution.params import ExecutionParams
 
 MOCK_OWNER_CODE = "FRSU"
@@ -15,7 +22,6 @@ MOCK_NOTE = (
 CONTAINER_NO_PATTERN = re.compile(r"[A-Z]{3}[UJZ]\d{7}")
 BOOKING_NO_PATTERN = re.compile(r"[A-Z0-9][A-Z0-9-]{3,29}")
 SEAL_NO_PATTERN = re.compile(r"[A-Z0-9][A-Z0-9-]{3,19}")
-DEFAULT_PALLET_KG = Product.model_fields["pallet_kg"].default
 ISO6346_LETTERS = {
     letter: value
     for letter, value in zip(
@@ -398,8 +404,8 @@ def build_execution_card(
         for a in assignments:
             lot = lots.get(a.lot_id)
             product = products.get(lot.product_id) if lot else None
-            net += a.pallets * (product.pallet_kg if product else DEFAULT_PALLET_KG)
-            if product is None or "pallet_kg" not in product.model_fields_set:
+            net += a.pallets * (product.net_pallet_kg if product else DEFAULT_PALLET_KG)
+            if product is None or product.pallet_kg is None:
                 net_assumed = True
         pallets = sum(a.pallets for a in assignments)
         found = [products[pid] for pid in load.product_ids if pid in products]

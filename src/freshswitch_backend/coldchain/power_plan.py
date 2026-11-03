@@ -187,6 +187,7 @@ def genset_candidates(lots: Iterable[LotPowerPlan]) -> list[GensetCandidate]:
                 unpowered_minutes=minutes,
                 threshold_minutes=members[0].threshold_minutes,
                 reason=reason,
+                gate_peak=peak,
             )
         )
     return out

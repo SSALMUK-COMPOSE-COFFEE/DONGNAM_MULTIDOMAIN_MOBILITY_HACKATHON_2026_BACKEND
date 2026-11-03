@@ -244,7 +244,7 @@ def _assumed(source: str) -> bool:
 def tariff_sheet(model: CostModel, product_id: str, tariff: PalletTariff) -> TariffSheet:
     product = model.products[product_id]
     rate_shift = model.air_rate_per_kg - tariff.air_rate_basis_per_kg.value
-    air_freight = round(tariff.air_freight.value + rate_shift * product.pallet_kg)
+    air_freight = round(tariff.air_freight.value + rate_shift * product.net_pallet_kg)
     rows = (
         ("freight", "운임", tariff.air_freight, air_freight, tariff.sea_freight),
         ("inland", "내륙·장비·보관", tariff.air_inland, None, tariff.sea_inland),

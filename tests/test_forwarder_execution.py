@@ -8,6 +8,7 @@ from test_saas_api import REDUCE
 
 from freshswitch_backend.api.saas_forwarder import _card
 from freshswitch_backend.coldchain.power_plan import power_plan
+from freshswitch_backend.domain.models import Product, Scenario
 from freshswitch_backend.execution.card import build_execution_card
 from freshswitch_backend.execution.orders import (
     PLAIN_GLOSSARY,
@@ -167,3 +168,67 @@ def test_peak_gate_makes_genset_line(client: TestClient) -> None:
     assert all(set(line.lot_ids) <= mine for line in scoped)
     others = {x for x, sid in lots.items() if sid != owner}
     assert not any(x in line.text for line in scoped for x in others)
+
+
+def _swap_requests():
+    cancel = _request("booking_cancel", 17, 0).model_copy(
+        update={"request_id": "REQ-A", "container_id": "CA-01"}
+    )
+    new = _request("booking_new", 0, 17).model_copy(
+        update={"request_id": "REQ-B", "container_id": "CA-02"}
+    )
+    return [cancel, new]
+
+
+def test_container_swap_with_same_count_is_si_vgm_correction() -> None:
+    swapped = saas_requests("plan-x", _swap_requests(), _scenario())
+    for request in swapped:
+        assert request.document_action == "si_vgm_correction"
+        assert request.document_action_label == "SI·VGM 정정"
+        assert request.plain_text == PLAIN_TEXT["si_vgm_correction"]
+        assert request.text.startswith("[SI 정정 + VGM 재제출 요청]")
+        assert "컨테이너 CA-01→CA-02 교체" in request.text
+        assert "부킹 변경" not in request.text
+
+
+def test_container_swap_with_different_kind_is_booking_change() -> None:
+    scenario = _scenario()
+    containers = [
+        c.model_copy(update={"kind": "40RH"}) if c.id == "CA-02" else c for c in scenario.containers
+    ]
+    scenario = scenario.model_copy(update={"containers": containers})
+    swapped = saas_requests("plan-x", _swap_requests(), scenario)
+    for request in swapped:
+        assert request.document_action == "booking_change"
+        assert request.text.startswith("[부킹 변경 요청")
+        assert request.plain_text == PLAIN_TEXT[request.kind]
+
+
+def test_genset_line_does_not_repeat_reason(client: TestClient) -> None:
+    plan_id = client.post("/api/plans", json={"scenario_id": "default"}).json()["plan_id"]
+    session = store.get(plan_id)
+    assert session is not None
+    peak = _with_peak(session, session.routes[0].pickup.routes[0].truck_id)
+    candidates = power_plan(peak).candidates
+    assert any(c.gate_peak for c in candidates)
+    lines = genset_instructions(candidates, _card(peak))
+    for line, candidate in zip(lines, candidates, strict=True):
+        assert "근거" not in line.text
+        assert line.text.count("무전원 예상") == 1
+        assert line.text.endswith("게이트 혼잡 시간대 도착.") == candidate.gate_peak
+        assert line.text == line.text.rstrip()
+
+
+def test_missing_pallet_kg_stays_assumed_after_round_trip() -> None:
+    scenario = _scenario()
+    products = [
+        Product.model_validate({k: v for k, v in p.model_dump().items() if k != "pallet_kg"})
+        for p in scenario.products
+    ]
+    scenario = scenario.model_copy(update={"products": products})
+    loaded = Scenario.model_validate(scenario.model_dump(mode="json"))
+    plan = _mixed_plan(loaded, {"lot-jinju-sb-1": 8, "lot-sancheong-sb-1": 5})
+    weight = build_execution_card("plan-x", 1, loaded, plan).containers[0].weight
+    net = next(item for item in weight.items if item.name == "화물 순중량")
+    assert net.assumed is True
+    assert net.kg == 13 * 415

@@ -363,6 +363,7 @@ class GensetCandidate(BaseModel):
     unpowered_minutes: float
     threshold_minutes: float
     reason: str
+    gate_peak: bool = False
 
 
 class PowerPlan(BaseModel):

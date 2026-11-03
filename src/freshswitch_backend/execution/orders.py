@@ -6,9 +6,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import TYPE_CHECKING
 
-from freshswitch_backend.domain.models import KST, Lot, Plan, Scenario
+from freshswitch_backend.domain.models import DEFAULT_PALLET_KG, KST, Lot, Plan, Scenario
 from freshswitch_backend.execution.card import (
-    DEFAULT_PALLET_KG,
     ExecutionCard,
     GensetInstruction,
     cutoff_timeline,
@@ -123,7 +122,7 @@ class _Ctx:
     def kg(self, lot_id: str, pallets: int) -> int:
         lot = self.lot(lot_id)
         product = self.products.get(lot.product_id) if lot else None
-        return round(pallets * (product.pallet_kg if product else 415))
+        return round(pallets * (product.net_pallet_kg if product else DEFAULT_PALLET_KG))
 
 
 def _composition(plan: Plan, container_id: str) -> dict[str, int]:
@@ -658,14 +657,39 @@ def container_count_delta(request: ExternalRequest) -> int:
     return CONTAINER_COUNT_DELTA.get(request.kind, 0)
 
 
-def document_action(request: ExternalRequest) -> DocumentAction | None:
+def container_swaps(
+    requests: list[ExternalRequest], scenario: Scenario
+) -> dict[int, tuple[str, str]]:
+    kinds = {c.id: c.kind for c in scenario.containers}
+    groups: dict[tuple[str | None, str | None], list[int]] = defaultdict(list)
+    for i, r in enumerate(requests):
+        if r.kind in SAAS_REQUEST_KINDS:
+            groups[(r.voyage_id, kinds.get(r.container_id or ""))].append(i)
+    swaps: dict[int, tuple[str, str]] = {}
+    for (_, kind), members in groups.items():
+        if kind is None or sum(container_count_delta(requests[i]) for i in members) != 0:
+            continue
+        cancels = [i for i in members if requests[i].kind == "booking_cancel"]
+        news = [i for i in members if requests[i].kind == "booking_new"]
+        for old, new in zip(cancels, news, strict=True):
+            pair = (requests[old].container_id or "", requests[new].container_id or "")
+            swaps[old] = pair
+            swaps[new] = pair
+    return swaps
+
+
+def document_action(
+    request: ExternalRequest, swap: tuple[str, str] | None = None
+) -> DocumentAction | None:
     if request.kind not in SAAS_REQUEST_KINDS:
         return None
-    return "si_vgm_correction" if container_count_delta(request) == 0 else "booking_change"
+    if swap is not None or container_count_delta(request) == 0:
+        return "si_vgm_correction"
+    return "booking_change"
 
 
-def plain_text(request: ExternalRequest) -> str:
-    if document_action(request) == "si_vgm_correction":
+def plain_text(request: ExternalRequest, swap: tuple[str, str] | None = None) -> str:
+    if document_action(request, swap) == "si_vgm_correction":
         return PLAIN_TEXT["si_vgm_correction"]
     if request.kind == "reefer_plug" and request.text.startswith("[리퍼 전원 연결 연장"):
         return PLAIN_TEXT["reefer_plug_extension"]
@@ -680,7 +704,7 @@ def _net_per_pallet(scenario: Scenario, lot_ids: list[str]) -> float:
         if lot.id not in lot_ids:
             continue
         product = products.get(lot.product_id)
-        weighted += lot.pallets * (product.pallet_kg if product else DEFAULT_PALLET_KG)
+        weighted += lot.pallets * (product.net_pallet_kg if product else DEFAULT_PALLET_KG)
         pallets += lot.pallets
     return weighted / pallets if pallets else DEFAULT_PALLET_KG
 
@@ -692,7 +716,7 @@ def _net_kg(scenario: Scenario, composition: dict[str, int]) -> float:
     for lot_id, pallets in composition.items():
         lot = lots.get(lot_id)
         product = products.get(lot.product_id) if lot else None
-        total += pallets * (product.pallet_kg if product else DEFAULT_PALLET_KG)
+        total += pallets * (product.net_pallet_kg if product else DEFAULT_PALLET_KG)
     return total
 
 
@@ -716,13 +740,14 @@ def saas_request_text(
     request: ExternalRequest,
     scenario: Scenario,
     params: ExecutionParams | None = None,
+    swap: tuple[str, str] | None = None,
 ) -> str:
     p = params or ExecutionParams()
     voyages = {v.id: v for v in scenario.voyages}
     containers = {c.id: c for c in scenario.containers}
     voyage = voyages.get(request.voyage_id or "")
     container = containers.get(request.container_id or "")
-    action = document_action(request)
+    action = document_action(request, swap)
     if action is None or voyage is None or container is None:
         return request.text
     ports = {port.id: port.name for port in scenario.ports}
@@ -751,6 +776,17 @@ def saas_request_text(
         f"SI 마감 {fmt(cutoffs.si_cutoff)}, VGM 마감 {fmt(cutoffs.vgm_cutoff)}, "
         f"CY 반입 마감 {fmt(cutoffs.cy_cutoff)}"
     )
+    if swap is not None:
+        source, target = swap
+        return (
+            f"[SI 정정 + VGM 재제출 요청] {head} 부킹 {mock_booking_no(plan_id, source)}(모의) "
+            f"컨테이너 {source}→{target} 교체({container.kind}), 컨테이너 수·종류가 같아 "
+            f"부킹은 그대로 둡니다. 이 요청 대상 {cid} 적재 {pb}→{pa}파렛트, 화물 총중량 "
+            f"{gb:,}→{ga:,}kg(순중량 + 파렛트·포장)으로 SI 정정하고 VGM "
+            f"{vgm_kg(gb, p) if pb else 0:,}→{vgm_kg(ga, p) if pa else 0:,}kg"
+            f"(컨테이너 자중 {tare:,.0f}kg 포함)으로 재제출합니다. 대상 출하: {lots}. "
+            f"{timeline}. 회신 기한 {fmt(request.deadline)}."
+        )
     if action == "si_vgm_correction":
         return (
             f"[SI 정정 + VGM 재제출 요청] {head} 부킹 {booking}(모의)의 컨테이너 {cid}"
@@ -782,16 +818,18 @@ def saas_requests(
     scenario: Scenario,
     params: ExecutionParams | None = None,
 ) -> list[ExternalRequest]:
+    swaps = container_swaps(requests, scenario)
     out = []
-    for r in requests:
-        action = document_action(r)
+    for i, r in enumerate(requests):
+        swap = swaps.get(i)
+        action = document_action(r, swap)
         out.append(
             r.model_copy(
                 update={
-                    "text": saas_request_text(plan_id, r, scenario, params),
+                    "text": saas_request_text(plan_id, r, scenario, params, swap),
                     "document_action": action,
                     "document_action_label": DOCUMENT_ACTION_LABEL[action] if action else None,
-                    "plain_text": plain_text(r),
+                    "plain_text": plain_text(r, swap),
                 }
             )
         )
@@ -838,8 +876,8 @@ def genset_instructions(
                     f"로트 {', '.join(lot_ids)}: 무전원 예상 {window} "
                     f"{candidate.unpowered_minutes:.0f}분(기준 {candidate.threshold_minutes:.0f}분). "
                     f"{candidate.equipment}를 게이트 도착 전에 배정·연결합니다. "
-                    f"근거: {candidate.reason}"
-                ),
+                    + ("게이트 혼잡 시간대 도착." if candidate.gate_peak else "")
+                ).rstrip(),
                 plain_text=PLAIN_TEXT["genset"],
             )
         )

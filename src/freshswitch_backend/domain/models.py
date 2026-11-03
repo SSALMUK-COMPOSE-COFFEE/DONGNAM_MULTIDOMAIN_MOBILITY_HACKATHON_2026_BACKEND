@@ -4,6 +4,7 @@ from typing import Annotated, Literal
 from pydantic import AfterValidator, BaseModel, Field, model_validator
 
 KST = timezone(timedelta(hours=9))
+DEFAULT_PALLET_KG = 415.0
 
 
 def to_kst(value: datetime) -> datetime:
@@ -28,7 +29,11 @@ class Product(Sourced):
     co2_pct: float | None = None
     shelf_life_days: int
     so2_treated: bool = False
-    pallet_kg: float = 415
+    pallet_kg: float | None = None
+
+    @property
+    def net_pallet_kg(self) -> float:
+        return self.pallet_kg if self.pallet_kg is not None else DEFAULT_PALLET_KG
 
 
 class Packhouse(Sourced):
