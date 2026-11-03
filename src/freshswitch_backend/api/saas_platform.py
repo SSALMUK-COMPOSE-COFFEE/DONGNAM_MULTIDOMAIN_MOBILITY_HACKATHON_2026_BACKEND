@@ -56,14 +56,14 @@ class PlatformLot(RegisteredLot):
 class PlatformPlanRequest(BaseModel):
     scenario_id: str = "default"
     use_learned_loss: bool = False
-    lot_ids: list[str] = Field(default_factory=list)
+    lot_ids: list[StorableStr] = Field(default_factory=list)
     include_registered: bool = False
     auto_accept: bool = False
 
 
 class AddLotRequest(BaseModel):
-    lot_id: str = Field(min_length=1, max_length=120)
-    idempotency_key: str | None = Field(default=None, min_length=1, max_length=200)
+    lot_id: StorableStr = Field(min_length=1, max_length=120)
+    idempotency_key: StorableStr | None = Field(default=None, min_length=1, max_length=200)
 
 
 class PlanPreview(BaseModel):

@@ -1,7 +1,9 @@
+import json
 import logging
 import math
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from urllib.parse import unquote_plus
 
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
@@ -9,10 +11,14 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from psycopg.errors import UntranslatableCharacter
+from sqlalchemy.exc import DataError
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from freshswitch_backend.api.router import api_router
 from freshswitch_backend.coldchain import coldchain_store
 from freshswitch_backend.config import Settings, get_settings
+from freshswitch_backend.domain.inputs import UNSTORABLE_TEXT, storable
 from freshswitch_backend.observability import RequestAuditMiddleware
 from freshswitch_backend.persistence import database
 from freshswitch_backend.replan import ReplanError
@@ -44,6 +50,101 @@ async def _validation_error(_: Request, exc: RequestValidationError) -> JSONResp
     )
 
 
+async def _data_error(_: Request, exc: Exception) -> JSONResponse:
+    orig = getattr(exc, "orig", None)
+    if isinstance(orig, UntranslatableCharacter) or "cannot contain NUL" in str(orig):
+        return JSONResponse(status_code=422, content={"detail": UNSTORABLE_TEXT})
+    raise exc
+
+
+def _unstorable(text: str) -> bool:
+    try:
+        storable(text)
+    except ValueError:
+        return True
+    return False
+
+
+def _has_unstorable(value: object) -> bool:
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            if _unstorable(item):
+                return True
+        elif isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return False
+
+
+def _json_body(scope: Scope) -> bool:
+    content_type = next(
+        (v for k, v in scope.get("headers", []) if k.lower() == b"content-type"), None
+    )
+    if content_type is None:
+        return True
+    media = content_type.split(b";", 1)[0].strip().lower()
+    return media == b"application/json" or (
+        media.startswith(b"application/") and media.endswith(b"+json")
+    )
+
+
+class UnstorableTextGuard:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        query = unquote_plus(scope.get("query_string", b"").decode("latin-1"))
+        if "\x00" in scope["path"]:
+            await _reject("path")(scope, receive, send)
+            return
+        if "\x00" in query:
+            await _reject("query")(scope, receive, send)
+            return
+        if not _json_body(scope):
+            await self.app(scope, receive, send)
+            return
+        messages: list[Message] = []
+        body = b""
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message["type"] != "http.request":
+                break
+            body += message.get("body", b"")
+            if not message.get("more_body", False):
+                break
+        if body and _body_unstorable(body):
+            await _reject("body")(scope, receive, send)
+            return
+
+        async def replay() -> Message:
+            if messages:
+                return messages.pop(0)
+            return await receive()
+
+        await self.app(scope, replay, send)
+
+
+def _body_unstorable(body: bytes) -> bool:
+    try:
+        parsed = json.loads(body)
+    except (ValueError, RecursionError):
+        return False
+    return _has_unstorable(parsed)
+
+
+def _reject(where: str) -> JSONResponse:
+    detail = [{"type": "value_error", "loc": [where], "msg": UNSTORABLE_TEXT}]
+    return JSONResponse(status_code=422, content={"detail": detail})
+
+
 def _startup() -> None:
     database.init()
     coldchain_store.finish_orphan_runs()
@@ -71,6 +172,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url=f"{prefix}/openapi.json",
     )
     app.state.settings = settings
+    app.add_middleware(UnstorableTextGuard)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
@@ -82,6 +184,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(api_router, prefix=prefix)
     app.add_exception_handler(ReplanError, _replan_error)
     app.add_exception_handler(RequestValidationError, _validation_error)
+    app.add_exception_handler(DataError, _data_error)
     return app
 
 

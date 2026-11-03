@@ -7,6 +7,7 @@ from freshswitch_backend.api.auth import Principal, require_role
 from freshswitch_backend.api.compute_limits import compute_slot, replan_rate
 from freshswitch_backend.api.saas_access import org_shipper_ids, plan_for
 from freshswitch_backend.api.saas_views import replan_pending
+from freshswitch_backend.domain.inputs import StorableStr
 from freshswitch_backend.notifications import notify_plan_confirmation
 from freshswitch_backend.persistence.orgs import org_sandbox
 from freshswitch_backend.planning.store import (
@@ -33,8 +34,8 @@ SANDBOX_ONLY = "전원 자동 수락은 데모(sandbox) 조직에서만 쓸 수 
 
 class ConfirmationDecision(BaseModel):
     accept: bool
-    reason: str | None = Field(default=None, max_length=500)
-    shipper_id: str | None = Field(default=None, max_length=100)
+    reason: StorableStr | None = Field(default=None, max_length=500)
+    shipper_id: StorableStr | None = Field(default=None, max_length=100)
 
     @model_validator(mode="after")
     def _reason(self) -> "ConfirmationDecision":
