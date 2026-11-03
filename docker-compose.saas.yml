@@ -1,10 +1,19 @@
 name: freshswitch-saas
 
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   api:
+    image: freshswitch-saas-api:${API_TAG:-latest}
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        GIT_COMMIT: ${API_TAG:-}
     env_file: .env.saas
     environment:
       POSTGRES_HOST: db
@@ -19,6 +28,7 @@ services:
         restart: true
     ports:
       - "127.0.0.1:18106:8000"
+    logging: *logging
 
   db:
     image: postgres:17-alpine
@@ -46,6 +56,7 @@ services:
       timeout: 3s
       retries: 20
       start_period: 10s
+    logging: *logging
 
 volumes:
   pgdata:
