@@ -30,6 +30,7 @@ RequestKind = Literal[
 CounterpartyRole = Literal["carrier", "terminal", "airline"]
 RequestStatus = Literal["pending", "accepted", "declined"]
 Actor = Literal["shipper", "forwarder", "system"]
+CandidateSource = Literal["shipper_rejected", "request_declined"]
 
 TERMINAL_STATUSES: tuple[OrderStatus, ...] = ("executed", "rejected", "expired")
 
@@ -131,3 +132,19 @@ class ConfirmRequest(BaseModel):
 class RequestResultBody(BaseModel):
     accepted: bool
     note: str | None = None
+
+
+class ReplanCandidate(BaseModel):
+    id: str
+    source: CandidateSource
+    created_at: datetime
+    lot_ids: list[str] = Field(default_factory=list)
+    voyage_id: str | None = None
+    container_id: str | None = None
+    shipper_id: str | None = None
+    order_id: str | None = None
+    request_id: str | None = None
+    request_kind: RequestKind | None = None
+    counterparty: str | None = None
+    note: str | None = None
+    events: list[Event] = Field(default_factory=list)

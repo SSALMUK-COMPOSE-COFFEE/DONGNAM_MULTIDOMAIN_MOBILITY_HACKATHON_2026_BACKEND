@@ -1,6 +1,7 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
@@ -9,15 +10,20 @@ from freshswitch_backend.api.compute_limits import (
     cache_key,
     check_lot_count,
     check_preview_rate,
+    compute_slot,
     preview_cache,
     preview_deadline,
     run_bounded,
 )
 from freshswitch_backend.api.plans import (
     CreatePlanRequest,
+    EventRequest,
+    ReplanResponse,
     create_tenant_plan,
+    post_event,
     tenant_plan_scenario,
 )
+from freshswitch_backend.api.saas_plan_confirm import require_sandbox
 from freshswitch_backend.api.saas_views import (
     PlanListItem,
     PlatformSettlement,
@@ -27,12 +33,13 @@ from freshswitch_backend.api.saas_views import (
 )
 from freshswitch_backend.domain.models import Plan, Scenario
 from freshswitch_backend.intake.tenants import load_catalog
-from freshswitch_backend.lots import ANY_ORG, LotStatus, RegisteredLot
+from freshswitch_backend.lots import ANY_ORG, LotStatus, LotUnavailable, RegisteredLot
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.orgs import same_sandbox
 from freshswitch_backend.persistence.tables import LotRow, OrganizationRow, PlanRow
 from freshswitch_backend.planning.service import VoyagePickup, build_plan
-from freshswitch_backend.planning.store import PlanSession
+from freshswitch_backend.planning.store import ContainerBooked, PlanSession, store
+from freshswitch_backend.replan import AddLotEvent
 
 router = APIRouter(prefix="/saas/platform", tags=["saas-platform"])
 
@@ -49,6 +56,12 @@ class PlatformPlanRequest(BaseModel):
     use_learned_loss: bool = False
     lot_ids: list[str] = Field(default_factory=list)
     include_registered: bool = False
+    auto_accept: bool = False
+
+
+class AddLotRequest(BaseModel):
+    lot_id: str = Field(min_length=1, max_length=120)
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class PlanPreview(BaseModel):
@@ -93,8 +106,85 @@ def list_lots(
 
 @router.post("/plans", status_code=status.HTTP_201_CREATED)
 def create_plan(body: PlatformPlanRequest, principal: PlatformPrincipal) -> PlanSession:
-    request = CreatePlanRequest(**body.model_dump())
-    return create_tenant_plan(request, principal.org_id)
+    if body.auto_accept:
+        require_sandbox(principal)
+    request = CreatePlanRequest(**body.model_dump(exclude={"auto_accept"}))
+    if not body.auto_accept:
+        return create_tenant_plan(request, principal.org_id)
+    scenario, registered_ids = tenant_plan_scenario(request, principal.org_id)
+    try:
+        with compute_slot():
+            return store.create(
+                scenario,
+                registered_ids,
+                org_id=principal.org_id,
+                lot_org_id=ANY_ORG,
+                exclusive=True,
+                auto_accept=True,
+            )
+    except LotUnavailable as exc:
+        raise HTTPException(
+            status_code=409, detail=f"이미 계획에 들어갔거나 그사이 바뀐 출하입니다: {exc}"
+        ) from exc
+    except ContainerBooked as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"그사이 다른 계획이 컨테이너를 배정했습니다: {', '.join(exc.container_ids)}",
+        ) from exc
+
+
+def _registered_lot(lot_id: str, principal: Principal) -> RegisteredLot | None:
+    with database.begin() as db:
+        row = db.scalars(
+            select(LotRow)
+            .join(OrganizationRow, OrganizationRow.id == LotRow.shipper_org_id)
+            .where(
+                LotRow.id == lot_id,
+                OrganizationRow.type == "shipper",
+                same_sandbox(OrganizationRow.sandbox, principal.org_id),
+            )
+        ).first()
+        return RegisteredLot.model_validate(row, from_attributes=True) if row else None
+
+
+def _addable(session: PlanSession, body: AddLotRequest, principal: Principal) -> AddLotEvent:
+    row = _registered_lot(body.lot_id, principal)
+    if row is None:
+        raise HTTPException(status_code=404, detail="등록된 출하를 찾을 수 없습니다")
+    if any(lot.id == row.id for lot in session.scenario.lots):
+        raise HTTPException(status_code=409, detail="이미 이 계획에 들어 있는 출하입니다")
+    if row.status != "registered":
+        raise HTTPException(status_code=409, detail="이미 다른 계획에 들어갔거나 취소된 출하입니다")
+    if row.scenario_id != session.scenario_id:
+        raise HTTPException(status_code=422, detail="다른 시나리오에 등록된 출하입니다")
+    lot = row.to_lot()
+    scenario = session.scenario
+    if lot.shipper_id not in {s.id for s in scenario.shippers}:
+        raise HTTPException(
+            status_code=422,
+            detail="계획을 만든 뒤 가입한 화주의 출하입니다. 새 계획으로 묶으세요",
+        )
+    if lot.product_id not in {p.id for p in scenario.products} or lot.destination not in {
+        p.id for p in scenario.ports
+    }:
+        raise HTTPException(status_code=422, detail="이 계획 시나리오에 없는 품목·항구입니다")
+    check_lot_count(len(scenario.lots) + 1)
+    return AddLotEvent(lot=lot)
+
+
+@router.post("/plans/{plan_id}/add-lot")
+async def add_registered_lot(
+    plan_id: str,
+    body: AddLotRequest,
+    principal: PlatformPrincipal,
+    llm: Annotated[bool | None, Query()] = None,
+) -> ReplanResponse:
+    session = await run_in_threadpool(store.get, plan_id, principal.org_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")
+    event = await run_in_threadpool(_addable, session, body, principal)
+    request = EventRequest(event=event, idempotency_key=body.idempotency_key)
+    return await post_event(plan_id, request, org_id=principal.org_id, llm=llm)
 
 
 def _compute_preview(scenario: Scenario, deadline: float) -> PlanPreview:
@@ -110,13 +200,13 @@ def preview_plan(
     deadline = preview_deadline()
     check_lot_count(len(dict.fromkeys(body.lot_ids)))
     scenario, registered_ids = tenant_plan_scenario(
-        CreatePlanRequest(**body.model_dump()), principal.org_id
+        CreatePlanRequest(**body.model_dump(exclude={"auto_accept"})), principal.org_id
     )
     key = cache_key(
         {
             "org_id": principal.org_id,
             "lot_ids": sorted(registered_ids),
-            "options": body.model_dump(exclude={"lot_ids"}),
+            "options": body.model_dump(exclude={"lot_ids", "auto_accept"}),
             "scenario": scenario.model_dump(mode="json"),
         }
     )

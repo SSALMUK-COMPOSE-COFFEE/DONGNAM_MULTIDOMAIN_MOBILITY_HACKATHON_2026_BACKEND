@@ -207,10 +207,36 @@ class PlanRow(Base):
     updated_at: Mapped[datetime]
     payload: Mapped[Json]
     committed: Mapped[Json]
+    confirmation_round: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    needs_replan: Mapped[bool] = mapped_column(server_default=text("false"))
+    replan_candidates: Mapped[list[Any]] = mapped_column(server_default=text("'[]'::jsonb"))
 
 
 def _plan_fk() -> ForeignKey:
     return ForeignKey("plan_sessions.plan_id", ondelete="CASCADE")
+
+
+class PlanConfirmationRow(Base):
+    __tablename__ = "plan_shipper_confirmations"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'accepted', 'rejected')",
+            name="plan_shipper_confirmations_status_check",
+        ),
+        Index("ix_plan_shipper_confirmations_org_status", "shipper_org_id", "status"),
+    )
+
+    plan_id: Mapped[str] = mapped_column(String(64), _plan_fk(), primary_key=True)
+    round: Mapped[int] = mapped_column(Integer, primary_key=True)
+    shipper_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    shipper_org_id: Mapped[str] = mapped_column(String(64), _org_fk("CASCADE"))
+    lot_ids: Mapped[list[Any]]
+    status: Mapped[str] = mapped_column(String(20), server_default="pending")
+    reason: Mapped[str | None] = mapped_column(String(500))
+    auto_accepted: Mapped[bool] = mapped_column(server_default=text("false"))
+    decided_by: Mapped[str | None] = mapped_column(String(64), _user_fk("SET NULL"))
+    created_at: Mapped[datetime]
+    decided_at: Mapped[datetime | None]
 
 
 class PlanForwarderRow(Base):
