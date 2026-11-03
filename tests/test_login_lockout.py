@@ -2,7 +2,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from freshswitch_backend.api import auth
-from freshswitch_backend.api.auth import LoginFailureGuard, RateRule, SlidingWindowLimiter
+from freshswitch_backend.api.auth import (
+    EmailFailureWindow,
+    LoginFailureGuard,
+    RateRule,
+    SlidingWindowLimiter,
+)
 from freshswitch_backend.config import get_settings
 from freshswitch_backend.main import create_app
 
@@ -30,6 +35,7 @@ def saas_app():
 def clock(saas_app) -> FakeClock:
     clock = FakeClock()
     saas_app.state.login_failure_guard = LoginFailureGuard(clock=clock)
+    saas_app.state.login_email_guard = EmailFailureWindow(clock=clock)
     return clock
 
 
@@ -68,7 +74,8 @@ def test_repeated_failures_lock_email_with_retry_after(saas_app, clock, owner) -
     assert locked.status_code == 429
     assert locked.headers["Retry-After"] == str(int(auth.LOGIN_LOCK_SECONDS))
     assert locked.json()["detail"] == auth.LOGIN_LOCKED
-    assert _login(saas_app, EMAIL, PASSWORD, ip="7.7.7.7").status_code == 429
+    assert _login(saas_app, EMAIL, PASSWORD, ip="7.7.7.7").status_code == 200
+    assert _login(saas_app, EMAIL, PASSWORD).status_code == 429
     clock.now += auth.LOGIN_LOCK_SECONDS + 1
     assert _login(saas_app, EMAIL, PASSWORD).status_code == 200
     assert _fail(saas_app, EMAIL, 4) == [401] * 4
@@ -90,6 +97,46 @@ def test_lock_grows_after_each_failure_past_threshold(saas_app, clock, owner) ->
         _fail(saas_app, EMAIL, 1)
     capped = _login(saas_app, EMAIL, PASSWORD)
     assert capped.headers["Retry-After"] == str(int(auth.LOGIN_MAX_LOCK_SECONDS))
+
+
+def test_attacker_ip_lock_leaves_other_ips_usable(saas_app, clock, owner) -> None:
+    for _ in range(6):
+        assert _fail(saas_app, EMAIL, 1, ip="5.5.5.5") == [401]
+        clock.now += auth.LOGIN_MAX_LOCK_SECONDS + 1
+    assert _fail(saas_app, EMAIL, 1, ip="5.5.5.5") == [401]
+    assert _login(saas_app, EMAIL, PASSWORD, ip="5.5.5.5").status_code == 429
+    assert _login(saas_app, EMAIL, PASSWORD, ip="4.4.4.4").status_code == 200
+    assert _login(saas_app, EMAIL, PASSWORD, ip="5.5.5.5").status_code == 429
+
+
+def _spread(app, email: str, count: int) -> list[int]:
+    return [
+        _login(app, email, "wrong-password", ip=f"10.1.0.{n}").status_code for n in range(count)
+    ]
+
+
+def test_distributed_failures_lock_email_briefly(saas_app, clock, owner) -> None:
+    assert _spread(saas_app, EMAIL, auth.LOGIN_EMAIL_THRESHOLD) == [401] * 20
+    locked = _login(saas_app, EMAIL, PASSWORD, ip="10.1.0.0")
+    assert locked.status_code == 429
+    assert locked.headers["Retry-After"] == str(int(auth.LOGIN_EMAIL_LOCK_SECONDS))
+    assert locked.json()["detail"] == auth.LOGIN_LOCKED
+    assert _login(saas_app, EMAIL, PASSWORD, ip="3.3.3.3").status_code == 200
+    assert _spread(saas_app, EMAIL, auth.LOGIN_EMAIL_THRESHOLD) == [401] * 20
+    clock.now += auth.LOGIN_EMAIL_LOCK_SECONDS + 1
+    assert _login(saas_app, EMAIL, "wrong-password", ip="10.1.0.1").status_code == 401
+    assert _login(saas_app, EMAIL, PASSWORD, ip="10.1.0.2").status_code == 200
+
+
+def test_distributed_email_lock_does_not_grow(saas_app, clock, owner) -> None:
+    for _ in range(3):
+        _spread(saas_app, EMAIL, auth.LOGIN_EMAIL_THRESHOLD)
+        locked = _login(saas_app, EMAIL, PASSWORD, ip="10.1.0.5")
+        assert locked.status_code == 429
+        assert locked.headers["Retry-After"] == str(int(auth.LOGIN_EMAIL_LOCK_SECONDS))
+        clock.now += auth.LOGIN_EMAIL_LOCK_SECONDS + 1
+    _fail(saas_app, EMAIL, 1, ip="10.1.0.6")
+    assert _login(saas_app, EMAIL, PASSWORD, ip="10.1.0.6").status_code == 200
 
 
 def test_success_resets_failure_count(saas_app, clock, owner) -> None:
@@ -131,3 +178,5 @@ def test_default_login_rule_is_generous() -> None:
     rule = auth.AUTH_RATE_RULES[auth.LOGIN_ROUTE]
     assert rule.per_client >= 20
     assert auth.LOGIN_FAILURE_THRESHOLD >= 5
+    assert auth.LOGIN_EMAIL_THRESHOLD >= 4 * auth.LOGIN_FAILURE_THRESHOLD
+    assert auth.LOGIN_EMAIL_LOCK_SECONDS <= auth.LOGIN_LOCK_SECONDS

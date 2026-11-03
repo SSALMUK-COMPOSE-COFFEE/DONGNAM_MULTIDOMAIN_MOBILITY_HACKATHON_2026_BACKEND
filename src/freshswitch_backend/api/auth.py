@@ -48,6 +48,9 @@ LOGIN_FAILURE_THRESHOLD = 5
 LOGIN_LOCK_SECONDS = 60.0
 LOGIN_MAX_LOCK_SECONDS = 900.0
 LOGIN_FORGET_SECONDS = 3600.0
+LOGIN_EMAIL_THRESHOLD = 20
+LOGIN_EMAIL_WINDOW_SECONDS = 900.0
+LOGIN_EMAIL_LOCK_SECONDS = 60.0
 DEMO_SESSION_CAP = 5000
 DEMO_SESSION_TTL = timedelta(hours=12)
 TRUSTED_PROXIES_ENV = "TRUSTED_PROXIES"
@@ -162,6 +165,68 @@ class LoginFailureGuard:
                 lock = self._lock_seconds * 2 ** min(steps, 32)
                 entry.locked_until = now + min(lock, self._max_lock_seconds)
             return None
+
+    def seen(self, key: str) -> bool:
+        now = self._clock()
+        with self._lock:
+            entry = self._entries.get(key)
+            return entry is not None and entry.count > 0 and not self._stale(entry, now)
+
+    def succeed(self, key: str) -> None:
+        with self._lock:
+            self._entries.pop(key, None)
+
+
+@dataclass
+class _EmailFailures:
+    hits: deque[float]
+    locked_until: float = 0.0
+
+
+class EmailFailureWindow:
+    def __init__(
+        self,
+        threshold: int = LOGIN_EMAIL_THRESHOLD,
+        window_seconds: float = LOGIN_EMAIL_WINDOW_SECONDS,
+        lock_seconds: float = LOGIN_EMAIL_LOCK_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._threshold = threshold
+        self._window = window_seconds
+        self._lock_seconds = lock_seconds
+        self._clock = clock
+        self._entries: dict[str, _EmailFailures] = {}
+        self._lock = threading.Lock()
+
+    def _trim(self, entry: _EmailFailures, now: float) -> None:
+        while entry.hits and entry.hits[0] <= now - self._window:
+            entry.hits.popleft()
+
+    def _sweep(self, now: float) -> None:
+        for key, entry in list(self._entries.items()):
+            self._trim(entry, now)
+            if not entry.hits and entry.locked_until <= now:
+                del self._entries[key]
+
+    def locked(self, key: str) -> float | None:
+        now = self._clock()
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None or entry.locked_until <= now:
+                return None
+            return entry.locked_until - now
+
+    def record(self, key: str) -> None:
+        now = self._clock()
+        with self._lock:
+            if len(self._entries) > 10_000:
+                self._sweep(now)
+            entry = self._entries.setdefault(key, _EmailFailures(hits=deque()))
+            self._trim(entry, now)
+            entry.hits.append(now)
+            if len(entry.hits) >= self._threshold:
+                entry.locked_until = now + self._lock_seconds
+                entry.hits.clear()
 
     def succeed(self, key: str) -> None:
         with self._lock:
@@ -347,6 +412,16 @@ def login_guard(request: Request) -> LoginFailureGuard:
         if guard is None:
             guard = LoginFailureGuard()
             state.login_failure_guard = guard
+        return guard
+
+
+def login_email_guard(request: Request) -> EmailFailureWindow:
+    state = request.app.state
+    with _limiter_lock:
+        guard = getattr(state, "login_email_guard", None)
+        if guard is None:
+            guard = EmailFailureWindow()
+            state.login_email_guard = guard
         return guard
 
 
@@ -626,10 +701,17 @@ def signup(body: SignupRequest, request: Request, response: Response) -> Me:
 def login(body: LoginRequest, request: Request, response: Response) -> Me:
     limiter = auth_limiter(request)
     guard = login_guard(request)
+    email_guard = login_email_guard(request)
     client = client_address(request)
+    pair = f"{body.email}|{client}"
+    enforce_email = guard.seen(pair)
     retry = limiter.hit(LOGIN_ROUTE, client)
+    if retry is None and enforce_email:
+        retry = email_guard.locked(body.email)
     if retry is None:
-        retry = guard.attempt(body.email)
+        retry = guard.attempt(pair)
+    if retry is None:
+        email_guard.record(body.email)
     if retry is not None:
         raise HTTPException(status_code=429, detail=LOGIN_LOCKED, headers=_retry_after(retry))
     with database.begin() as db:
@@ -641,7 +723,8 @@ def login(body: LoginRequest, request: Request, response: Response) -> Me:
             raise HTTPException(status_code=401, detail=INVALID_LOGIN)
         me = _start_session(db, request, response, user)
     limiter.refund(LOGIN_ROUTE, client)
-    guard.succeed(body.email)
+    guard.succeed(pair)
+    email_guard.succeed(body.email)
     return me
 
 

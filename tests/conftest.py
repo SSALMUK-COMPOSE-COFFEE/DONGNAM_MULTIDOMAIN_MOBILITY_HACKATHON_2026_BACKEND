@@ -173,7 +173,13 @@ def frozen_clock():
 
 @pytest.fixture(autouse=True)
 def fresh_request_limits():
-    for name in ("auth_rate_limiter", "login_failure_guard", "replan_limiter"):
+    for name in (
+        "auth_rate_limiter",
+        "login_failure_guard",
+        "login_email_guard",
+        "replan_limiter",
+        "analysis_limiter",
+    ):
         setattr(app.state, name, None)
     yield
 
