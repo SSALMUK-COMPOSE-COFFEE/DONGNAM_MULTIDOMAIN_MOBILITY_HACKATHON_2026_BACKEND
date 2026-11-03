@@ -1,7 +1,8 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
 from freshswitch_backend.api import (
     analysis,
+    auth,
     coldchain,
     compare,
     demo,
@@ -9,6 +10,7 @@ from freshswitch_backend.api import (
     health,
     intake,
     lots,
+    me,
     plans,
     provenance,
     quality,
@@ -17,7 +19,7 @@ from freshswitch_backend.api import (
     vessels,
 )
 
-api_router = APIRouter(prefix="/api")
+api_router = APIRouter(dependencies=[Depends(auth.csrf_guard)])
 api_router.include_router(health.router)
 api_router.include_router(scenarios.router)
 api_router.include_router(plans.router)
@@ -32,3 +34,5 @@ api_router.include_router(settlement.router)
 api_router.include_router(coldchain.router)
 api_router.include_router(quality.router)
 api_router.include_router(provenance.router)
+api_router.include_router(auth.router)
+api_router.include_router(me.router)

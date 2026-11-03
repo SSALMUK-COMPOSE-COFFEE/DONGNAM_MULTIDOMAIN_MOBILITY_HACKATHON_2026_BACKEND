@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 
 from freshswitch_backend.api.router import api_router
 from freshswitch_backend.coldchain import coldchain_store
-from freshswitch_backend.config import get_settings
+from freshswitch_backend.config import Settings, get_settings
 from freshswitch_backend.observability import RequestAuditMiddleware
 from freshswitch_backend.persistence import database
 from freshswitch_backend.replan import ReplanError
@@ -36,24 +36,27 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     coldchain_store.stop_all()
 
 
-def create_app() -> FastAPI:
+def create_app(settings: Settings | None = None) -> FastAPI:
+    settings = settings or get_settings()
+    prefix = settings.api_prefix
     app = FastAPI(
         title="FreshSwitch API",
         lifespan=lifespan,
         version="0.1.0",
-        docs_url="/api/docs",
-        redoc_url="/api/redoc",
-        openapi_url="/api/openapi.json",
+        docs_url=f"{prefix}/docs",
+        redoc_url=f"{prefix}/redoc",
+        openapi_url=f"{prefix}/openapi.json",
     )
+    app.state.settings = settings
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=get_settings().cors_origins,
+        allow_origins=settings.cors_origins,
         allow_methods=["*"],
         allow_headers=["*"],
         expose_headers=["X-Request-ID"],
     )
     app.add_middleware(RequestAuditMiddleware)
-    app.include_router(api_router)
+    app.include_router(api_router, prefix=prefix)
     app.add_exception_handler(ReplanError, _replan_error)
     return app
 
