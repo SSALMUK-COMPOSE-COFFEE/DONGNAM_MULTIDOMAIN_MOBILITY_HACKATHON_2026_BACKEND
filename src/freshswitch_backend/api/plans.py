@@ -26,15 +26,16 @@ from freshswitch_backend.execution.models import (
     ExecutionOrder,
     RequestResultBody,
 )
+from freshswitch_backend.forecast.observations import planned_voyages, record_schedule_check
 from freshswitch_backend.intake.tenants import load_catalog, tenant_scenario
 from freshswitch_backend.integrations import (
     MAX_GAP_HOURS,
-    PlannedVoyage,
     ScheduleChange,
     VesselMovement,
     detect_schedule_changes,
 )
 from freshswitch_backend.lots import ANY_ORG, LotFilter, LotUnavailable, RegisteredLot, lot_store
+from freshswitch_backend.notifications import notify_order_confirmation
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.orgs import same_sandbox
 from freshswitch_backend.persistence.tables import DEMO_ORG, LotRow, OrganizationRow
@@ -376,12 +377,11 @@ async def post_event(
     )
 
 
-@router.post("/{plan_id}/apply")
-def apply_alternative(plan_id: str, body: ApplyRequest, org_id: OrgId) -> PlanSession:
+def apply_alternative(plan_id: str, body: ApplyRequest, org_id: str) -> PlanSession:
     _session(plan_id, org_id)
     key = body.idempotency_key
     try:
-        return store.apply(
+        session = store.apply(
             plan_id,
             body.alternative_id,
             body.replan_id,
@@ -396,6 +396,16 @@ def apply_alternative(plan_id: str, body: ApplyRequest, org_id: OrgId) -> PlanSe
         raise HTTPException(
             status_code=404, detail="재최적화 결과 또는 대안을 찾을 수 없습니다"
         ) from exc
+    return session
+
+
+@router.post("/{plan_id}/apply")
+def apply_and_notify(plan_id: str, body: ApplyRequest, org_id: OrgId) -> PlanSession:
+    session = apply_alternative(plan_id, body, org_id)
+    if org_id != DEMO_ORG and session.active_order_id is not None:
+        order = store.order(plan_id, session.active_order_id, org_id=org_id)
+        notify_order_confirmation(session, order, org_id, store.clock())
+    return session
 
 
 @router.get("/{plan_id}/orders")
@@ -471,16 +481,25 @@ async def schedule_check(
     used = {c.voyage_id for c in session.plan.containers if c.used}
     voyages = [v for v in session.scenario.voyages if v.id in used] or session.scenario.voyages
     if body.movements is not None:
-        movements, source = body.movements, "provided"
+        movements, source, trusted = body.movements, "provided", False
     else:
         start = min(v.etd for v in voyages).date() - timedelta(days=1)
         end = max(v.etd for v in voyages).date() + timedelta(days=3)
         movements = await fetch_busan_movements(factory, start, end, "O", demo=demo)
-        source = "해수부"
+        source, trusted = "해수부", not demo
     changes = detect_schedule_changes(
-        [PlannedVoyage(voyage_id=v.id, vessel_name=v.vessel_name, etd=v.etd) for v in voyages],
+        planned_voyages(voyages),
         movements,
         threshold_hours=body.threshold_hours,
+        max_gap_hours=body.max_gap_hours,
+    )
+    await run_in_threadpool(
+        record_schedule_check,
+        org_id,
+        voyages,
+        movements,
+        trusted=trusted,
+        plan_id=plan_id,
         max_gap_hours=body.max_gap_hours,
     )
     events = [
