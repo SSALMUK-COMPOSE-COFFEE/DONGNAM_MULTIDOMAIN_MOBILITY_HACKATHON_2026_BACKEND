@@ -188,6 +188,14 @@ def test_business_separates_contribution_from_fixed_cost(scenario):
     assert freight.breakeven_pallets < total.breakeven_pallets
 
 
+def test_business_basis_labels_name_settlement_basis(scenario):
+    basis = {b.basis: b for b in business(scenario).basis}
+    assert basis["total_cost"].label == "정산 기준(정산표 단가)"
+    assert basis["freight_difference"].label == "운임 차액 기준(기획서)"
+    lines = {line.product_id: line.savings_per_pallet for line in basis["total_cost"].lines}
+    assert lines["strawberry"] == 249_000
+
+
 def test_business_matrix_rows_and_highlights(scenario):
     matrix = business_matrix(scenario)
     assert matrix is not None

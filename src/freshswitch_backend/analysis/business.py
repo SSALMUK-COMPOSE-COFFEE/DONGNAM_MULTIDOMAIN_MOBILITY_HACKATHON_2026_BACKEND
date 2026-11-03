@@ -380,7 +380,7 @@ def basis_comparison(
         ),
         (
             "total_cost",
-            "총비용 기준(최적화·경로비 정산)",
+            "정산 기준(정산표 단가)",
             "이 시나리오 최적화 결과의 품목별 파렛트당 화주 절감 평균(항공 대비 총비용 차이)",
             {pid: measured[pid] for pid in pallets},
         ),
