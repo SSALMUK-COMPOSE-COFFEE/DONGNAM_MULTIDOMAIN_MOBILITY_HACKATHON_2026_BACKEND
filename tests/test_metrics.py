@@ -53,7 +53,8 @@ def _register_all(saas_login) -> list[str]:
 
 def _platform_plan(platform_client: TestClient, saas_login) -> dict:
     response = platform_client.post(
-        "/api/saas/platform/plans", json={"lot_ids": _register_all(saas_login)}
+        "/api/saas/platform/plans",
+        json={"lot_ids": _register_all(saas_login), "auto_accept": True},
     )
     assert response.status_code == 201, response.text
     return response.json()

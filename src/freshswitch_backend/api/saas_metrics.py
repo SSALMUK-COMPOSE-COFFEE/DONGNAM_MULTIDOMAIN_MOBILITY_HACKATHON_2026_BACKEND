@@ -323,7 +323,7 @@ def platform_metrics(principal: PlatformPrincipal, month: MonthQuery = None) -> 
         plan_confirmation_rate=_rate(
             sum(1 for s in sessions if s.status == "committed"),
             len(sessions),
-            "이번 달 계획 중 화주 확인 대기(pending_confirmation)가 아닌 확정(committed) 비율",
+            "이번 달 계획 중 화주 확인 대기(pending_shipper_confirmation·pending_confirmation)가 아닌 확정(committed) 비율",
             "이번 달 계획이 없다",
         ),
         shipper_reuse_rate=_reuse(target, sessions, every),

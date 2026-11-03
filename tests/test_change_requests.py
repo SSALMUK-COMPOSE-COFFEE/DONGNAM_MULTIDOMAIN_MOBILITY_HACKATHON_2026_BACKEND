@@ -55,7 +55,9 @@ def _plan(
         response = client.post("/api/saas/shipper/lots", json=_lot_body(lot, suffix))
         assert response.status_code == 201, response.text
         ids.append(response.json()["registered"]["id"])
-    created = platform_client.post("/api/saas/platform/plans", json={"lot_ids": ids})
+    created = platform_client.post(
+        "/api/saas/platform/plans", json={"lot_ids": ids, "auto_accept": True}
+    )
     assert created.status_code == 201, created.text
     plan_id = created.json()["plan_id"]
     with database.begin() as db:

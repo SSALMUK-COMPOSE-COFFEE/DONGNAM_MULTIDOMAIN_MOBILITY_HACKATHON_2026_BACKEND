@@ -62,14 +62,17 @@ def test_apply_notifies_shippers_who_must_confirm(platform_client: TestClient, s
     )
     assert applied.status_code == 200, applied.text
     order_id = applied.json()["active_order_id"]
-    sent = list_for_org(shipper_org_id("sh-miryang"), plan_id=plan_id)
-    assert [n.kind for n in sent] == ["order_confirmation_requested"]
-    assert sent[0].order_id == order_id
+
+    def order_notices():
+        sent = list_for_org(shipper_org_id("sh-miryang"), plan_id=plan_id)
+        return [n for n in sent if n.kind == "order_confirmation_requested"]
+
+    assert [n.order_id for n in order_notices()] == [order_id]
     again = platform_client.post(
         f"/api/plans/{plan_id}/apply", json={"alternative_id": "pull_forward"}
     )
     assert again.status_code in (200, 409)
-    assert len(list_for_org(shipper_org_id("sh-miryang"), plan_id=plan_id)) == 1
+    assert len(order_notices()) == 1
 
 
 def test_demo_apply_records_no_notifications(client: TestClient):
