@@ -7,8 +7,8 @@ from fastapi.testclient import TestClient
 from saas_fixtures import demo_org_type
 
 from freshswitch_backend.coldchain import ColdchainParams
-from freshswitch_backend.coldchain.models import TimelinePoint
-from freshswitch_backend.coldchain.store import outage_episodes, residual_risks
+from freshswitch_backend.coldchain.models import ReadingIn, TimelinePoint
+from freshswitch_backend.coldchain.store import coldchain_store, outage_episodes, residual_risks
 from freshswitch_backend.config import get_settings
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import KST
@@ -185,7 +185,12 @@ def test_readings_csv_neutralises_formula_cells(client: TestClient) -> None:
         "temp_c": -1.5,
         "power_on": True,
     }
-    assert client.post("/api/coldchain/readings", json=reading).status_code == 200
+    rejected = client.post("/api/coldchain/readings", json=reading)
+    assert rejected.status_code == 422, rejected.text
+    stored = coldchain_store.ingest(
+        [ReadingIn.model_construct(**{**reading, "ts": START, "stage": None})]
+    )
+    assert stored.accepted == 1
     params = {"plan_id": plan_id}
     readings = _rows(client.get("/api/coldchain/containers/CA-01/readings.csv", params=params))
     raw = [r for r in readings if r["source"] == "raw"]

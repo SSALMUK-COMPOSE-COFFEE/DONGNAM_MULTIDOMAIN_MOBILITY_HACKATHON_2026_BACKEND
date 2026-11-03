@@ -103,10 +103,18 @@ def test_coldchain3_device_id_rule(saas, bad: str) -> None:
     assert created.status_code == 422, created.text
 
 
-@pytest.mark.parametrize("legacy", ["x/y", "x y", "센서 1"])
-def test_coldchain3_simulation_keeps_legacy_device_ids(client: TestClient, legacy: str) -> None:
-    simulated = client.post("/api/coldchain/simulate", json={"device_id": legacy})
+@pytest.mark.parametrize("bad", ["x/y", "x y", "센서 1", "TK:0001", "a" * (ID_MAX_LENGTH + 1)])
+def test_coldchain3_simulation_rejects_rule_breaking_device_ids(
+    client: TestClient, bad: str
+) -> None:
+    simulated = client.post("/api/coldchain/simulate", json={"device_id": bad})
+    assert simulated.status_code == 422, simulated.text
+
+
+def test_coldchain3_simulation_default_device_id(client: TestClient) -> None:
+    simulated = client.post("/api/coldchain/simulate", json={})
     assert simulated.status_code == 200, simulated.text
+    assert simulated.json()["device_id"] == "sim-01"
 
 
 def test_coldchain3_valid_device_can_be_deleted(saas) -> None:
@@ -117,27 +125,38 @@ def test_coldchain3_valid_device_can_be_deleted(saas) -> None:
     assert deleted.status_code == 204, deleted.text
 
 
-def test_coldchain3_legacy_device_id_keeps_working(saas) -> None:
-    legacy = "TK:0001"
+@pytest.mark.parametrize("bad", ["TK:0001", "x/y", "센서 1"])
+def test_coldchain3_rule_breaking_device_id_is_rejected_everywhere(
+    saas, client: TestClient, bad: str
+) -> None:
     token = "legacy-token-tk-0001"
     with database.begin() as db:
-        db.add(DeviceRow(device_id=legacy, org_id="freshswitch", token_hash=token_hash(token)))
+        db.add(DeviceRow(device_id=bad, org_id="freshswitch", token_hash=token_hash(token)))
     scenario = load_scenarios()["default"]
     plan_id = store.create(scenario, org_id="freshswitch").plan_id
     platform = _platform(saas)
     bound = platform.post(
         "/api/coldchain/bindings",
-        json={"device_id": legacy, "container_id": "CA-01", "plan_id": plan_id},
+        json={"device_id": bad, "container_id": "CA-01", "plan_id": plan_id},
         headers=CSRF,
     )
-    assert bound.status_code == 201, bound.text
+    assert bound.status_code == 422, bound.text
     device = TestClient(saas, base_url="https://testserver")
     reading = device.post(
         "/api/coldchain/readings",
-        json={"device_id": legacy, "temp_c": 1.0, "power_on": True},
+        json={"device_id": bad, "temp_c": 1.0, "power_on": True},
         headers={"X-Device-Token": token},
     )
-    assert reading.status_code == 200, reading.text
-    assert reading.json()["accepted"] == 1
-    deleted = platform.delete(f"/api/saas/devices/{legacy}", headers=CSRF)
-    assert deleted.status_code == 204, deleted.text
+    assert reading.status_code == 422, reading.text
+    simulated = platform.post(
+        "/api/coldchain/simulate", json={"device_id": bad, "plan_id": plan_id}, headers=CSRF
+    )
+    assert simulated.status_code == 422, simulated.text
+    demo_reading = client.post(
+        "/api/coldchain/readings", json={"device_id": bad, "temp_c": 1.0, "power_on": True}
+    )
+    assert demo_reading.status_code == 422, demo_reading.text
+    demo_bound = client.post(
+        "/api/coldchain/bindings", json={"device_id": bad, "container_id": "CA-01"}
+    )
+    assert demo_bound.status_code == 422, demo_bound.text
