@@ -49,7 +49,7 @@ from freshswitch_backend.coldchain.models import (
 )
 from freshswitch_backend.coldchain.power_plan import power_plan
 from freshswitch_backend.coldchain.simulator import PRESETS
-from freshswitch_backend.coldchain.store import ActionTransition
+from freshswitch_backend.coldchain.store import STALE_BINDING, ActionTransition
 from freshswitch_backend.domain.models import Quantity
 from freshswitch_backend.lots import lot_store
 from freshswitch_backend.persistence import database
@@ -272,7 +272,10 @@ def ingest(
     if org_id != DEMO_ORG:
         device_store.touch({item.device_id for item in items})
     if result.accepted == 0 and result.duplicates == 0:
-        raise HTTPException(status_code=422, detail=result.rejected[0].reason)
+        reason = result.rejected[0].reason
+        if all(item.reason == STALE_BINDING for item in result.rejected):
+            raise HTTPException(status_code=409, detail=reason)
+        raise HTTPException(status_code=422, detail=reason)
     return result
 
 

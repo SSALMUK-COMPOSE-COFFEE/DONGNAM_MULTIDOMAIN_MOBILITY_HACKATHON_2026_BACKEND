@@ -74,6 +74,7 @@ MAX_CONTAINERS = 200
 MAX_RUNS = 200
 RESET_POLL_SECONDS = 0.05
 AMBIGUOUS = "동일 컨테이너의 계획이 여러 개입니다. plan_id를 지정하세요"
+STALE_BINDING = "연결된 계획이 삭제되었습니다. 기기를 다시 바인딩하세요"
 DEFAULT_STAGE: Stage = "terminal"
 PREVIEW_RULE = (
     "트윈 예상 손실률을 도착 검수 손실률 대신 넣어 품질 사후정산을 미리 계산한다. "
@@ -301,6 +302,27 @@ def _record_key(plan_id: str | None, container_id: str, org_id: str = DEMO_ORG) 
     if org_id == DEMO_ORG:
         return f"-:{container_id}"
     return f"-{org_id}:{container_id}"
+
+
+def _status_of(alert: Alert) -> str | None:
+    if alert.kind != "status_change":
+        return None
+    return alert.key.split(":", 2)[1]
+
+
+def _same_status_run(alert: Alert, evaluated: list[Alert], stored: dict[str, Alert]) -> bool:
+    status = _status_of(alert)
+    if status is None:
+        return False
+    changes = [item for item in [*evaluated, *stored.values()] if _status_of(item) is not None]
+    until = min(
+        (item.at for item in changes if _status_of(item) != status and item.at > alert.at),
+        default=None,
+    )
+    return any(
+        _status_of(item) == status and item.at >= alert.at and (until is None or item.at < until)
+        for item in stored.values()
+    )
 
 
 _CARRY = TypeAdapter(Carry)
@@ -622,6 +644,8 @@ class ColdchainStore:
         for alert in evaluation.alerts:
             if alert.key in record.alerts:
                 continue
+            if _same_status_run(alert, evaluation.alerts, record.alerts):
+                continue
             seq = db.scalar(ALERT_SEQ.next_value())
             now = self.clock()
             action = alert.action.model_copy(update={"created_at": now}) if alert.action else None
@@ -701,6 +725,14 @@ class ColdchainStore:
                     )
                     continue
                 item = item.model_copy(update={"container_id": None, "plan_id": None})
+                bound_plan = binding.plan_id if binding else None
+                if bound_plan is not None and bound_plan not in live:
+                    live[bound_plan] = self._session(bound_plan, org_id) is not None
+                if bound_plan is None or not live[bound_plan]:
+                    rejected.append(
+                        IngestRejected(index=index, device_id=item.device_id, reason=STALE_BINDING)
+                    )
+                    continue
             container_id = item.container_id or (binding.container_id if binding else None)
             if container_id is None:
                 rejected.append(
