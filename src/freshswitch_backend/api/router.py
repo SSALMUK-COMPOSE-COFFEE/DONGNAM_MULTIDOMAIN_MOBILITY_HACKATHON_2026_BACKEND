@@ -16,6 +16,7 @@ from freshswitch_backend.api import (
     provenance,
     quality,
     saas_catalog,
+    saas_devices,
     saas_forwarder,
     saas_platform,
     saas_shipper,
@@ -46,3 +47,4 @@ api_router.include_router(saas_shipper.router)
 api_router.include_router(saas_platform.router)
 api_router.include_router(saas_forwarder.router)
 api_router.include_router(orgs.router)
+api_router.include_router(saas_devices.router)
