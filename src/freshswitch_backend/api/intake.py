@@ -3,9 +3,10 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from freshswitch_backend.api.auth import OptionalPrincipal
+from freshswitch_backend.api.auth import OptionalPrincipal, Principal
+from freshswitch_backend.api.saas_access import plan_for
 from freshswitch_backend.data.loader import get_scenario
-from freshswitch_backend.domain.models import Scenario
+from freshswitch_backend.domain.models import Plan, Scenario
 from freshswitch_backend.intake.models import IntakePreview, IntakeRequest
 from freshswitch_backend.intake.savings import estimate_savings
 from freshswitch_backend.intake.service import IntakeError, preview_lot
@@ -23,6 +24,7 @@ class IntakeScope:
     catalog_org: str | None = None
     lot_org: str | None = DEMO_ORG
     peer_of: str | None = None
+    shipper: Principal | None = None
 
     def scenario(self, scenario_id: str) -> Scenario | None:
         base = get_scenario(scenario_id)
@@ -56,7 +58,10 @@ def intake_scope(principal: OptionalPrincipal) -> IntakeScope:
         )
     if principal.org_type == "shipper":
         return IntakeScope(
-            org_id=principal.org_id, catalog_org=principal.org_id, lot_org=principal.org_id
+            org_id=principal.org_id,
+            catalog_org=principal.org_id,
+            lot_org=principal.org_id,
+            shipper=principal,
         )
     raise HTTPException(status_code=403, detail="이 조직 유형은 출하를 등록할 수 없습니다")
 
@@ -68,6 +73,27 @@ def intake_error(exc: IntakeError) -> HTTPException:
     return HTTPException(status_code=422, detail=[e.model_dump() for e in exc.errors])
 
 
+def _shipper_plan(plan_id: str, principal: Principal) -> tuple[Scenario, Plan]:
+    session = plan_for(plan_id, principal).session
+    scenario = session.scenario
+    catalog = load_catalog(principal.org_id, scenario)
+    known = {p.id for p in scenario.packhouses}
+    packhouses = [*scenario.packhouses, *(p for p in catalog.packhouses if p.id not in known)]
+    own = scenario.model_copy(
+        update={"shippers": [s.shipper for s in catalog.shippers], "packhouses": packhouses}
+    )
+    return own, session.plan
+
+
+def _plan_scenario(plan_id: str, scope: IntakeScope) -> tuple[Scenario, Plan]:
+    if scope.shipper is not None:
+        return _shipper_plan(plan_id, scope.shipper)
+    session = store.get(plan_id, org_id=scope.org_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")
+    return session.scenario, session.plan
+
+
 def build_preview(
     body: IntakeRequest,
     reservation: Reservation | None = None,
@@ -75,10 +101,7 @@ def build_preview(
 ) -> tuple[IntakePreview, str]:
     plan = None
     if body.plan_id is not None:
-        session = store.get(body.plan_id, org_id=scope.org_id)
-        if session is None:
-            raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")
-        scenario, plan = session.scenario, session.plan
+        scenario, plan = _plan_scenario(body.plan_id, scope)
     else:
         scenario = scope.scenario(body.scenario_id)
         if scenario is None:
