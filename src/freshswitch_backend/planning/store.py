@@ -22,6 +22,8 @@ from freshswitch_backend.execution.quality import (
     ArrivalRequest,
     ArrivalSettlementResult,
     arrival_settlement,
+    current_inspections,
+    planned_loss_rate,
 )
 from freshswitch_backend.explain.models import Explanation
 from freshswitch_backend.planning.service import VoyagePickup, build_plan
@@ -86,6 +88,7 @@ class PlanSession(BaseModel):
     committed_version: int = 1
     active_order_id: str | None = None
     arrival_inspections: list[ArrivalInspection] = Field(default_factory=list)
+    inspection_revision: int = 0
 
 
 class PendingReplan(BaseModel):
@@ -100,6 +103,7 @@ class _Snapshot(BaseModel):
     plan: Plan
     routes: list[VoyagePickup]
     air_locked_lot_ids: list[str]
+    arrival_inspections: list[ArrivalInspection] = Field(default_factory=list)
 
 
 def _now() -> datetime:
@@ -113,6 +117,7 @@ def _snapshot(session: PlanSession) -> _Snapshot:
         plan=session.plan,
         routes=session.routes,
         air_locked_lot_ids=session.air_locked_lot_ids,
+        arrival_inspections=session.arrival_inspections,
     )
 
 
@@ -334,6 +339,9 @@ class SessionStore:
                     "history": [*session.history, entry],
                     "status": "pending_confirmation",
                     "active_order_id": order.order_id,
+                    "arrival_inspections": self._carry_inspections(
+                        session, scenario, alternative.plan
+                    ),
                 }
             )
             self._sessions[plan_id] = updated
@@ -421,6 +429,7 @@ class SessionStore:
                 "status": "committed",
                 "committed_version": version,
                 "active_order_id": None,
+                "arrival_inspections": snapshot.arrival_inspections,
             }
         )
         self._committed[plan_id] = snapshot.model_copy(update={"version": version})
@@ -586,6 +595,11 @@ class SessionStore:
             return order
 
     def record_arrival(self, plan_id: str, body: ArrivalRequest) -> ArrivalSettlementResult:
+        return self.record_arrival_snapshot(plan_id, body)[0]
+
+    def record_arrival_snapshot(
+        self, plan_id: str, body: ArrivalRequest
+    ) -> tuple[ArrivalSettlementResult, PlanSession]:
         with self._lock:
             self._expire_due(plan_id)
             session = self._sessions[plan_id]
@@ -593,10 +607,35 @@ class SessionStore:
             result, inspections = arrival_settlement(
                 plan_id, session.scenario, session.plan, session.arrival_inspections, body, now
             )
-            self._sessions[plan_id] = session.model_copy(
-                update={"arrival_inspections": inspections, "updated_at": now}
+            updated = session.model_copy(
+                update={
+                    "arrival_inspections": inspections,
+                    "updated_at": now,
+                    "inspection_revision": session.inspection_revision + 1,
+                }
             )
-            return result
+            self._sessions[plan_id] = updated
+            if updated.status == "committed":
+                self._committed[plan_id] = _snapshot(updated)
+            return result, updated.model_copy(deep=True)
+
+    @staticmethod
+    def _carry_inspections(session: PlanSession, scenario: Scenario, plan: Plan):
+        before = {a.lot_id: a for a in session.plan.assignments}
+        after = {a.lot_id: a for a in plan.assignments}
+        lots_before = {lot.id: lot for lot in session.scenario.lots}
+        lots_after = {lot.id: lot for lot in scenario.lots}
+        kept = []
+        for inspection in current_inspections(plan, session.arrival_inspections):
+            lid = inspection.lot_id
+            if before.get(lid) != after.get(lid) or lots_before.get(lid) != lots_after.get(lid):
+                continue
+            if planned_loss_rate(session.scenario, session.plan, lid) != planned_loss_rate(
+                scenario, plan, lid
+            ):
+                continue
+            kept.append(inspection)
+        return kept
 
 
 store = SessionStore()
