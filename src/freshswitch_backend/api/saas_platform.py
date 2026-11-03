@@ -16,6 +16,7 @@ from freshswitch_backend.api.saas_views import (
 from freshswitch_backend.intake.tenants import load_catalog
 from freshswitch_backend.lots import ANY_ORG, LotStatus, RegisteredLot
 from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.orgs import same_sandbox
 from freshswitch_backend.persistence.tables import LotRow, OrganizationRow, PlanRow
 from freshswitch_backend.planning.store import PlanSession
 
@@ -47,7 +48,10 @@ def list_lots(
     query = (
         select(LotRow, OrganizationRow.name)
         .join(OrganizationRow, OrganizationRow.id == LotRow.shipper_org_id)
-        .where(OrganizationRow.type == "shipper")
+        .where(
+            OrganizationRow.type == "shipper",
+            same_sandbox(OrganizationRow.sandbox, principal.org_id),
+        )
         .order_by(LotRow.created_at.desc(), LotRow.id)
         .limit(limit)
         .offset(offset)
@@ -102,5 +106,5 @@ def list_settlements(
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[PlatformSettlement]:
-    names = load_catalog(ANY_ORG).org_names()
+    names = load_catalog(ANY_ORG, peer_of=principal.org_id).org_names()
     return [platform_settlement(s, names) for s in _sessions(principal, limit, offset)]

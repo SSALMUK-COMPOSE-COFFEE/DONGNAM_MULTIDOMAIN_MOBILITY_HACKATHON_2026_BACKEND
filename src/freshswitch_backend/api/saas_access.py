@@ -2,12 +2,14 @@ from dataclasses import dataclass
 from typing import Annotated, Any
 
 from fastapi import Depends, HTTPException
-from sqlalchemy import exists, func, select
+from sqlalchemy import and_, exists, func, select
 
 from freshswitch_backend.api.auth import AuthPrincipal, Principal
 from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.orgs import same_sandbox
 from freshswitch_backend.persistence.tables import (
     LotRow,
+    OrganizationRow,
     PlanForwarderRow,
     PlanRow,
     ShipperProfileRow,
@@ -61,7 +63,13 @@ def forwarder_assigned(org_id: str) -> Any:
     )
 
 
-def visible_plans(principal: Principal) -> Any:
+def owner_in_sandbox_of(org_id: str) -> Any:
+    return exists().where(
+        OrganizationRow.id == PlanRow.org_id, same_sandbox(OrganizationRow.sandbox, org_id)
+    )
+
+
+def _role_condition(principal: Principal) -> Any:
     if principal.org_type == "platform":
         return PlanRow.org_id == principal.org_id
     if principal.org_type == "forwarder":
@@ -69,6 +77,13 @@ def visible_plans(principal: Principal) -> Any:
     if principal.org_type == "shipper":
         return shipper_lot_included(principal.org_id)
     return None
+
+
+def visible_plans(principal: Principal) -> Any:
+    condition = _role_condition(principal)
+    if condition is None:
+        return None
+    return and_(condition, owner_in_sandbox_of(principal.org_id))
 
 
 def _owner_if_visible(plan_id: str, principal: Principal) -> str | None:

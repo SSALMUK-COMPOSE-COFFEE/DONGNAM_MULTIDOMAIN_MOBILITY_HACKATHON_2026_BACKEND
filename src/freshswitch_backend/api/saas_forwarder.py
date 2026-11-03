@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from freshswitch_backend.api.auth import Principal, require_role
-from freshswitch_backend.api.saas_access import forwarder_assigned, plan_for
+from freshswitch_backend.api.saas_access import plan_for, visible_plans
 from freshswitch_backend.api.saas_views import (
     ForwarderOrder,
     PlanListItem,
@@ -43,7 +43,7 @@ def list_plans(
     with database.begin() as db:
         rows = db.scalars(
             select(PlanRow)
-            .where(forwarder_assigned(principal.org_id))
+            .where(visible_plans(principal))
             .order_by(PlanRow.created_at.desc(), PlanRow.seq.desc())
             .limit(limit)
             .offset(offset)

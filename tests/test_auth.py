@@ -276,6 +276,7 @@ def test_org_header_switches_and_rejects_outsiders(https_client: TestClient) -> 
         "org_type": "forwarder",
         "org_name": "추가 포워더",
         "role": "member",
+        "sandbox": False,
     }
     assert https_client.get("/api/me").json()["active_org"]["org_id"] == "forwarder-extra"
 

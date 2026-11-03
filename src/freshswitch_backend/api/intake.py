@@ -21,17 +21,18 @@ class IntakeScope:
     org_id: str = DEMO_ORG
     catalog_org: str | None = None
     lot_org: str | None = DEMO_ORG
+    peer_of: str | None = None
 
     def scenario(self, scenario_id: str) -> Scenario | None:
         base = get_scenario(scenario_id)
         if base is None or self.catalog_org is None:
             return base
-        return tenant_scenario(base, load_catalog(self.catalog_org, base))
+        return tenant_scenario(base, load_catalog(self.catalog_org, base, self.peer_of))
 
     def lot_org_for(self, shipper_id: str) -> str:
         if self.lot_org is not None:
             return self.lot_org
-        org = load_catalog(self.catalog_org or ANY_ORG).org_of(shipper_id)
+        org = load_catalog(self.catalog_org or ANY_ORG, peer_of=self.peer_of).org_of(shipper_id)
         if org is None:
             raise HTTPException(
                 status_code=422, detail=f"소속 조직이 없는 화주입니다: {shipper_id}"
@@ -46,7 +47,12 @@ def intake_scope(principal: OptionalPrincipal) -> IntakeScope:
     if principal is None:
         return DEMO_SCOPE
     if principal.org_type == "platform":
-        return IntakeScope(org_id=principal.org_id, catalog_org=ANY_ORG, lot_org=None)
+        return IntakeScope(
+            org_id=principal.org_id,
+            catalog_org=ANY_ORG,
+            lot_org=None,
+            peer_of=principal.org_id,
+        )
     if principal.org_type == "shipper":
         return IntakeScope(
             org_id=principal.org_id, catalog_org=principal.org_id, lot_org=principal.org_id

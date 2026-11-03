@@ -12,7 +12,7 @@ from freshswitch_backend.api.saas_access import (
     PlanAccess,
     org_shipper_ids,
     plan_for,
-    shipper_lot_included,
+    visible_plans,
 )
 from freshswitch_backend.api.saas_views import (
     ShipperPlanItem,
@@ -111,7 +111,7 @@ def _sessions(principal: Principal) -> list[PlanSession]:
     with database.begin() as db:
         rows = db.scalars(
             select(PlanRow)
-            .where(shipper_lot_included(principal.org_id))
+            .where(visible_plans(principal))
             .order_by(PlanRow.created_at.desc(), PlanRow.seq.desc())
         )
         return [PlanSession.model_validate(row.payload) for row in rows]

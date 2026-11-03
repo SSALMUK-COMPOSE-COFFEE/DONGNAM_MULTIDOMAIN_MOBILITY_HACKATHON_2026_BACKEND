@@ -18,7 +18,7 @@ def org_scenario(principal: Principal, scenario_id: str = "default") -> Scenario
     if base is None:
         raise HTTPException(status_code=404, detail="시나리오를 찾을 수 없습니다")
     if principal.org_type == "platform":
-        return tenant_scenario(base, load_catalog(ANY_ORG, base))
+        return tenant_scenario(base, load_catalog(ANY_ORG, base, peer_of=principal.org_id))
     scenario = tenant_scenario(base, load_catalog(principal.org_id, base))
     return scenario.model_copy(update={"description": ""})
 

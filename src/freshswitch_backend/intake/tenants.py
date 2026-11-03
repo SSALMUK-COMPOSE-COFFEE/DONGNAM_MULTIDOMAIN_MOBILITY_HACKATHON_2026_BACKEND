@@ -5,6 +5,7 @@ from sqlalchemy import select
 from freshswitch_backend.domain.models import Lot, Packhouse, Scenario, Shipper
 from freshswitch_backend.lots import ANY_ORG
 from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.orgs import same_sandbox
 from freshswitch_backend.persistence.tables import (
     OrganizationRow,
     PackhouseRow,
@@ -36,7 +37,9 @@ class TenantCatalog:
         return {s.shipper.id: s.org_name for s in self.shippers}
 
 
-def load_catalog(org_id: str, base: Scenario | None = None) -> TenantCatalog:
+def load_catalog(
+    org_id: str, base: Scenario | None = None, peer_of: str | None = None
+) -> TenantCatalog:
     query = (
         select(ShipperProfileRow, PackhouseRow, OrganizationRow.name)
         .join(PackhouseRow, PackhouseRow.id == ShipperProfileRow.packhouse_id)
@@ -46,6 +49,8 @@ def load_catalog(org_id: str, base: Scenario | None = None) -> TenantCatalog:
     )
     if org_id != ANY_ORG:
         query = query.where(ShipperProfileRow.org_id == org_id)
+    if peer_of is not None:
+        query = query.where(same_sandbox(OrganizationRow.sandbox, peer_of))
     with database.begin() as db:
         rows = db.execute(query).all()
     order = {s.id: i for i, s in enumerate(base.shippers)} if base is not None else {}

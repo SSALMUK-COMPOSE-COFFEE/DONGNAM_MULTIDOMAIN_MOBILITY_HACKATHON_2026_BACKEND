@@ -4,7 +4,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from freshswitch_backend.main import app
-from freshswitch_backend.persistence.seed import DEMO_EMAIL_DOMAIN
+from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.seed import create_platform, demo_orgs
 
 SAAS_CSRF = {"X-Requested-With": "freshswitch"}
 SAAS_DEMO_PASSWORD = "test-demo-password"
@@ -15,11 +16,14 @@ FORWARDER_ORG_ID = "forwarder-dongnam"
 OTHER_FORWARDER_ORG_ID = "forwarder-sinhang"
 
 
+def demo_org_type(org_id: str) -> str:
+    return next(org.type for org in demo_orgs() if org.id == org_id)
+
+
 def login_client(org_id: str, client_app=app) -> TestClient:
     client = TestClient(client_app, base_url="https://testserver", headers=SAAS_CSRF)
     response = client.post(
-        "/api/auth/login",
-        json={"email": f"{org_id}@{DEMO_EMAIL_DOMAIN}", "password": SAAS_DEMO_PASSWORD},
+        "/api/auth/demo-login", json={"org_type": demo_org_type(org_id), "org_id": org_id}
     )
     assert response.status_code == 200, response.text
     assert response.json()["active_org"]["org_id"] == org_id
@@ -54,3 +58,27 @@ def forwarder_client(saas_login) -> TestClient:
 @pytest.fixture
 def other_forwarder_client(saas_login) -> TestClient:
     return saas_login(OTHER_FORWARDER_ORG_ID)
+
+
+REAL_PLATFORM_EMAIL = "ops@real-platform.example.com"
+REAL_PLATFORM_PASSWORD = "real-platform-password"
+
+
+def create_real_platform(org_id: str = "platform-real") -> str:
+    with database.begin() as db:
+        create_platform(
+            db,
+            name="실제 플랫폼",
+            email=REAL_PLATFORM_EMAIL,
+            user_name="실제 운영",
+            password=REAL_PLATFORM_PASSWORD,
+            org_id=org_id,
+        )
+    return org_id
+
+
+def password_client(client_app, email: str, password: str) -> TestClient:
+    client = TestClient(client_app, base_url="https://testserver", headers=SAAS_CSRF)
+    response = client.post("/api/auth/login", json={"email": email, "password": password})
+    assert response.status_code == 200, response.text
+    return client

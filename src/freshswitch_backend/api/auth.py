@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from freshswitch_backend.config import Settings, get_settings
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.passwords import hash_password, verify_password
-from freshswitch_backend.persistence.seed import DEMO_EMAIL_DOMAIN, demo_orgs
+from freshswitch_backend.persistence.seed import demo_orgs, is_demo_email
 from freshswitch_backend.persistence.tables import (
     DEMO_ORG,
     AuthSessionRow,
@@ -59,6 +59,7 @@ class OrgMembership(BaseModel):
     org_type: str
     org_name: str
     role: str
+    sandbox: bool = False
 
 
 class Me(BaseModel):
@@ -107,6 +108,7 @@ class LoginRequest(BaseModel):
 
 class DemoLoginRequest(BaseModel):
     org_type: OrgType
+    org_id: str | None = Field(default=None, max_length=64)
 
 
 def app_settings(request: Request) -> Settings:
@@ -126,21 +128,22 @@ def _dummy_hash() -> str:
     return hash_password(secrets.token_urlsafe(16))
 
 
-def is_demo_email(email: str) -> bool:
-    domain = email.rpartition("@")[2]
-    return domain == DEMO_EMAIL_DOMAIN or domain.endswith("." + DEMO_EMAIL_DOMAIN)
-
-
 def _memberships(db: Session, user_id: str) -> list[OrgMembership]:
     rows = db.execute(
-        select(OrganizationRow.id, OrganizationRow.type, OrganizationRow.name, MembershipRow.role)
+        select(
+            OrganizationRow.id,
+            OrganizationRow.type,
+            OrganizationRow.name,
+            MembershipRow.role,
+            OrganizationRow.sandbox,
+        )
         .join(OrganizationRow, OrganizationRow.id == MembershipRow.org_id)
         .where(MembershipRow.user_id == user_id)
         .order_by(MembershipRow.created_at, MembershipRow.org_id)
     ).all()
     return [
-        OrgMembership(org_id=org_id, org_type=kind, org_name=name, role=role)
-        for org_id, kind, name, role in rows
+        OrgMembership(org_id=org_id, org_type=kind, org_name=name, role=role, sandbox=sandbox)
+        for org_id, kind, name, role, sandbox in rows
     ]
 
 
@@ -340,6 +343,8 @@ def login(body: LoginRequest, request: Request, response: Response) -> Me:
         valid = verify_password(body.password, user.password_hash if user else _dummy_hash())
         if user is None or not valid:
             raise HTTPException(status_code=401, detail=INVALID_LOGIN)
+        if app_settings(request).saas_mode and (user.is_demo or is_demo_email(user.email)):
+            raise HTTPException(status_code=401, detail=INVALID_LOGIN)
         return _start_session(db, request, response, user)
 
 
@@ -354,8 +359,14 @@ def demo_login(body: DemoLoginRequest, request: Request, response: Response) -> 
             select(UserRow, OrganizationRow.id)
             .join(MembershipRow, MembershipRow.user_id == UserRow.id)
             .join(OrganizationRow, OrganizationRow.id == MembershipRow.org_id)
-            .where(UserRow.is_demo.is_(True), OrganizationRow.type == body.org_type)
+            .where(
+                UserRow.is_demo.is_(True),
+                OrganizationRow.type == body.org_type,
+                OrganizationRow.sandbox.is_(True),
+            )
         ).all()
+        if body.org_id is not None:
+            candidates = [row for row in candidates if row[1] == body.org_id]
         if not candidates:
             raise HTTPException(status_code=404, detail="데모 계정이 준비되어 있지 않습니다")
         rank = _demo_rank()

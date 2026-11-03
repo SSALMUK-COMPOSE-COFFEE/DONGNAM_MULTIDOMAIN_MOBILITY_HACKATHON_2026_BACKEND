@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from freshswitch_backend.api.auth import Principal, require_role
 from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.orgs import same_sandbox
 from freshswitch_backend.persistence.tables import OrganizationRow, PlanForwarderRow, PlanRow
 
 ListedOrgType = Literal["shipper", "forwarder"]
@@ -46,7 +47,10 @@ def list_orgs(
     with database.begin() as db:
         rows = db.execute(
             select(OrganizationRow.id, OrganizationRow.type, OrganizationRow.name)
-            .where(OrganizationRow.type.in_(types))
+            .where(
+                OrganizationRow.type.in_(types),
+                same_sandbox(OrganizationRow.sandbox, principal.org_id),
+            )
             .order_by(OrganizationRow.type, OrganizationRow.name, OrganizationRow.id)
         ).all()
     return [OrgSummary(org_id=oid, org_type=kind, org_name=name) for oid, kind, name in rows]
@@ -69,7 +73,13 @@ def assign_forwarder(
     with database.begin() as db:
         _lock_own_plan(db, plan_id, principal.org_id)
         forwarder = db.get(OrganizationRow, body.forwarder_org_id)
-        if forwarder is None or forwarder.type != "forwarder":
+        platform = db.get(OrganizationRow, principal.org_id)
+        if (
+            forwarder is None
+            or forwarder.type != "forwarder"
+            or platform is None
+            or forwarder.sandbox != platform.sandbox
+        ):
             raise HTTPException(status_code=422, detail="포워더 조직이 아닙니다")
         db.execute(delete(PlanForwarderRow).where(PlanForwarderRow.plan_id == plan_id))
         db.add(

@@ -35,6 +35,7 @@ from freshswitch_backend.integrations import (
 )
 from freshswitch_backend.lots import ANY_ORG, LotFilter, RegisteredLot, lot_store
 from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.orgs import same_sandbox
 from freshswitch_backend.persistence.tables import DEMO_ORG, LotRow, OrganizationRow
 from freshswitch_backend.planning.store import (
     HistoryEntry,
@@ -154,7 +155,7 @@ def _lot_errors(scenario: Scenario, lots: list[Lot]) -> list[str]:
     return errors
 
 
-def _shipper_org_lots(lots: list[RegisteredLot]) -> list[RegisteredLot]:
+def _shipper_org_lots(lots: list[RegisteredLot], peer_of: str) -> list[RegisteredLot]:
     if not lots:
         return []
     with database.begin() as db:
@@ -162,7 +163,11 @@ def _shipper_org_lots(lots: list[RegisteredLot]) -> list[RegisteredLot]:
             db.scalars(
                 select(LotRow.id)
                 .join(OrganizationRow, OrganizationRow.id == LotRow.shipper_org_id)
-                .where(LotRow.id.in_([lot.id for lot in lots]), OrganizationRow.type == "shipper")
+                .where(
+                    LotRow.id.in_([lot.id for lot in lots]),
+                    OrganizationRow.type == "shipper",
+                    same_sandbox(OrganizationRow.sandbox, peer_of),
+                )
             )
         )
     return [lot for lot in lots if lot.id in owned]
@@ -173,11 +178,11 @@ def _with_lots(
     body: CreatePlanRequest,
     lot_org: str = DEMO_ORG,
     registered_only: bool = False,
-    shipper_orgs_only: bool = False,
+    peer_of: str | None = None,
 ) -> tuple[Scenario, list[str]]:
     registered = lot_store.get_many(list(dict.fromkeys(body.lot_ids)), org_id=lot_org)
-    if shipper_orgs_only:
-        registered = _shipper_org_lots(registered)
+    if peer_of is not None:
+        registered = _shipper_org_lots(registered, peer_of)
     missing = sorted(set(body.lot_ids) - {lot.id for lot in registered})
     if missing:
         raise HTTPException(
@@ -204,7 +209,7 @@ def _with_lots(
             )
             if lot.status == "registered" and lot.id not in chosen
         ]
-        registered += _shipper_org_lots(extra) if shipper_orgs_only else extra
+        registered += _shipper_org_lots(extra, peer_of) if peer_of is not None else extra
     added = [*body.lots, *(lot.to_lot() for lot in registered)]
     if not added:
         return scenario, []
@@ -237,9 +242,9 @@ def create_tenant_plan(body: CreatePlanRequest, org_id: str) -> PlanSession:
     if body.lots:
         raise HTTPException(status_code=422, detail=INLINE_LOTS_FORBIDDEN)
     base = _base_scenario(body.scenario_id)
-    scenario = tenant_scenario(base, load_catalog(ANY_ORG, base))
+    scenario = tenant_scenario(base, load_catalog(ANY_ORG, base, peer_of=org_id))
     scenario, registered_ids = _with_lots(
-        scenario, body, lot_org=ANY_ORG, registered_only=True, shipper_orgs_only=True
+        scenario, body, lot_org=ANY_ORG, registered_only=True, peer_of=org_id
     )
     if not registered_ids:
         raise HTTPException(status_code=422, detail="계획에 넣을 등록 출하가 없습니다")
