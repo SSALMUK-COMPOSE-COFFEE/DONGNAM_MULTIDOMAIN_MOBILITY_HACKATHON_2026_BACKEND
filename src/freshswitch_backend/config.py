@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,6 +14,8 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["*"]
     explain_use_llm: bool = False
     offline_mode: bool = False
+    replan_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+    explain_timeout_seconds: float = Field(default=8.0, gt=0, le=10)
 
 
 @lru_cache
