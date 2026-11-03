@@ -34,6 +34,11 @@ CONFIRMATION_MONEY = (
     "net_cost_delta",
 )
 CANCELLATION_MONEY = ("container_cost", "share_per_pallet_before", "share_per_pallet_after", "fee")
+SETTLEMENT_ACTION = "settlement_recompute"
+SETTLEMENT_TITLE = "정산 재계산"
+TOTAL_COST_CLAUSE = re.compile(
+    r"이며 총 비용은 (?:변동 없습니다|\S+(?: 원)? (?:늘어납니다|줄어듭니다))\."
+)
 
 
 class ForwarderShipperConfirmation(ShipperConfirmation):
@@ -286,8 +291,26 @@ class Anonymizer:
         return result
 
 
+def _without_total_cost(summary: str) -> str:
+    return TOTAL_COST_CLAUSE.sub("입니다.", summary)
+
+
+def _scope_explanations(payload: dict[str, Any], own: set[str]) -> None:
+    for entry in payload["history"]:
+        explanation = entry.get("explanation")
+        if explanation is None:
+            continue
+        explanation["operator_summary"] = _without_total_cost(explanation["operator_summary"])
+        explanation["shipper_messages"] = [
+            m for m in explanation["shipper_messages"] if m["shipper_id"] in own
+        ]
+
+
 def anonymized_session(session: PlanSession, own_shipper_ids: Iterable[str]) -> dict[str, Any]:
-    return Anonymizer(session.scenario, own_shipper_ids).session(session.model_dump(mode="json"))
+    own = set(own_shipper_ids)
+    payload = session.model_dump(mode="json")
+    _scope_explanations(payload, own)
+    return Anonymizer(session.scenario, own).session(payload)
 
 
 def shipper_lot_ids(session: PlanSession, own_shipper_ids: Iterable[str]) -> set[str]:
@@ -314,7 +337,27 @@ def shipper_order_view(
             "requests": [r for r in order.requests if my_lots & set(r.lot_ids)],
         }
     )
-    return Anonymizer(session.scenario, own).walk(trimmed.model_dump(mode="json"))
+    payload = trimmed.model_dump(mode="json")
+    for action in payload["automatic"]:
+        if action["kind"] == SETTLEMENT_ACTION:
+            action["description"] = _own_settlement_text(order.cancellation, own)
+    cancellation = payload.get("cancellation")
+    if cancellation is not None:
+        if cancellation["payer_shipper_id"] not in own:
+            cancellation["fee"] = None
+        cancellation["transfers"] = [t for t in cancellation["transfers"] if t["shipper_id"] in own]
+    return Anonymizer(session.scenario, own).walk(payload)
+
+
+def _own_settlement_text(charge: CancellationCharge | None, own: set[str]) -> str:
+    parts = [SETTLEMENT_TITLE]
+    if charge is not None and charge.fee > 0:
+        if charge.payer_shipper_id in own:
+            parts.append(f"취소 부담금 {charge.fee:,}원 부담")
+        parts += [
+            f"취소 부담금 {t.amount:,}원 보전" for t in charge.transfers if t.shipper_id in own
+        ]
+    return ". ".join(parts)
 
 
 def anonymized_orders(
@@ -340,11 +383,15 @@ def without_settlement(session: PlanSession) -> dict[str, Any]:
     for entry in payload["history"]:
         for name in HISTORY_MONEY:
             entry[name] = None
+    _scope_explanations(payload, set())
     return payload
 
 
 def forwarder_order_view(order: ExecutionOrder) -> ForwarderOrder:
     payload = order.model_dump(mode="json")
+    for action in payload["automatic"]:
+        if action["kind"] == SETTLEMENT_ACTION:
+            action["description"] = SETTLEMENT_TITLE
     for confirmation in payload["shipper_confirmations"]:
         for name in CONFIRMATION_MONEY:
             confirmation[name] = None
