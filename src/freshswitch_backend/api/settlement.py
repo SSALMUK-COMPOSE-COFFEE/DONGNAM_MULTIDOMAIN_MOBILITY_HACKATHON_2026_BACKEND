@@ -1,6 +1,9 @@
-from fastapi import APIRouter, HTTPException
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from freshswitch_backend.api.auth import current_org_id
 from freshswitch_backend.domain.models import ContainerSettlement, TariffSheet
 from freshswitch_backend.execution.quality import (
     ArrivalInspection,
@@ -15,6 +18,8 @@ from freshswitch_backend.planning.store import store
 from freshswitch_backend.quality import quality_history
 
 router = APIRouter(prefix="/plans", tags=["settlement"])
+
+OrgId = Annotated[str, Depends(current_org_id)]
 
 
 class SettlementView(BaseModel):
@@ -32,8 +37,8 @@ class SettlementView(BaseModel):
 
 
 @router.get("/{plan_id}/settlement")
-def read_settlement(plan_id: str) -> SettlementView:
-    session = store.get(plan_id)
+def read_settlement(plan_id: str, org_id: OrgId) -> SettlementView:
+    session = store.get(plan_id, org_id=org_id)
     if session is None:
         raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")
     settlements = adjusted_settlements(session.plan, session.arrival_inspections)
@@ -59,14 +64,14 @@ def read_settlement(plan_id: str) -> SettlementView:
 
 
 @router.post("/{plan_id}/settlement/arrival")
-def post_arrival(plan_id: str, body: ArrivalRequest) -> ArrivalSettlementResult:
-    if store.get(plan_id) is None:
+def post_arrival(plan_id: str, body: ArrivalRequest, org_id: OrgId) -> ArrivalSettlementResult:
+    if store.get(plan_id, org_id=org_id) is None:
         raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")
     try:
-        result, session = store.record_arrival_snapshot(plan_id, body)
+        result, session = store.record_arrival_snapshot(plan_id, body, org_id=org_id)
     except QualityError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다") from exc
-    quality_history.record_arrival(plan_id, session, result)
+    quality_history.record_arrival(plan_id, session, result, org_id=org_id)
     return result

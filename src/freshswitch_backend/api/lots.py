@@ -1,31 +1,36 @@
 from datetime import date
 from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from freshswitch_backend.api.intake import intake_error, register
+from freshswitch_backend.api.auth import current_org_id
+from freshswitch_backend.api.intake import DEMO_SCOPE, IntakeScope, Scope, intake_error, register
 from freshswitch_backend.data.loader import get_scenario
+from freshswitch_backend.domain.models import Scenario
 from freshswitch_backend.intake.models import FieldError, IntakePreview, IntakeRequest
 from freshswitch_backend.intake.service import IntakeError, resolve_names
 from freshswitch_backend.lots import LotFilter, LotPatch, LotStatus, RegisteredLot, lot_store
 
 router = APIRouter(prefix="/lots", tags=["lots"])
 
+OrgId = Annotated[str, Depends(current_org_id)]
 
-def _lot(lot_id: str) -> RegisteredLot:
-    lot = lot_store.get(lot_id)
+
+def _lot(lot_id: str, org_id: str) -> RegisteredLot:
+    lot = lot_store.get(lot_id, org_id=org_id)
     if lot is None:
         raise HTTPException(status_code=404, detail="등록된 로트를 찾을 수 없습니다")
     return lot
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
-def create_lot(body: IntakeRequest) -> IntakePreview:
-    return register(body)
+def create_lot(body: IntakeRequest, scope: Scope) -> IntakePreview:
+    return register(body, scope)
 
 
 @router.get("")
 def list_lots(
+    org_id: OrgId,
     scenario_id: str | None = None,
     shipper: str | None = None,
     product: str | None = None,
@@ -47,20 +52,25 @@ def list_lots(
             ready_to=ready_to,
             limit=limit,
             offset=offset,
-        )
+        ),
+        org_id=org_id,
     )
 
 
 @router.get("/{lot_id}")
-def read_lot(lot_id: str) -> RegisteredLot:
-    return _lot(lot_id)
+def read_lot(lot_id: str, org_id: OrgId) -> RegisteredLot:
+    return _lot(lot_id, org_id)
 
 
-def _validate_patch(lot: RegisteredLot, patch: LotPatch) -> dict[str, Any]:
+def _validate_patch(
+    lot: RegisteredLot, patch: LotPatch, scope: IntakeScope = DEMO_SCOPE
+) -> dict[str, Any]:
     changes = patch.model_dump(exclude_unset=True)
     values: dict[str, Any] = {}
     errors: list[FieldError] = []
-    scenario = get_scenario(lot.scenario_id)
+    scenario: Scenario | None = (
+        get_scenario(lot.scenario_id) if scope is DEMO_SCOPE else scope.scenario(lot.scenario_id)
+    )
     if {"product", "shipper", "destination"} & changes.keys():
         if scenario is None:
             raise HTTPException(
@@ -110,9 +120,12 @@ def _validate_patch(lot: RegisteredLot, patch: LotPatch) -> dict[str, Any]:
 
 
 @router.patch("/{lot_id}")
-def update_lot(lot_id: str, patch: LotPatch) -> RegisteredLot:
+def update_lot(lot_id: str, patch: LotPatch, scope: Scope, org_id: OrgId) -> RegisteredLot:
+    extra = () if scope is DEMO_SCOPE else (scope,)
     try:
-        updated = lot_store.update(lot_id, lambda lot: _validate_patch(lot, patch))
+        updated = lot_store.update(
+            lot_id, lambda lot: _validate_patch(lot, patch, *extra), org_id=org_id
+        )
     except IntakeError as exc:
         raise intake_error(exc) from exc
     if updated is None:
@@ -121,6 +134,6 @@ def update_lot(lot_id: str, patch: LotPatch) -> RegisteredLot:
 
 
 @router.delete("/{lot_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_lot(lot_id: str) -> None:
-    if not lot_store.delete(lot_id):
+def delete_lot(lot_id: str, org_id: OrgId) -> None:
+    if not lot_store.delete(lot_id, org_id=org_id):
         raise HTTPException(status_code=404, detail="등록된 로트를 찾을 수 없습니다")
