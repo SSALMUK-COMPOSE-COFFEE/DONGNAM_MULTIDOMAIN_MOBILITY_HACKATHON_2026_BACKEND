@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.routing import APIRoute
 from fastapi.security import HTTPAuthorizationCredentials
 
-from freshswitch_backend.api import auth, coldchain, demo, health, quality
+from freshswitch_backend.api import auth, coldchain, demo, health, quality, showcase
 from freshswitch_backend.api.access import require_demo_reset
 from freshswitch_backend.api.auth import app_settings, current_principal
 
@@ -23,7 +23,7 @@ def _endpoints(*routers: APIRouter) -> frozenset[Endpoint]:
     )
 
 
-PUBLIC_ENDPOINTS = _endpoints(auth.router, health.router)
+PUBLIC_ENDPOINTS = _endpoints(auth.router, health.router, showcase.router)
 DEVICE_ENDPOINTS: frozenset[Endpoint] = frozenset({coldchain.ingest})
 ADMIN_TOKEN_ENDPOINTS: frozenset[Endpoint] = frozenset(
     {demo.reset, quality.reset, quality.delete_observation}
