@@ -1,3 +1,5 @@
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
@@ -6,6 +8,7 @@ from sqlalchemy import select, update
 
 from freshswitch_backend.main import app
 from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.orgs import redeem_invitation
 from freshswitch_backend.persistence.tables import MembershipRow, OrgInvitationRow, UserRow
 
 PASSWORD = "members-password"
@@ -72,6 +75,10 @@ def test_signup_with_invite_code_joins_existing_org() -> None:
 
     assert staff.post("/api/saas/org/invitations", json={}).status_code == 403
     assert staff.get("/api/saas/org/invitations").status_code == 403
+    pending = _invite(admin)
+    assert staff.delete(f"/api/saas/org/invitations/{pending['invitation_id']}").status_code == 403
+    still = admin.get("/api/saas/org/invitations").json()[0]
+    assert (still["invitation_id"], still["status"]) == (pending["invitation_id"], "pending")
 
 
 def test_signup_requires_org_fields_without_invite() -> None:
@@ -156,3 +163,35 @@ def test_sandbox_orgs_cannot_invite_or_accept(demo_tenants) -> None:
     assert anonymous.get("/api/saas/org/members").status_code == 401
     accept = anonymous.post("/api/saas/invitations/accept", json={"code": invitation["code"]})
     assert accept.status_code == 401
+
+
+def test_concurrent_accepts_of_two_invitations_return_conflict() -> None:
+    admin, org_id = _admin("boss@race.example.com", "경합 농장")
+    first = _invite(admin)
+    second = _invite(admin)
+    joiner, own_org = _admin("joiner@race.example.com", "가입자 농장")
+    user_id = joiner.get("/api/me").json()["user"]["id"]
+    results: list[int] = []
+
+    def accept() -> None:
+        response = joiner.post("/api/saas/invitations/accept", json={"code": second["code"]})
+        results.append(response.status_code)
+
+    with database.begin() as db:
+        redeem_invitation(db, first["code"], user_id)
+        racer = threading.Thread(target=accept)
+        racer.start()
+        time.sleep(0.5)
+        assert racer.is_alive()
+    racer.join(timeout=10)
+
+    assert results == [409]
+    statuses = {
+        i["invitation_id"]: i["status"] for i in admin.get("/api/saas/org/invitations").json()
+    }
+    assert statuses == {first["invitation_id"]: "used", second["invitation_id"]: "pending"}
+    with database.begin() as db:
+        rows = db.scalars(
+            select(MembershipRow.org_id).where(MembershipRow.user_id == user_id)
+        ).all()
+    assert sorted(rows) == sorted([org_id, own_org])

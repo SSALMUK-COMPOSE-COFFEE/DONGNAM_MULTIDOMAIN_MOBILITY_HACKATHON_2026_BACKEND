@@ -93,9 +93,14 @@ def redeem_invitation(
     org = db.get(OrganizationRow, invitation.org_id)
     if org is None or org.sandbox or org.type == "demo":
         raise InvalidInvitation(INVALID_INVITATION)
-    if db.get(MembershipRow, (user_id, org.id)) is not None:
+    inserted = db.scalar(
+        insert(MembershipRow)
+        .values(user_id=user_id, org_id=org.id, role=invitation.role, created_at=moment)
+        .on_conflict_do_nothing(index_elements=[MembershipRow.user_id, MembershipRow.org_id])
+        .returning(MembershipRow.user_id)
+    )
+    if inserted is None:
         raise AlreadyMember(ALREADY_MEMBER)
-    db.add(MembershipRow(user_id=user_id, org_id=org.id, role=invitation.role, created_at=moment))
     invitation.used_by = user_id
     invitation.used_at = moment
     db.flush()
