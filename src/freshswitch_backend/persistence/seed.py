@@ -3,19 +3,22 @@ import getpass
 import os
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, exists, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from freshswitch_backend.data.loader import get_scenario
+from freshswitch_backend.data.loader import get_scenario, load_scenarios
 from freshswitch_backend.persistence.database import Database, database
 from freshswitch_backend.persistence.orgs import insert_demo_org
 from freshswitch_backend.persistence.passwords import hash_password
 from freshswitch_backend.persistence.tables import (
+    LotRow,
     MembershipRow,
     OrganizationRow,
     PackhouseRow,
+    PlanRow,
     ShipperProfileRow,
     UserRow,
 )
@@ -192,6 +195,95 @@ class SeedError(ValueError):
     pass
 
 
+def _sandbox_profile_orgs(db: Session) -> dict[str, str]:
+    rows = db.execute(
+        select(ShipperProfileRow.id, ShipperProfileRow.org_id)
+        .join(OrganizationRow, OrganizationRow.id == ShipperProfileRow.org_id)
+        .where(OrganizationRow.type == "shipper", OrganizationRow.sandbox.is_(True))
+    ).all()
+    return {profile_id: org_id for profile_id, org_id in rows}
+
+
+def _real_plan_lot_ids(db: Session) -> set[str]:
+    rows = db.scalars(
+        select(PlanRow.payload["registered_lot_ids"])
+        .join(OrganizationRow, OrganizationRow.id == PlanRow.org_id)
+        .where(OrganizationRow.sandbox.is_(False))
+    )
+    return {lot_id for ids in rows for lot_id in ids or []}
+
+
+def _drop_other_scenario_lots(db: Session, scenario_id: str, owner_orgs: set[str]) -> None:
+    seeded = {lot.id for scenario in load_scenarios().values() for lot in scenario.lots}
+    if not seeded or not owner_orgs:
+        return
+    referenced = exists().where(
+        PlanRow.payload["registered_lot_ids"].contains(func.jsonb_build_array(LotRow.id))
+    )
+    db.execute(
+        delete(LotRow).where(
+            LotRow.id.in_(seeded),
+            LotRow.shipper_org_id.in_(owner_orgs),
+            LotRow.scenario_id != scenario_id,
+            LotRow.status == "registered",
+            ~referenced,
+        )
+    )
+
+
+def seed_lots(db: Session, scenario_id: str = SCENARIO_ID, now: datetime | None = None) -> int:
+    scenario = get_scenario(scenario_id)
+    if scenario is None:
+        raise SeedError(f"시나리오를 찾을 수 없습니다: {scenario_id}")
+    owners = _sandbox_profile_orgs(db)
+    _drop_other_scenario_lots(db, scenario.id, set(owners.values()))
+    blocked = _real_plan_lot_ids(db)
+    packhouses = {s.id: s.packhouse_id for s in scenario.shippers}
+    stamp = now or datetime.now(UTC)
+    values = [
+        {
+            "id": lot.id,
+            "scenario_id": scenario.id,
+            "shipper_id": lot.shipper_id,
+            "shipper_org_id": owners[lot.shipper_id],
+            "product_id": lot.product_id,
+            "pallets": lot.pallets,
+            "ready_date": lot.ready_date,
+            "destination": lot.destination,
+            "sell_by_date": lot.sell_by_date,
+            "sell_window": lot.sell_window,
+            "packhouse": packhouses.get(lot.shipper_id),
+            "source": lot.source,
+            "status": "registered",
+            "created_at": stamp,
+            "updated_at": stamp,
+        }
+        for lot in scenario.lots
+        if lot.shipper_id in owners and lot.id not in blocked
+    ]
+    if not values:
+        return 0
+    inserted = db.execute(
+        insert(LotRow)
+        .values(values)
+        .on_conflict_do_nothing(index_elements=[LotRow.id])
+        .returning(LotRow.id)
+    )
+    return len(inserted.all())
+
+
+def reset_to_baseline(
+    db: Session, scenario_id: str = SCENARIO_ID, now: datetime | None = None
+) -> int:
+    seed_demo_tenants(db)
+    return seed_lots(db, scenario_id, now)
+
+
+def run_lots(target: Database | None = None, scenario_id: str = SCENARIO_ID) -> int:
+    with (target or database).begin() as db:
+        return seed_lots(db, scenario_id)
+
+
 @dataclass(frozen=True)
 class CreatedPlatform:
     org_id: str
@@ -254,6 +346,11 @@ def _parser() -> argparse.ArgumentParser:
     platform.add_argument("--email", required=True)
     platform.add_argument("--user-name", required=True)
     platform.add_argument("--org-id", default=None)
+    scenarios = sorted(load_scenarios())
+    lots = commands.add_parser("lots", help="sandbox 화주 조직에 시나리오 출하를 등록 상태로 넣기")
+    lots.add_argument("--scenario", default=SCENARIO_ID, choices=scenarios)
+    reset = commands.add_parser("reset-sandbox", help="sandbox 조직 데이터를 지우고 기준 상태로")
+    reset.add_argument("--scenario", default=SCENARIO_ID, choices=scenarios)
     return parser
 
 
@@ -276,8 +373,20 @@ def main(argv: list[str] | None = None) -> None:
             parser.exit(1, f"{exc}\n")
         print(f"org_id={created.org_id} user_id={created.user_id} email={created.email}")
         return
-    counts = run(password=args.password)
-    print(" ".join(f"{kind}={count}" for kind, count in sorted(counts.items())))
+    if args.command == "lots":
+        print(f"lots={run_lots(scenario_id=args.scenario)}")
+        return
+    if args.command == "reset-sandbox":
+        from freshswitch_backend.persistence.sandbox_reset import reset_sandbox
+
+        result = reset_sandbox(scenario_id=args.scenario)
+        print(f"scope=sandbox orgs={result.orgs} reset_at={result.reset_at.isoformat()}")
+        return
+    with database.begin() as db:
+        seed_demo_tenants(db, args.password)
+        added = seed_lots(db)
+        counts = org_counts(db)
+    print(" ".join(f"{kind}={count}" for kind, count in sorted(counts.items())), f"lots={added}")
 
 
 if __name__ == "__main__":
