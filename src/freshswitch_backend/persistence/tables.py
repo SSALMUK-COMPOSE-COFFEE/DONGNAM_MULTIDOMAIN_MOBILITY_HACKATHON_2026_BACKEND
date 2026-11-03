@@ -330,3 +330,63 @@ class ObservationRow(Base):
     recorded_at: Mapped[datetime]
     inspection_revision: Mapped[int | None]
     payload: Mapped[Json]
+
+
+CHANGE_REQUEST_TYPES = ("reduce", "cancel", "air_switch")
+CHANGE_REQUEST_STATUSES = ("open", "applied", "rejected")
+
+
+class ChangeRequestRow(Base):
+    __tablename__ = "plan_change_requests"
+    __table_args__ = (
+        CheckConstraint(
+            "type IN ('reduce', 'cancel', 'air_switch')", name="plan_change_requests_type_check"
+        ),
+        CheckConstraint(
+            "status IN ('open', 'applied', 'rejected')", name="plan_change_requests_status_check"
+        ),
+        Index("ix_plan_change_requests_org_status", "org_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(), unique=True)
+    plan_id: Mapped[str] = mapped_column(String(64), _plan_fk(), index=True)
+    org_id: Mapped[str] = mapped_column(String(64), _org_fk("CASCADE"))
+    shipper_org_id: Mapped[str] = mapped_column(String(64), _org_fk("CASCADE"), index=True)
+    shipper_id: Mapped[str] = mapped_column(String(100))
+    lot_id: Mapped[str] = mapped_column(String(120))
+    type: Mapped[str] = mapped_column(String(20))
+    new_pallets: Mapped[int | None] = mapped_column(Integer)
+    reason: Mapped[str | None] = mapped_column(String(500))
+    status: Mapped[str] = mapped_column(String(20), server_default="open")
+    estimate: Mapped[Json | None]
+    replan_id: Mapped[str | None] = mapped_column(String(64))
+    alternative_id: Mapped[str | None] = mapped_column(String(40))
+    order_id: Mapped[str | None] = mapped_column(String(64))
+    decision_note: Mapped[str | None] = mapped_column(String(500))
+    requested_by: Mapped[str | None] = mapped_column(String(64), _user_fk("SET NULL"))
+    created_at: Mapped[datetime]
+    updated_at: Mapped[datetime]
+    decided_at: Mapped[datetime | None]
+
+
+class NotificationRow(Base):
+    __tablename__ = "notifications"
+    __table_args__ = (Index("ix_notifications_org_seq", "org_id", "seq"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(), unique=True)
+    org_id: Mapped[str] = mapped_column(String(64), _org_fk("CASCADE"))
+    shipper_id: Mapped[str | None] = mapped_column(String(100))
+    plan_id: Mapped[str | None] = mapped_column(String(64), _plan_fk(), index=True)
+    order_id: Mapped[str | None] = mapped_column(String(64))
+    change_request_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("plan_change_requests.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(40))
+    channel: Mapped[str] = mapped_column(String(40))
+    title: Mapped[str] = mapped_column(String(200))
+    body: Mapped[str] = mapped_column(String(2000))
+    link: Mapped[str] = mapped_column(String(500))
+    dedupe_key: Mapped[str] = mapped_column(String(300), unique=True)
+    created_at: Mapped[datetime]

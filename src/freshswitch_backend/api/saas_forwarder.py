@@ -15,6 +15,7 @@ from freshswitch_backend.api.saas_views import (
     without_settlement,
 )
 from freshswitch_backend.execution.models import ConfirmRequest, RequestResultBody
+from freshswitch_backend.notifications import notify_order_committed
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.tables import PlanRow
 from freshswitch_backend.planning.store import (
@@ -78,6 +79,7 @@ def confirm_order(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except SessionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    notify_order_committed(access.session, order, access.owner_org_id, store.clock())
     return forwarder_order_view(order)
 
 
