@@ -26,7 +26,8 @@ from freshswitch_backend.execution.models import (
     ExecutionOrder,
     RequestResultBody,
 )
-from freshswitch_backend.execution.orders import saas_requests
+from freshswitch_backend.execution.numbers import entered_numbers
+from freshswitch_backend.execution.orders import saas_requests, without_saas_basis
 from freshswitch_backend.forecast.observations import planned_voyages, record_schedule_check
 from freshswitch_backend.intake.tenants import load_catalog, tenant_scenario
 from freshswitch_backend.integrations import (
@@ -441,8 +442,9 @@ def _order_view(
     order: ExecutionOrder, session: PlanSession, org_id: str, request: Request
 ) -> ExecutionOrder:
     if org_id == DEMO_ORG and not app_settings(request).saas_mode:
-        return order
-    requests = saas_requests(order.plan_id, order.requests, session.scenario)
+        return without_saas_basis(order)
+    numbers = entered_numbers(order.plan_id)
+    requests = saas_requests(order.plan_id, order.requests, session.scenario, numbers=numbers)
     return order.model_copy(update={"requests": requests})
 
 

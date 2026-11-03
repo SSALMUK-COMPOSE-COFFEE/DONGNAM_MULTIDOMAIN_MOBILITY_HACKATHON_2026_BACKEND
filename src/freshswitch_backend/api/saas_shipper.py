@@ -84,8 +84,13 @@ def _access(plan_id: str, principal: Principal) -> PlanAccess:
     return plan_for(plan_id, principal)
 
 
-def _saas_order(order: ExecutionOrder, session: PlanSession) -> ExecutionOrder:
-    requests = saas_requests(order.plan_id, order.requests, session.scenario)
+def _saas_order(
+    order: ExecutionOrder,
+    session: PlanSession,
+    numbers: dict[str, EnteredNumbers] | None = None,
+) -> ExecutionOrder:
+    entered = entered_numbers(order.plan_id) if numbers is None else numbers
+    requests = saas_requests(order.plan_id, order.requests, session.scenario, numbers=entered)
     return order.model_copy(update={"requests": requests})
 
 
@@ -188,8 +193,10 @@ def read_container_numbers(
 @router.get("/plans/{plan_id}/orders")
 def list_orders(plan_id: str, principal: ShipperPrincipal) -> list[dict[str, Any]]:
     access = _access(plan_id, principal)
+    numbers = entered_numbers(plan_id)
     orders = [
-        _saas_order(o, access.session) for o in store.orders(plan_id, org_id=access.owner_org_id)
+        _saas_order(o, access.session, numbers)
+        for o in store.orders(plan_id, org_id=access.owner_org_id)
     ]
     return anonymized_orders(access.session, orders, access.viewer.shipper_ids)
 

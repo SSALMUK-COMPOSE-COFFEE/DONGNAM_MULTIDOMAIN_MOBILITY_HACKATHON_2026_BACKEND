@@ -63,6 +63,17 @@ class AutomaticAction(BaseModel):
     done: bool = False
 
 
+class RequestBasis(BaseModel):
+    head: str
+    container_kind: str
+    si_cutoff: datetime
+    vgm_cutoff: datetime
+    cy_cutoff: datetime
+    net_kg_before: float
+    net_kg_after: float
+    setting: str
+
+
 class ExternalRequest(BaseModel):
     request_id: str
     kind: RequestKind
@@ -81,6 +92,7 @@ class ExternalRequest(BaseModel):
     document_action: DocumentAction | None = None
     document_action_label: str | None = None
     plain_text: str | None = None
+    saas_basis: RequestBasis | None = Field(default=None, exclude_if=lambda value: value is None)
     status: RequestStatus = "pending"
     note: str | None = None
     answered_at: datetime | None = None

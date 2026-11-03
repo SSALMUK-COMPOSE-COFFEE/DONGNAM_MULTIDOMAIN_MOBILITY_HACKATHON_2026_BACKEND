@@ -18,6 +18,7 @@ from freshswitch_backend.coldchain.power_plan import power_plan
 from freshswitch_backend.domain.models import Scenario
 from freshswitch_backend.execution.card import (
     ContainerExecution,
+    EnteredNumbers,
     ExecutionCard,
     ExecutionNumbersInput,
     build_execution_card,
@@ -53,9 +54,12 @@ class ForwarderDecision(BaseModel):
     note: str | None = None
 
 
-def _order_view(order: ExecutionOrder, scenario: Scenario) -> ForwarderOrder:
+def _order_view(
+    order: ExecutionOrder, scenario: Scenario, numbers: dict[str, EnteredNumbers] | None = None
+) -> ForwarderOrder:
     view = forwarder_order_view(order)
-    view.requests = saas_requests(order.plan_id, view.requests, scenario)
+    entered = entered_numbers(order.plan_id) if numbers is None else numbers
+    view.requests = saas_requests(order.plan_id, view.requests, scenario, numbers=entered)
     return view
 
 
@@ -136,7 +140,10 @@ def save_container_numbers(
 def list_orders(plan_id: str, principal: ForwarderPrincipal) -> list[ForwarderOrder]:
     access = plan_for(plan_id, principal)
     scenario = access.session.scenario
-    return [_order_view(o, scenario) for o in store.orders(plan_id, org_id=access.owner_org_id)]
+    numbers = entered_numbers(plan_id)
+    return [
+        _order_view(o, scenario, numbers) for o in store.orders(plan_id, org_id=access.owner_org_id)
+    ]
 
 
 @router.post("/plans/{plan_id}/orders/{order_id}/confirm")

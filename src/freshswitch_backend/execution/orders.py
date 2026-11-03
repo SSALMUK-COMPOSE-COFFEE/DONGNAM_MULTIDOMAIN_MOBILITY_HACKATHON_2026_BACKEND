@@ -1,13 +1,14 @@
 import re
 import uuid
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import TYPE_CHECKING
 
 from freshswitch_backend.domain.models import DEFAULT_PALLET_KG, KST, Lot, Plan, Scenario
 from freshswitch_backend.execution.card import (
+    EnteredNumbers,
     ExecutionCard,
     GensetInstruction,
     cutoff_timeline,
@@ -23,6 +24,7 @@ from freshswitch_backend.execution.models import (
     ExecutionOrder,
     ExternalRequest,
     OrderLogEntry,
+    RequestBasis,
     ShipperConfirmation,
 )
 from freshswitch_backend.execution.params import ExecutionParams
@@ -118,6 +120,14 @@ class _Ctx:
     def shipper_name(self, shipper_id: str) -> str:
         shipper = self.shippers.get(shipper_id)
         return shipper.name if shipper else shipper_id
+
+    def net_kg(self, composition: dict[str, int]) -> float:
+        total = 0.0
+        for lot_id, pallets in composition.items():
+            lot = self.lot(lot_id)
+            product = self.products.get(lot.product_id) if lot else None
+            total += pallets * (product.net_pallet_kg if product else DEFAULT_PALLET_KG)
+        return total
 
     def kg(self, lot_id: str, pallets: int) -> int:
         lot = self.lot(lot_id)
@@ -354,6 +364,17 @@ def build_order(
         )
         composition = _composition_text(ctx, before, after)
         lot_ids = sorted(set(before) | set(after))
+        timeline = cutoff_timeline(voyage, p)
+        basis = RequestBasis(
+            head=head,
+            container_kind=container.kind,
+            si_cutoff=timeline.si_cutoff,
+            vgm_cutoff=timeline.vgm_cutoff,
+            cy_cutoff=timeline.cy_cutoff,
+            net_kg_before=ctx.net_kg(before),
+            net_kg_after=ctx.net_kg(after),
+            setting=_scenario_setting(scenario_after, lot_ids),
+        )
         common = {
             "voyage_id": voyage.id,
             "container_id": cid,
@@ -377,6 +398,7 @@ def build_order(
                     f"부탁드립니다. CY 반입 마감 {fmt(voyage.cy_cutoff)} 유지. "
                     f"회신 기한 {fmt(booking_deadline)}."
                 ),
+                saas_basis=basis,
                 **common,
             )
         elif before:
@@ -392,6 +414,7 @@ def build_order(
                     f"{composition}. CA 장비 반납 일정과 취소료 조건 회신 부탁드립니다. "
                     f"회신 기한 {fmt(booking_deadline)}."
                 ),
+                saas_basis=basis,
                 **common,
             )
         else:
@@ -408,6 +431,7 @@ def build_order(
                     f"설정: {setting}. 장비 PTI·공컨테이너 반출 일정 회신 부탁드립니다. "
                     f"CY 반입 마감 {fmt(voyage.cy_cutoff)}. 회신 기한 {fmt(booking_deadline)}."
                 ),
+                saas_basis=basis,
                 **common,
             )
             requests.add(
@@ -723,7 +747,8 @@ def container_swaps(
     groups: dict[tuple[str | None, str | None], list[int]] = defaultdict(list)
     for i, r in enumerate(requests):
         if r.kind in SAAS_REQUEST_KINDS:
-            groups[(r.voyage_id, kinds.get(r.container_id or ""))].append(i)
+            kind = r.saas_basis.container_kind if r.saas_basis else kinds.get(r.container_id or "")
+            groups[(r.voyage_id, kind)].append(i)
     swaps: dict[int, tuple[str, str]] = {}
     for (_, kind), members in groups.items():
         if kind is None or sum(container_count_delta(requests[i]) for i in members) != 0:
@@ -794,52 +819,83 @@ def _scenario_setting(scenario: Scenario, lot_ids: list[str]) -> str:
     return "; ".join(texts) or "품목 조건 없음(선사 기본 설정)"
 
 
+def _scenario_basis(
+    request: ExternalRequest, scenario: Scenario, params: ExecutionParams
+) -> RequestBasis | None:
+    voyage = next((v for v in scenario.voyages if v.id == request.voyage_id), None)
+    container = next((c for c in scenario.containers if c.id == request.container_id), None)
+    if voyage is None or container is None:
+        return None
+    ports = {port.id: port.name for port in scenario.ports}
+    cutoffs = cutoff_timeline(voyage, params)
+    if request.lot_pallets_before or request.lot_pallets_after:
+        net_before = _net_kg(scenario, request.lot_pallets_before)
+        net_after = _net_kg(scenario, request.lot_pallets_after)
+    else:
+        per_pallet = _net_per_pallet(scenario, request.lot_ids)
+        net_before = per_pallet * request.pallets_before
+        net_after = per_pallet * request.pallets_after
+    return RequestBasis(
+        head=(
+            f"{voyage.vessel_name}({voyage.id}, {voyage.terminal}, ETD {fmt(voyage.etd)}) "
+            f"{ports.get(voyage.origin, voyage.origin)}→"
+            f"{ports.get(voyage.destination, voyage.destination)}"
+        ),
+        container_kind=container.kind,
+        si_cutoff=cutoffs.si_cutoff,
+        vgm_cutoff=cutoffs.vgm_cutoff,
+        cy_cutoff=cutoffs.cy_cutoff,
+        net_kg_before=net_before,
+        net_kg_after=net_after,
+        setting=_scenario_setting(scenario, request.lot_ids),
+    )
+
+
+def _booking_label(
+    plan_id: str, container_id: str, numbers: Mapping[str, EnteredNumbers] | None
+) -> str:
+    entered = (numbers or {}).get(container_id)
+    if entered is not None and entered.booking_no:
+        return entered.booking_no
+    return f"{mock_booking_no(plan_id, container_id)}(모의)"
+
+
 def saas_request_text(
     plan_id: str,
     request: ExternalRequest,
     scenario: Scenario,
     params: ExecutionParams | None = None,
     swap: tuple[str, str] | None = None,
+    numbers: Mapping[str, EnteredNumbers] | None = None,
 ) -> str:
     p = params or ExecutionParams()
-    voyages = {v.id: v for v in scenario.voyages}
-    containers = {c.id: c for c in scenario.containers}
-    voyage = voyages.get(request.voyage_id or "")
-    container = containers.get(request.container_id or "")
     action = document_action(request, swap)
-    if action is None or voyage is None or container is None:
+    if action is None:
         return request.text
-    ports = {port.id: port.name for port in scenario.ports}
+    basis = request.saas_basis or _scenario_basis(request, scenario, p)
+    if basis is None:
+        return request.text
     pb, pa = request.pallets_before, request.pallets_after
-    if request.lot_pallets_before or request.lot_pallets_after:
-        gb = gross_cargo_kg(_net_kg(scenario, request.lot_pallets_before), pb, p)
-        ga = gross_cargo_kg(_net_kg(scenario, request.lot_pallets_after), pa, p)
-    else:
-        per_pallet = _net_per_pallet(scenario, request.lot_ids)
-        gb = gross_cargo_kg(per_pallet * pb, pb, p)
-        ga = gross_cargo_kg(per_pallet * pa, pa, p)
+    gb = gross_cargo_kg(basis.net_kg_before, pb, p)
+    ga = gross_cargo_kg(basis.net_kg_after, pa, p)
     tare = p.container_tare_kg.value
-    cid = request.container_id
-    booking = mock_booking_no(plan_id, cid)
-    cutoffs = cutoff_timeline(voyage, p)
-    head = (
-        f"{voyage.vessel_name}({voyage.id}, {voyage.terminal}, ETD {fmt(voyage.etd)}) "
-        f"{ports.get(voyage.origin, voyage.origin)}→"
-        f"{ports.get(voyage.destination, voyage.destination)}"
-    )
+    cid = request.container_id or ""
+    booking = _booking_label(plan_id, cid, numbers)
+    head = basis.head
+    kind = basis.container_kind
     lots = ", ".join(request.lot_ids) or "없음"
     found = re.search(r"화주별 파렛트: (.+?)\. ", request.text)
     if found:
         lots = f"{lots}. 화주별 파렛트: {found.group(1)}"
     timeline = (
-        f"SI 마감 {fmt(cutoffs.si_cutoff)}, VGM 마감 {fmt(cutoffs.vgm_cutoff)}, "
-        f"CY 반입 마감 {fmt(cutoffs.cy_cutoff)}"
+        f"SI 마감 {fmt(basis.si_cutoff)}, VGM 마감 {fmt(basis.vgm_cutoff)}, "
+        f"CY 반입 마감 {fmt(basis.cy_cutoff)}"
     )
     if swap is not None:
         source, target = swap
         return (
-            f"[SI 정정 + VGM 재제출 요청] {head} 부킹 {mock_booking_no(plan_id, source)}(모의) "
-            f"컨테이너 {source}→{target} 교체({container.kind}), 컨테이너 수·종류가 같아 "
+            f"[SI 정정 + VGM 재제출 요청] {head} 부킹 {_booking_label(plan_id, source, numbers)} "
+            f"컨테이너 {source}→{target} 교체({kind}), 컨테이너 수·종류가 같아 "
             f"부킹은 그대로 둡니다. 이 요청 대상 {cid} 적재 {pb}→{pa}파렛트, 화물 총중량 "
             f"{gb:,}→{ga:,}kg(순중량 + 파렛트·포장)으로 SI 정정하고 VGM "
             f"{vgm_kg(gb, p) if pb else 0:,}→{vgm_kg(ga, p) if pa else 0:,}kg"
@@ -848,8 +904,8 @@ def saas_request_text(
         )
     if action == "si_vgm_correction":
         return (
-            f"[SI 정정 + VGM 재제출 요청] {head} 부킹 {booking}(모의)의 컨테이너 {cid}"
-            f"({container.kind}) 적재를 {pb}→{pa}파렛트, 화물 총중량 {gb:,}→{ga:,}kg"
+            f"[SI 정정 + VGM 재제출 요청] {head} 부킹 {booking}의 컨테이너 {cid}"
+            f"({kind}) 적재를 {pb}→{pa}파렛트, 화물 총중량 {gb:,}→{ga:,}kg"
             f"(순중량 + 파렛트·포장)으로 SI 정정하고 VGM {vgm_kg(gb, p):,}→{vgm_kg(ga, p):,}kg"
             f"(컨테이너 자중 {tare:,.0f}kg 포함)으로 재제출합니다. 컨테이너 수·종류가 같아 "
             f"부킹은 그대로 둡니다. 대상 출하: {lots}. {timeline}. "
@@ -857,17 +913,16 @@ def saas_request_text(
         )
     if container_count_delta(request) < 0:
         return (
-            f"[부킹 변경 요청: 컨테이너 1대 취소] {head} 부킹 {booking}(모의)의 컨테이너 {cid}"
-            f"({container.kind}, {pb}파렛트·화물 총중량 {gb:,}kg)를 취소합니다. "
+            f"[부킹 변경 요청: 컨테이너 1대 취소] {head} 부킹 {booking}의 컨테이너 {cid}"
+            f"({kind}, {pb}파렛트·화물 총중량 {gb:,}kg)를 취소합니다. "
             f"대상 출하: {lots}. CA 장비 반납 일정과 취소 조건 회신 부탁드립니다. "
             f"회신 기한 {fmt(request.deadline)}."
         )
     return (
-        f"[부킹 변경 요청: 컨테이너 1대 추가] {head} {container.kind} 1대({cid}), "
+        f"[부킹 변경 요청: 컨테이너 1대 추가] {head} {kind} 1대({cid}), "
         f"{pa}파렛트·화물 총중량 {ga:,}kg(VGM {vgm_kg(ga, p):,}kg, 컨테이너 자중 "
-        f"{tare:,.0f}kg 포함). 대상 출하: {lots}. 설정: "
-        f"{_scenario_setting(scenario, request.lot_ids)}. 장비 PTI·공컨테이너 반출 일정 "
-        f"회신 부탁드립니다. {timeline}. 회신 기한 {fmt(request.deadline)}."
+        f"{tare:,.0f}kg 포함). 대상 출하: {lots}. 설정: {basis.setting}. 장비 PTI·공컨테이너 "
+        f"반출 일정 회신 부탁드립니다. {timeline}. 회신 기한 {fmt(request.deadline)}."
     )
 
 
@@ -876,6 +931,7 @@ def saas_requests(
     requests: list[ExternalRequest],
     scenario: Scenario,
     params: ExecutionParams | None = None,
+    numbers: Mapping[str, EnteredNumbers] | None = None,
 ) -> list[ExternalRequest]:
     swaps = container_swaps(requests, scenario)
     out = []
@@ -885,14 +941,22 @@ def saas_requests(
         out.append(
             r.model_copy(
                 update={
-                    "text": saas_request_text(plan_id, r, scenario, params, swap),
+                    "text": saas_request_text(plan_id, r, scenario, params, swap, numbers),
                     "document_action": action,
                     "document_action_label": DOCUMENT_ACTION_LABEL[action] if action else None,
                     "plain_text": plain_text(r, swap),
+                    "saas_basis": None,
                 }
             )
         )
     return out
+
+
+def without_saas_basis(order: ExecutionOrder) -> ExecutionOrder:
+    if all(r.saas_basis is None for r in order.requests):
+        return order
+    requests = [r.model_copy(update={"saas_basis": None}) for r in order.requests]
+    return order.model_copy(update={"requests": requests})
 
 
 def genset_instructions(
