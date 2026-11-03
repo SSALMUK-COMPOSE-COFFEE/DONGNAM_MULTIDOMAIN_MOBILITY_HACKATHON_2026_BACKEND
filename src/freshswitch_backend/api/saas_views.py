@@ -34,6 +34,13 @@ CONFIRMATION_MONEY = (
     "net_cost_delta",
 )
 CANCELLATION_MONEY = ("container_cost", "share_per_pallet_before", "share_per_pallet_after", "fee")
+INSPECTION_FIELDS = (
+    "lot_id",
+    "shipper_id",
+    "planned_loss_rate",
+    "inspected_loss_rate",
+    "inspected_at",
+)
 SETTLEMENT_ACTION = "settlement_recompute"
 SETTLEMENT_TITLE = "정산 재계산"
 TOTAL_COST_CLAUSE = re.compile(
@@ -359,11 +366,30 @@ def _scope_settlements(payload: dict[str, Any], own: set[str]) -> None:
             entry[name] = None
 
 
+def _operational_inspections(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {**{name: row[name] for name in INSPECTION_FIELDS}, "excess_loss_value": None, "note": None}
+        for row in rows
+    ]
+
+
+def _scope_tariffs(payload: dict[str, Any], session: PlanSession, own: set[str]) -> None:
+    products = {lot.product_id for lot in session.scenario.lots if lot.shipper_id in own}
+    plan = payload["plan"]
+    plan["settlement_tariffs"] = [
+        t for t in plan["settlement_tariffs"] if t["product_id"] in products
+    ]
+
+
 def anonymized_session(session: PlanSession, own_shipper_ids: Iterable[str]) -> dict[str, Any]:
     own = set(own_shipper_ids)
     payload = session.model_dump(mode="json")
     _scope_settlements(payload, own)
+    _scope_tariffs(payload, session, own)
     _scope_explanations(payload, own)
+    payload["arrival_inspections"] = [
+        row for row in payload["arrival_inspections"] if row["shipper_id"] in own
+    ]
     return Anonymizer(session.scenario, own).session(payload)
 
 
@@ -438,6 +464,7 @@ def without_settlement(session: PlanSession) -> dict[str, Any]:
         for name in HISTORY_MONEY:
             entry[name] = None
     _scope_explanations(payload, set())
+    payload["arrival_inspections"] = _operational_inspections(payload["arrival_inspections"])
     return payload
 
 
