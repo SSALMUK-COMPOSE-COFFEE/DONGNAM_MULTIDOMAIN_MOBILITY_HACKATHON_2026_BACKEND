@@ -4,7 +4,7 @@ from sqlalchemy import update
 from test_saas_api import _platform_plan
 
 from freshswitch_backend.persistence import database
-from freshswitch_backend.persistence.tables import OrganizationRow, PlanRow
+from freshswitch_backend.persistence.tables import OrganizationRow, PlanConfirmationRow, PlanRow
 
 
 def _assign(client: TestClient, plan_id: str):
@@ -39,6 +39,13 @@ def test_real_org_assignment_waits_for_shipper_confirmation(
     assert blocked.json()["detail"] == "화주 확인이 끝난 뒤 배정할 수 있습니다"
     with database.begin() as db:
         db.execute(update(PlanRow).where(PlanRow.plan_id == plan_id).values(status="committed"))
+    assert _assign(platform_client, plan_id).status_code == 409
+    with database.begin() as db:
+        db.execute(
+            update(PlanConfirmationRow)
+            .where(PlanConfirmationRow.plan_id == plan_id)
+            .values(status="accepted")
+        )
     allowed = _assign(platform_client, plan_id)
     assert allowed.status_code == 200, allowed.text
     assert allowed.json()["before_shipper_confirmation"] is False

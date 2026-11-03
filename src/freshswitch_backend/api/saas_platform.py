@@ -184,7 +184,11 @@ async def add_registered_lot(
         raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")
     event = await run_in_threadpool(_addable, session, body, principal)
     request = EventRequest(event=event, idempotency_key=body.idempotency_key)
-    return await post_event(plan_id, request, org_id=principal.org_id, llm=llm)
+    response = await post_event(plan_id, request, org_id=principal.org_id, llm=llm)
+    await run_in_threadpool(
+        store.mark_registered_add, plan_id, response.replan_id, event.lot.id, principal.org_id
+    )
+    return response
 
 
 def _compute_preview(scenario: Scenario, deadline: float) -> PlanPreview:

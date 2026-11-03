@@ -34,8 +34,8 @@ from freshswitch_backend.persistence.tables import (
     MembershipRow,
     OrganizationRow,
     PackhouseRow,
+    PlanConfirmationRow,
     PlanForwarderRow,
-    PlanRow,
     ShipperProfileRow,
     UserRow,
 )
@@ -303,7 +303,9 @@ def test_forwarder_assignment_stays_within_sandbox(worlds) -> None:
     assert real.put(path, json=assign).status_code == 409
     with database.begin() as db:
         db.execute(
-            update(PlanRow).where(PlanRow.plan_id == real_plan_id).values(status="committed")
+            update(PlanConfirmationRow)
+            .where(PlanConfirmationRow.plan_id == real_plan_id)
+            .values(status="accepted")
         )
     assert real.put(path, json=assign).status_code == 200
 

@@ -61,6 +61,7 @@ from freshswitch_backend.persistence.tables import (
     OrganizationRow,
     PendingRow,
     PlanConfirmationRow,
+    PlanForwarderRow,
     PlanRow,
 )
 from freshswitch_backend.planning.service import VoyagePickup, build_plan
@@ -77,12 +78,25 @@ from freshswitch_backend.replan import (
 )
 from freshswitch_backend.replan.engine import PREFERENCE
 from freshswitch_backend.replan.explanation import build_explain_context
-from freshswitch_backend.replan.models import AlternativeId, CancellationCharge
+from freshswitch_backend.replan.models import AlternativeId, CancellationCharge, PlanDiff
 
 MAX_SESSIONS = 200
 MAX_PENDING = 20
 MAX_ORDERS = 50
 MAX_IDEMPOTENCY_KEYS = 100
+REGISTERED_ADD = "registered_lot_id"
+RECOMPUTE_AFTER_ORDER = (
+    "포워더가 확정한 실행 지시가 있는 계획은 처음부터 다시 계산할 수 없습니다. "
+    "재계획 후보의 출하 취소로 거절한 화주를 빼세요(취소 부담금 없음)"
+)
+APPLY_BEFORE_CONFIRMATION = (
+    "화주 확인을 기다리는 계획은 바꿀 수 없습니다. 전원 수락을 기다리거나 "
+    "거절한 화주를 빼고 다시 계산하세요"
+)
+ADD_BEFORE_CONFIRMATION = (
+    "포워더가 배정된 계획에는 아직 계획을 수락하지 않은 화주의 출하를 넣을 수 없습니다. "
+    "포워더 배정을 해제한 뒤 넣고, 그 화주가 수락하면 다시 배정하세요"
+)
 
 SessionStatus = Literal["committed", "pending_confirmation", "pending_shipper_confirmation"]
 ConfirmationStatus = Literal["pending", "accepted", "rejected"]
@@ -227,6 +241,8 @@ class _State:
     orders: OrderedDict[str, ExecutionOrder]
     unconfirmed: set[str] = field(default_factory=set)
     release: set[str] = field(default_factory=set)
+    withdraw: set[str] = field(default_factory=set)
+    advanced: bool = False
 
     def settled_status(self) -> SessionStatus:
         shippers = {lot.shipper_id for lot in self.session.scenario.lots}
@@ -305,6 +321,8 @@ def _payload(
     owners: dict[str, str | None],
     created_by: datetime | None = None,
 ) -> dict[str, Any]:
+    registered = set(session.registered_lot_ids)
+    owners = {i: org for i, org in owners.items() if i in registered}
     missing = [i for i in session.registered_lot_ids if i not in owners]
     if missing:
         owners = {**owners, **lot_owners(db, missing, created_by)}
@@ -366,6 +384,166 @@ def _unconfirmed(db: Session, row: PlanRow) -> set[str]:
         for c in _round_rows(db, row.plan_id, row.confirmation_round)
         if c.status != "accepted"
     }
+
+
+def _present_shippers(row: PlanRow) -> set[str]:
+    lots = (row.payload.get("scenario") or {}).get("lots") or []
+    return {lot["shipper_id"] for lot in lots}
+
+
+def awaiting_shippers(db: Session, row: PlanRow) -> set[str]:
+    return _unconfirmed(db, row) & _present_shippers(row)
+
+
+def _accepted(db: Session, row: PlanRow) -> set[str]:
+    if not row.confirmation_round:
+        return set()
+    return {
+        c.shipper_id
+        for c in _round_rows(db, row.plan_id, row.confirmation_round)
+        if c.status == "accepted"
+    }
+
+
+def _sandbox(db: Session, org_id: str) -> bool:
+    return bool(db.scalar(select(OrganizationRow.sandbox).where(OrganizationRow.id == org_id)))
+
+
+def _has_forwarder(db: Session, plan_id: str) -> bool:
+    found = db.scalar(select(PlanForwarderRow.plan_id).where(PlanForwarderRow.plan_id == plan_id))
+    return found is not None
+
+
+def _current_owners(db: Session, row: PlanRow, session: PlanSession) -> dict[str, str | None]:
+    owners, created_by = _stored_owners(row)
+    missing = [i for i in session.registered_lot_ids if i not in owners]
+    return {**owners, **lot_owners(db, missing, created_by)}
+
+
+def _cleared(db: Session, row: PlanRow, session: PlanSession) -> set[str]:
+    if row.confirmation_round:
+        return _accepted(db, row)
+    return set(_participants(session, _current_owners(db, row, session)))
+
+
+def _guard_real_apply(db: Session, row: PlanRow, session: PlanSession, event: Event) -> None:
+    if row.org_id == DEMO_ORG or _sandbox(db, row.org_id):
+        return
+    if session.status == "pending_shipper_confirmation":
+        raise SessionConflict(APPLY_BEFORE_CONFIRMATION)
+    if (
+        isinstance(event, AddLotEvent)
+        and db.get(LotRow, event.lot.id) is not None
+        and event.lot.shipper_id not in _cleared(db, row, session)
+        and _has_forwarder(db, row.plan_id)
+    ):
+        raise SessionConflict(ADD_BEFORE_CONFIRMATION)
+
+
+def _withdraw(db: Session, row: PlanRow, shipper_ids: set[str]) -> None:
+    if not shipper_ids or not row.confirmation_round:
+        return
+    db.execute(
+        delete(PlanConfirmationRow).where(
+            PlanConfirmationRow.plan_id == row.plan_id,
+            PlanConfirmationRow.round == row.confirmation_round,
+            PlanConfirmationRow.shipper_id.in_(shipper_ids),
+        )
+    )
+    kept = [
+        c
+        for c in _candidates(row)
+        if not (c.source == "shipper_rejected" and c.shipper_id in shipper_ids)
+    ]
+    if len(kept) != len(row.replan_candidates or []):
+        _set_candidates(row, kept)
+
+
+def _shippers_of(scenario: Scenario) -> set[str]:
+    return {lot.shipper_id for lot in scenario.lots}
+
+
+def _departed(db: Session, row: PlanRow, state: _State) -> set[str]:
+    if not row.confirmation_round:
+        return set()
+    listed = {c.shipper_id for c in _round_rows(db, row.plan_id, row.confirmation_round)}
+    return listed - _shippers_of(state.session.scenario) - _shippers_of(state.committed.scenario)
+
+
+def _prune_candidates(row: PlanRow, state: _State) -> None:
+    if not state.advanced:
+        return
+    state.advanced = False
+    if row.org_id == DEMO_ORG or not row.needs_replan:
+        return
+    candidates = _candidates(row)
+    committed = state.committed
+    kept = _still_relevant(candidates, committed.scenario, committed.plan)
+    if len(kept) != len(candidates):
+        _set_candidates(row, kept)
+
+
+def _committed_orders(state: _State) -> bool:
+    if any(o.status in ("forwarder_confirmed", "executed") for o in state.orders.values()):
+        return True
+    history = state.session.history
+    rolled_back = {e.order_id for e in history if e.kind == "rollback"}
+    return any(
+        e.kind == "apply" and e.order_id not in state.orders and e.order_id not in rolled_back
+        for e in history
+    )
+
+
+def _rejecting_shipper(db: Session, row: PlanRow, session: PlanSession, event: Event) -> str | None:
+    if row.org_id == DEMO_ORG or not row.confirmation_round or not isinstance(event, CancelEvent):
+        return None
+    lot = next((lot for lot in session.scenario.lots if lot.id == event.lot_id), None)
+    if lot is None:
+        return None
+    rejected = any(
+        c.shipper_id == lot.shipper_id and c.status == "rejected"
+        for c in _round_rows(db, row.plan_id, row.confirmation_round)
+    )
+    return lot.shipper_id if rejected else None
+
+
+def _waive_diff(diff: PlanDiff | None, payer: str) -> bool:
+    if diff is None or diff.cancellation is None or diff.cancellation.payer_shipper_id != payer:
+        return False
+    diff.cancellation = None
+    for delta in diff.shippers:
+        delta.cancellation_adjustment = 0
+    return True
+
+
+def _waive_fee(session: PlanSession, result: ReplanResult, payer: str) -> None:
+    changed = [_waive_diff(a.diff, payer) for a in result.alternatives]
+    changed.append(_waive_diff(result.diff, payer))
+    if any(changed) and result.explanation is not None:
+        result.explanation = render_template(
+            build_explain_context(session.scenario, session.plan, result)
+        )
+
+
+def _excuse(order: ExecutionOrder, shipper_id: str, now: datetime) -> None:
+    kept = [c for c in order.shipper_confirmations if c.shipper_id != shipper_id]
+    if len(kept) == len(order.shipper_confirmations):
+        return
+    order.shipper_confirmations = kept
+    order.notified_shipper_ids = sorted({*order.notified_shipper_ids, shipper_id})
+    if kept:
+        order.deadlines.shipper = min(c.deadline for c in kept)
+        return
+    if order.status == "proposed":
+        order.status = "shipper_confirmed"
+        order.log.append(
+            OrderLogEntry(
+                at=now,
+                actor="system",
+                action="확인이 필요한 화주 없음 → 포워더 확정 대기",
+                status_after="shipper_confirmed",
+            )
+        )
 
 
 def _participants(
@@ -462,10 +640,22 @@ def _state_of(db: Session, row: PlanRow, session: PlanSession) -> PlanConfirmati
     )
 
 
-def _claim_added(db: Session, owner_org: str, event: AddLotEvent, now: datetime) -> str | None:
+def _registered_add(db: Session, row: PlanRow, event: Event) -> str | None:
+    if row.org_id == DEMO_ORG or not isinstance(event, AddLotEvent):
+        return None
+    if db.get(LotRow, event.lot.id) is None:
+        return None
+    return event.lot.id
+
+
+def _claim_added(
+    db: Session, owner_org: str, event: AddLotEvent, now: datetime, required: bool = False
+) -> str | None:
     lot_id = event.lot.id
-    lot = db.get(LotRow, lot_id)
+    lot = db.get(LotRow, lot_id, with_for_update=True)
     if lot is None:
+        if required:
+            raise LotTaken([lot_id])
         return None
     worlds = dict(
         db.execute(
@@ -517,10 +707,16 @@ def _rejected(row: PlanConfirmationRow, scenario: Scenario, now: datetime) -> Re
 
 
 def _invite_added(
-    db: Session, row: PlanRow, event: AddLotEvent, shipper_org: str, now: datetime
+    db: Session,
+    row: PlanRow,
+    session: PlanSession,
+    event: AddLotEvent,
+    shipper_org: str,
+    now: datetime,
 ) -> str | None:
     if not row.confirmation_round:
-        return None
+        _open_round(db, row, session, _current_owners(db, row, session), now, auto=True)
+        row.confirmation_round = row.confirmation_round or 1
     shipper_id = event.lot.shipper_id
     if any(
         c.shipper_id == shipper_id for c in _round_rows(db, row.plan_id, row.confirmation_round)
@@ -742,6 +938,12 @@ class SessionStore:
         if state.release:
             release_lots(db, state.release, session.updated_at)
             state.release = set()
+        gone = state.withdraw | _departed(db, row, state)
+        if gone:
+            _withdraw(db, row, gone)
+            state.unconfirmed -= gone
+            state.withdraw = set()
+        _prune_candidates(row, state)
 
     def _has_due(self, db: Session, plan_id: str) -> bool:
         return bool(self._due_plans(db, OrderRow.plan_id == plan_id))
@@ -1001,19 +1203,39 @@ class SessionStore:
             if row is None:
                 return pending
             _mark_booked(session, result, _booked(db, row.org_id, row.scenario_id, row.plan_id))
+            rejecting = _rejecting_shipper(db, row, session, result.event)
+            if rejecting:
+                _waive_fee(session, result, rejecting)
+            payload = _dump_pending(pending)
+            added = _registered_add(db, row, result.event)
+            if added:
+                payload[REGISTERED_ADD] = added
             db.add(
                 PendingRow(
                     replan_id=pending.replan_id,
                     plan_id=session.plan_id,
                     base_version=pending.base_version,
-                    payload=_dump_pending(pending),
+                    payload=payload,
                 )
             )
             db.flush()
             _trim(db, PendingRow, PendingRow.plan_id == session.plan_id, MAX_PENDING)
         return pending
 
-    def _pending(self, db: Session, plan_id: str, replan_id: str | None) -> PendingReplan:
+    def mark_registered_add(
+        self, plan_id: str, replan_id: str, lot_id: str, org_id: str = DEMO_ORG
+    ) -> None:
+        with self._lock, self._db.begin() as db:
+            if _plan_row(db, plan_id, org_id) is None:
+                return
+            row = db.get(PendingRow, replan_id, with_for_update=True)
+            if row is None or row.plan_id != plan_id:
+                return
+            row.payload = {**row.payload, REGISTERED_ADD: lot_id}
+
+    def _pending(
+        self, db: Session, plan_id: str, replan_id: str | None
+    ) -> tuple[PendingReplan, str | None]:
         query = select(PendingRow).where(PendingRow.plan_id == plan_id)
         if replan_id is None:
             row = db.scalars(query.order_by(PendingRow.seq.desc()).limit(1)).first()
@@ -1023,7 +1245,7 @@ class SessionStore:
             row = db.scalars(query.where(PendingRow.replan_id == replan_id)).first()
             if row is None:
                 raise KeyError(replan_id)
-        return _load_pending(row.payload)
+        return _load_pending(row.payload), row.payload.get(REGISTERED_ADD)
 
     def apply(
         self,
@@ -1057,9 +1279,13 @@ class SessionStore:
         idempotency: tuple[str, str] | None,
         org_id: str = DEMO_ORG,
     ) -> tuple[PlanSession, set[str]]:
+        locked = _plan_row(db, plan_id, org_id)
+        if locked is not None and locked.org_id != DEMO_ORG:
+            _lock_bookings(db, locked.org_id)
+            db.refresh(locked, with_for_update=True)
         state = self._require(db, plan_id, org_id)
         session = state.session
-        pending = self._pending(db, plan_id, replan_id)
+        pending, registered_add = self._pending(db, plan_id, replan_id)
         if pending.base_version != session.version:
             raise SessionConflict(
                 "이미 다른 대안이 적용된 계획입니다. 이벤트를 다시 보내 재최적화하세요"
@@ -1072,14 +1298,17 @@ class SessionStore:
                 f"실행 불가한 대안입니다: {'; '.join(alternative.infeasible_reasons)}"
             )
         row = _plan_row(db, plan_id, ANY_ORG)
+        event = pending.result.event
+        _guard_real_apply(db, row, session, event)
+        rejecting = _rejecting_shipper(db, row, session, event)
+        if rejecting:
+            _waive_fee(session, pending.result, rejecting)
         if row.org_id != DEMO_ORG:
-            _lock_bookings(db, row.org_id)
             clash = sea_containers(alternative.plan) & _booked(
                 db, row.org_id, row.scenario_id, plan_id
             )
             if clash:
                 raise ContainerBooked(sorted(clash))
-        event = pending.result.event
         scenario = pending.result.scenario_after
         locked = set(session.air_locked_lot_ids)
         if locks_air(scenario, event):
@@ -1090,10 +1319,12 @@ class SessionStore:
         registered_ids = session.registered_lot_ids
         invited: set[str] = set()
         if row.org_id != DEMO_ORG and isinstance(event, AddLotEvent):
-            shipper_org = _claim_added(db, row.org_id, event, now)
+            shipper_org = _claim_added(
+                db, row.org_id, event, now, required=registered_add == event.lot.id
+            )
             if shipper_org:
                 registered_ids = [*registered_ids, event.lot.id]
-                invite = _invite_added(db, row, event, shipper_org, now)
+                invite = _invite_added(db, row, session, event, shipper_org, now)
                 if invite:
                     invited.add(invite)
                     state.unconfirmed.add(invite)
@@ -1126,6 +1357,8 @@ class SessionStore:
             now=now,
         )
         order.cancellation_charges = list(charges)
+        if rejecting:
+            _excuse(order, rejecting, now)
         if charges:
             _charge_payers(order, charges, ordered, (before.scenario, scenario))
         passed = _deadline_passed(order, now)
@@ -1166,8 +1399,6 @@ class SessionStore:
         state.committed = committed.model_copy(update={"applied_charges": charges})
         state.orders[order.order_id] = order
         self._save(db, state)
-        if row.org_id != DEMO_ORG and row.needs_replan:
-            _set_candidates(row, _still_relevant(_candidates(row), scenario, alternative.plan))
         if idempotency is not None:
             self._remember(db, plan_id, idempotency[0], "apply", idempotency[1], updated)
         return updated, invited
@@ -1238,13 +1469,15 @@ class SessionStore:
         version = session.version + 1
         kept = {lot.id for lot in snapshot.scenario.lots}
         added = {
-            o.event.lot.id
+            o.event.lot.id: o.event.lot.shipper_id
             for o in [*state.orders.values(), order]
             if isinstance(o.event, AddLotEvent)
             and o.status not in ("forwarder_confirmed", "executed")
         }
         dropped = {i for i in session.registered_lot_ids if i in added and i not in kept}
         registered_ids = _unregister(state, dropped)
+        remaining = {lot.shipper_id for lot in state.committed.scenario.lots}
+        state.withdraw |= {added[i] for i in dropped} - remaining
         snapshot = state.committed
         entry = HistoryEntry(
             seq=len(session.history) + 1,
@@ -1293,6 +1526,7 @@ class SessionStore:
         state.session = updated
         updated.status = state.settled_status()
         state.committed = _snapshot(updated)
+        state.advanced = True
 
     def confirm(
         self,
@@ -1594,7 +1828,8 @@ class SessionStore:
                 db.flush()
                 if not accept:
                     candidate = _rejected(target, state.session.scenario, now)
-                    _set_candidates(row, [*_candidates(row), candidate])
+                    if candidate.lot_ids:
+                        _set_candidates(row, [*_candidates(row), candidate])
                 self._settle(db, row, state, now)
                 return _state_of(db, row, state.session)
 
@@ -1631,9 +1866,12 @@ class SessionStore:
                 row = _plan_row(db, plan_id, org_id)
                 if row is None:
                     raise KeyError(plan_id)
-                session = self._require(db, plan_id, org_id).session
+                loaded = self._require(db, plan_id, org_id)
+                session = loaded.session
                 if session.status != "pending_shipper_confirmation":
                     raise SessionConflict("화주 확인을 기다리는 계획만 화주를 빼고 다시 계산합니다")
+                if _committed_orders(loaded):
+                    raise SessionConflict(RECOMPUTE_AFTER_ORDER)
                 listed = {
                     c.shipper_id: c.status for c in _round_rows(db, plan_id, row.confirmation_round)
                 }
@@ -1666,6 +1904,8 @@ class SessionStore:
                 raise SessionConflict(
                     "그사이 계획이 바뀌었습니다. 확인 현황을 새로 고친 뒤 다시 하세요"
                 )
+            if _committed_orders(state):
+                raise SessionConflict(RECOMPUTE_AFTER_ORDER)
             clash = sea_containers(built.plan) & _booked(db, row.org_id, row.scenario_id, plan_id)
             if clash:
                 raise ContainerBooked(sorted(clash))

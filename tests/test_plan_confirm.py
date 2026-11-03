@@ -182,8 +182,8 @@ def test_recompute_without_rejected_shipper_releases_lots_and_reasks(
     pohang = saas_login("shipper-pohang")
     lots = pohang.get("/api/saas/shipper/lots").json()
     assert [lot["status"] for lot in lots] == ["registered"]
-    gone = pohang.get(f"/api/saas/shipper/plans/{plan_id}/confirmation").json()
-    assert gone["confirmations"] == []
+    assert pohang.get(f"/api/saas/shipper/plans/{plan_id}/confirmation").status_code == 404
+    assert pohang.get("/api/saas/shipper/plan-confirmations").json() == []
     jinju = saas_login("shipper-jinju")
     assert _kinds(jinju, plan_id).count("plan_confirmation_requested") == 2
 

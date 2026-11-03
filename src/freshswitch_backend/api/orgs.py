@@ -17,6 +17,7 @@ from freshswitch_backend.persistence.tables import (
     PlanRow,
     UserRow,
 )
+from freshswitch_backend.planning.store import awaiting_shippers
 
 ListedOrgType = Literal["shipper", "forwarder"]
 MemberRole = Literal["admin", "member"]
@@ -51,7 +52,6 @@ class ForwarderAssignment(BaseModel):
     before_shipper_confirmation: bool = False
 
 
-AWAITING_SHIPPERS = "pending_shipper_confirmation"
 ASSIGN_BEFORE_CONFIRMATION = "화주 확인이 끝난 뒤 배정할 수 있습니다"
 
 
@@ -73,9 +73,9 @@ def list_orgs(
     return [OrgSummary(org_id=oid, org_type=kind, org_name=name) for oid, kind, name in rows]
 
 
-def _lock_own_plan(db: Session, plan_id: str, org_id: str) -> str:
+def _lock_own_plan(db: Session, plan_id: str, org_id: str) -> PlanRow:
     found = db.scalar(
-        select(PlanRow.status)
+        select(PlanRow)
         .where(PlanRow.plan_id == plan_id, PlanRow.org_id == org_id)
         .with_for_update()
     )
@@ -89,7 +89,7 @@ def assign_forwarder(
     plan_id: str, body: ForwarderAssignRequest, principal: PlatformPrincipal
 ) -> ForwarderAssignment:
     with database.begin() as db:
-        plan_status = _lock_own_plan(db, plan_id, principal.org_id)
+        plan = _lock_own_plan(db, plan_id, principal.org_id)
         forwarder = db.get(OrganizationRow, body.forwarder_org_id)
         platform = db.get(OrganizationRow, principal.org_id)
         if (
@@ -99,7 +99,7 @@ def assign_forwarder(
             or forwarder.sandbox != platform.sandbox
         ):
             raise HTTPException(status_code=422, detail="포워더 조직이 아닙니다")
-        awaiting = plan_status == AWAITING_SHIPPERS
+        awaiting = bool(awaiting_shippers(db, plan))
         if awaiting and not platform.sandbox:
             raise HTTPException(status_code=409, detail=ASSIGN_BEFORE_CONFIRMATION)
         db.execute(delete(PlanForwarderRow).where(PlanForwarderRow.plan_id == plan_id))

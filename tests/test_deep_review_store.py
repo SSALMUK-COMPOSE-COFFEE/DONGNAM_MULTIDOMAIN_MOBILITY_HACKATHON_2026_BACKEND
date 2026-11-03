@@ -321,10 +321,11 @@ def test_platform_attention_applies_expiry_before_listing(
     pending = attention()
     assert pending["status"] == "pending_confirmation"
     store.clock = lambda: LATE
-    listed = attention()
-    assert listed["status"] == "committed"
-    assert listed["version"] == pending["version"] + 1
-    assert platform_client.get(f"/api/plans/{plan_id}").json()["version"] == listed["version"]
+    listed = platform_client.get("/api/saas/platform/plan-confirmations").json()
+    assert plan_id not in {s["plan_id"] for s in listed}
+    session = platform_client.get(f"/api/plans/{plan_id}").json()
+    assert session["status"] == "committed"
+    assert session["version"] == pending["version"] + 1
 
 
 def test_demo_plan_list_applies_expiry_before_listing(client: TestClient) -> None:
