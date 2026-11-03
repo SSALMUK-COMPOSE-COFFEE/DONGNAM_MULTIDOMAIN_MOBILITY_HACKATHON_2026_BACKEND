@@ -71,7 +71,12 @@ class ColdchainParams(BaseModel):
         f"{JLST}: 단전 있음 손실률 하한 6%. 예상 손실률이 이 값을 넘어도 냉장창고 예약",
     )
     insurance_continuous_minutes: Quantity = _q(
-        480, "분", "GCMI 2025: 적하보험 냉동기 고장 특약은 냉각이 8시간 이상 연속으로 멈춰야 보상"
+        480,
+        "분",
+        "GCMI Clauses 2025(SVV, 스위스 보험협회): 냉동기 고장 연속 8시간은 육상·항공·보관 구간 조건. "
+        "해상 구간(2006년판 24시간)과 Institute Frozen Food Clauses는 연속 24시간이라 "
+        "부산→홍콩 해상 적용 여부 확인 필요. "
+        "https://svv.ch/sites/default/files/media/documents/2026-07/GCMI_Clauses_2025.pdf",
     )
     max_gap_minutes: Quantity = _q(
         60,
@@ -81,12 +86,14 @@ class ColdchainParams(BaseModel):
     default_temp_min_c: Quantity = _q(
         0.0,
         "°C",
-        "시나리오 딸기 CA 조건(원예원 품목별 CA 가이드라인). 계획이 없을 때 쓰는 적정 범위",
+        "시나리오 딸기 적정 온도 0~2°C(USDA HB66 딸기 최적 0°C에 2°C 여유, "
+        "원예원 CA 프로그램 원문 확인 필요). 계획이 없을 때 쓰는 적정 범위",
     )
     default_temp_max_c: Quantity = _q(
         2.0,
         "°C",
-        "시나리오 딸기 CA 조건(원예원 품목별 CA 가이드라인). 계획이 없을 때 쓰는 적정 범위",
+        "시나리오 딸기 적정 온도 0~2°C(USDA HB66 딸기 최적 0°C에 2°C 여유, "
+        "원예원 CA 프로그램 원문 확인 필요). 계획이 없을 때 쓰는 적정 범위",
     )
 
     @property
