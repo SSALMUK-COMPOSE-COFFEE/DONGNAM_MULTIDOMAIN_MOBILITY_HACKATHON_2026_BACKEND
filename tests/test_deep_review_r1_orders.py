@@ -1,11 +1,13 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import pytest
 from fastapi.testclient import TestClient
 
 from freshswitch_backend.domain.models import KST, Quantity
 from freshswitch_backend.execution import orders as orders_module
+from freshswitch_backend.execution.models import ExecutionOrder
 from freshswitch_backend.execution.params import ExecutionParams
+from freshswitch_backend.planning import store as store_module
 from freshswitch_backend.planning.store import store
 
 
@@ -24,38 +26,38 @@ def _apply(client: TestClient, plan_id: str, alternative: str) -> None:
     assert response.status_code == 200, response.text
 
 
+def _rejected(client: TestClient, plan_id: str, alternative: str, phrase: str) -> None:
+    response = client.post(f"/api/plans/{plan_id}/apply", json={"alternative_id": alternative})
+    assert response.status_code == 409, response.text
+    assert phrase in response.json()["detail"]
+    session = client.get(f"/api/plans/{plan_id}").json()
+    assert session["version"] == 1
+    assert _orders(client, plan_id) == []
+
+
 def _orders(client: TestClient, plan_id: str) -> list[dict]:
     return client.get(f"/api/plans/{plan_id}/orders").json()
 
 
-def _live(client: TestClient, plan_id: str, now: datetime) -> dict:
-    order = _orders(client, plan_id)[-1]
-    assert order["status"] in ("proposed", "shipper_confirmed"), order["status"]
-    deadlines = order["deadlines"]
-    shipper = datetime.fromisoformat(deadlines["shipper"])
-    forwarder = datetime.fromisoformat(deadlines["forwarder"])
-    assert now < shipper < forwarder
-    for request in order["requests"]:
-        assert datetime.fromisoformat(request["deadline"]) >= forwarder
-    for item in order["shipper_confirmations"]:
-        assert now < datetime.fromisoformat(item["deadline"]) <= forwarder
-    return order
-
-
-def test_replan3_order_created_after_air_deadline_is_not_born_expired(client: TestClient) -> None:
+def test_replan3_order_past_air_deadline_is_rejected_without_floor(client: TestClient) -> None:
     plan_id = _create(client)
     now = datetime(2026, 11, 17, 9, 0, tzinfo=KST)
     store.clock = lambda: now
     alternatives = _alternatives(client, plan_id, {"type": "cancel", "lot_id": "lot-miryang-sb-2"})
-    _apply(client, plan_id, next(iter(alternatives)))
-    order = _live(client, plan_id, now)
-    air = [r for r in order["requests"] if r["kind"] == "air_cancel"]
-    assert air
-    assert "하한" in order["deadlines"]["basis"]
-    assert "11/17 00:00" not in air[0]["text"]
+    _rejected(client, plan_id, next(iter(alternatives)), "포워더 확정 기한")
 
 
-def test_replan3_delay_after_cutoff_has_no_fallback_dispatch(client: TestClient) -> None:
+def test_replan3_delay_after_cutoff_has_no_fallback_dispatch(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    built: list[ExecutionOrder] = []
+
+    def spy(**kwargs: object) -> ExecutionOrder:
+        order = orders_module.build_order(**kwargs)
+        built.append(order)
+        return order
+
+    monkeypatch.setattr(store_module, "build_order", spy)
     plan_id = _create(client)
     now = datetime(2026, 11, 18, 10, 0, tzinfo=KST)
     store.clock = lambda: now
@@ -67,13 +69,11 @@ def test_replan3_delay_after_cutoff_has_no_fallback_dispatch(client: TestClient)
     }
     alternatives = _alternatives(client, plan_id, event)
     assert "sail_as_is" in alternatives
-    _apply(client, plan_id, "sail_as_is")
-    order = _live(client, plan_id, now)
-    assert "이미 터미널에 반입" in order["deadlines"]["basis"]
-    assert any(r["kind"] == "reefer_plug" and "연장" in r["text"] for r in order["requests"])
-    session = client.get(f"/api/plans/{plan_id}").json()
-    voyage = next(v for v in session["scenario"]["voyages"] if v["id"] == "V-2611A")
-    assert voyage["etd"].startswith("2026-11-19T18:00")
+    _rejected(client, plan_id, "sail_as_is", "기한")
+    order = built[-1]
+    assert "이미 터미널에 반입" in order.deadlines.basis
+    assert order.deadlines.forwarder == min(r.deadline for r in order.requests)
+    assert "하한" not in order.deadlines.basis
 
 
 def test_replan3_default_deadlines_unchanged(client: TestClient) -> None:
@@ -89,7 +89,7 @@ def test_replan3_default_deadlines_unchanged(client: TestClient) -> None:
     assert forwarder <= dispatch
 
 
-def test_replan3_shipper_only_floor_is_written_in_basis(
+def test_replan3_passed_harvest_notice_is_rejected_without_floor(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     params = ExecutionParams(
@@ -102,18 +102,7 @@ def test_replan3_shipper_only_floor_is_written_in_basis(
     _alternatives(
         client, plan_id, {"type": "reduce", "lot_id": "lot-sancheong-sb-1", "new_pallets": 3}
     )
-    _apply(client, plan_id, "pull_forward")
-    order = _orders(client, plan_id)[-1]
-    floor = now + timedelta(hours=params.shipper_response_hours.value)
-    forwarder_floor = floor + timedelta(hours=params.forwarder_processing_hours.value)
-    assert all(datetime.fromisoformat(r["deadline"]) > forwarder_floor for r in order["requests"])
-    assert order["shipper_confirmations"]
-    basis = order["deadlines"]["basis"]
-    assert "하한" in basis
-    assert "수확 통보" in basis
-    assert datetime.fromisoformat(order["deadlines"]["shipper"]) == floor
-    for item in order["shipper_confirmations"]:
-        assert datetime.fromisoformat(item["deadline"]) == floor
+    _rejected(client, plan_id, "pull_forward", "화주 확인 기한")
 
 
 def _etas(routes: list[dict], container_lots: set[str]) -> set[tuple[str, str]]:
