@@ -24,6 +24,15 @@ MONEY_TOTALS = (
     "total_operational_savings",
 )
 MONEY_LISTS = ("settlements", "container_settlements", "settlement_tariffs", "shipper_costs")
+HISTORY_MONEY = ("cost_before", "cost_after", "cost_delta")
+CONFIRMATION_MONEY = (
+    "cost_before",
+    "cost_after",
+    "cost_delta",
+    "cancellation_adjustment",
+    "net_cost_delta",
+)
+CANCELLATION_MONEY = ("container_cost", "share_per_pallet_before", "share_per_pallet_after", "fee")
 
 
 class ForwarderRef(BaseModel):
@@ -300,4 +309,24 @@ def without_settlement(session: PlanSession) -> dict[str, Any]:
         plan[name] = []
     for name in MONEY_TOTALS:
         plan[name] = None
+    plan["objective"] = None
+    for entry in payload["history"]:
+        for name in HISTORY_MONEY:
+            entry[name] = None
+    return payload
+
+
+def forwarder_order_view(order: ExecutionOrder) -> dict[str, Any]:
+    payload = order.model_dump(mode="json")
+    for confirmation in payload["shipper_confirmations"]:
+        for name in CONFIRMATION_MONEY:
+            confirmation[name] = None
+    cancellation = payload.get("cancellation")
+    if cancellation is not None:
+        for name in CANCELLATION_MONEY:
+            cancellation[name] = None
+        cancellation["transfers"] = [
+            {**transfer, "share_increase": None, "amount": None}
+            for transfer in cancellation["transfers"]
+        ]
     return payload
