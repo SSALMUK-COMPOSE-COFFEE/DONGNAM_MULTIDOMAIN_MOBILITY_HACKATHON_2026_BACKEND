@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select
 
+from freshswitch_backend.analysis.benchmark import empty_slot_cost, tariff_empty_slot_cost
 from freshswitch_backend.analysis.business import (
     ANNUAL_FIXED_COST,
     DEFAULT_BASE_FEE_FROM_YEAR,
@@ -93,6 +94,7 @@ class PlanEconomics(BaseModel):
     fee_revenue: int
     contribution_margin: int
     empty_slot_cost: int
+    tariff_empty_slot_cost: int
     tariff_operational_gap: int
 
 
@@ -124,6 +126,7 @@ class PlatformBusiness(BaseModel):
     plan_count: int
     assumptions: list[Assumption]
     empty_slot_cost: int
+    tariff_empty_slot_cost: int
     empty_slot_definition: str
     tariff_operational_gap: int
     tariff_operational_definition: str
@@ -335,11 +338,12 @@ def platform_metrics(principal: PlatformPrincipal, month: MonthQuery = None) -> 
     )
 
 
-def _empty_slot_cost(plan: Plan) -> int:
-    return sum(
-        round(c.container_cost * (c.capacity_pallets - c.pallets) / c.capacity_pallets)
-        for c in plan.containers
-        if c.used and c.capacity_pallets
+def _empty_slot_definition(total: int, tariff: int) -> str:
+    return (
+        "쓴 컨테이너 전체 빈칸 비용 = 컨테이너 비용 × 빈 파렛트 ÷ 용량. "
+        f"쓴 컨테이너 전체 빈칸 비용 {total:,}원 중 정산표 품목 기준 빈칸 몫 {tariff:,}원은 "
+        f"정산 차액(settlement_gap)에, 운영비 기준 화주 몫 {total - tariff:,}원은 해당 화주 "
+        "청구서에 이미 반영돼 따로 빼지 않는 참고 항목"
     )
 
 
@@ -382,7 +386,8 @@ def _business_line(
                 voyages=voyages,
                 fee_revenue=sum(v.fee_revenue for v in voyages),
                 contribution_margin=sum(v.contribution_margin for v in voyages),
-                empty_slot_cost=_empty_slot_cost(session.plan),
+                empty_slot_cost=empty_slot_cost(session.plan),
+                tariff_empty_slot_cost=tariff_empty_slot_cost(session.plan),
                 tariff_operational_gap=session.plan.total_shared_cost
                 - session.plan.total_operational_cost,
             )
@@ -450,6 +455,8 @@ def platform_business(
             (sensitivity_forwarder_share, f"민감도({FORWARDER_SHARE_SENSITIVITY_LABEL})"),
         )
     ]
+    empty_total = sum(p.empty_slot_cost for p in lines[0].plans)
+    tariff_empty = sum(p.tariff_empty_slot_cost for p in lines[0].plans)
     return PlatformBusiness(
         month=target,
         plan_count=len(sessions),
@@ -478,12 +485,9 @@ def platform_business(
                 source="가정: 주 1회 출항. 연 환산 = 항차당 공헌이익 평균 × 연 항차",
             ),
         ],
-        empty_slot_cost=sum(p.empty_slot_cost for p in lines[0].plans),
-        empty_slot_definition=(
-            "쓴 컨테이너의 빈 칸 비용 = 컨테이너 비용 × 빈 파렛트 ÷ 용량. "
-            "정산 단가(파렛트당)로 받지 못하는 몫. 정산 차이(settlement_gap)에 이미 들어 있어 "
-            "따로 빼지 않는 참고 항목"
-        ),
+        empty_slot_cost=empty_total,
+        tariff_empty_slot_cost=tariff_empty,
+        empty_slot_definition=_empty_slot_definition(empty_total, tariff_empty),
         tariff_operational_gap=sum(p.tariff_operational_gap for p in lines[0].plans),
         tariff_operational_definition=(
             "화주 정산액(total_shared_cost) − 운영비(total_operational_cost). "

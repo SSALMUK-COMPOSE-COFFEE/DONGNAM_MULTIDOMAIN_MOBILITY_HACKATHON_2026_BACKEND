@@ -3,6 +3,7 @@ from saas_fixtures import PLATFORM_ORG_ID
 from test_metrics import _platform_plan, _scenario
 
 from freshswitch_backend.analysis import business_matrix
+from freshswitch_backend.analysis.benchmark import tariff_empty_slot_cost
 from freshswitch_backend.analysis.business import (
     ANNUAL_FIXED_COST,
     DEFAULT_OPS_COST_PER_VOYAGE,
@@ -135,6 +136,13 @@ def test_platform_business_uses_org_plans(platform_client: TestClient, saas_logi
     assert body["tariff_operational_gap"] == (
         stored.plan.total_shared_cost - stored.plan.total_operational_cost
     )
+    assert (body["empty_slot_cost"], body["tariff_empty_slot_cost"]) == (2_265_000, 1_359_000)
+    assert body["tariff_empty_slot_cost"] == tariff_empty_slot_cost(stored.plan)
+    definition = body["empty_slot_definition"]
+    assert "쓴 컨테이너 전체 빈칸 비용 2,265,000원" in definition
+    assert "정산표 품목 기준 빈칸 몫 1,359,000원" in definition
+    assert "운영비 기준 화주 몫 906,000원" in definition
+    assert "이미 들어 있어" not in definition
     empty = platform_client.get("/api/saas/platform/business", params={"month": "2026-01"})
     assert empty.json()["plan_count"] == 0
     assert empty.json()["lines"][0]["annual_net"] is None
