@@ -9,7 +9,7 @@ from freshswitch_backend.analysis import (
     greedy_plan,
     sensitivity,
 )
-from freshswitch_backend.analysis.benchmark import violations
+from freshswitch_backend.analysis.benchmark import compare_methods, violations
 from freshswitch_backend.analysis.params import SPEC_BY_KEY, anchor_value, scaled
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.optimize import solve_plan
@@ -259,3 +259,69 @@ def test_sensitivity_with_plan_session(client):
     response = client.post("/api/analysis/sensitivity", json={"plan_id": plan_id})
     assert response.status_code == 200
     assert response.json()["plan_id"] == plan_id
+
+
+def test_benchmark_keeps_method_rows(scenario, bench):
+    strip = {"solve_ms"}
+    assert [m.model_dump(exclude=strip) for m in bench.methods] == [
+        m.model_dump(exclude=strip) for m in compare_methods(scenario)
+    ]
+
+
+def test_benchmark_explains_settlement_vs_operational_basis(scenario, bench):
+    assert bench.comparison_basis == "operational"
+    bases = {b.key: b for b in bench.bases}
+    assert set(bases) == {"operational", "settlement"}
+    assert "total_operational_savings" in bases["operational"].fields
+    assert "total_savings" in bases["settlement"].fields
+    assert "가정" in bases["operational"].source
+    assert "가정 항목" in bases["settlement"].source
+    assert all(b.definition for b in bench.bases)
+
+    methods = {m.method: m for m in bench.methods}
+    gaps = {g.method: g for g in bench.basis_gaps}
+    assert set(gaps) == set(methods)
+    for key, gap in gaps.items():
+        m = methods[key]
+        assert gap.settlement_savings == m.total_savings
+        assert gap.operational_savings == m.total_operational_savings
+        assert gap.settlement_cost_gap == m.total_shipper_cost - m.total_operational_cost
+        assert gap.baseline_gap == m.total_baseline_cost - m.total_operational_baseline_cost
+        assert gap.savings_gap == gap.baseline_gap - gap.settlement_cost_gap
+
+    opt, fcfs = gaps["optimizer"], gaps["fcfs"]
+    tariff = build_plan(scenario).plan.settlement_tariffs[0]
+    extra = fcfs.tariff_sea_pallets - opt.tariff_sea_pallets
+    assert extra == 2
+    assert fcfs.settlement_savings - opt.settlement_savings == extra * tariff.savings_per_pallet
+    ca03 = next(c for c in fcfs_plan(scenario).containers if c.container_id == "CA-03")
+    alone = round(
+        ca03.container_cost * (ca03.capacity_pallets - ca03.pallets) / ca03.capacity_pallets
+    )
+    assert fcfs.empty_slot_cost - opt.empty_slot_cost == alone
+    assert fcfs.settlement_cost_gap_per_tariff_pallet == round(
+        fcfs.settlement_cost_gap / fcfs.tariff_pallets
+    )
+
+    text = bench.settlement_fcfs_explanation
+    assert fcfs.settlement_savings > opt.settlement_savings
+    for number in (
+        fcfs.settlement_savings,
+        opt.settlement_savings,
+        fcfs.settlement_savings - opt.settlement_savings,
+        tariff.air_total,
+        tariff.sea_total,
+        tariff.savings_per_pallet,
+        fcfs.empty_slot_cost - opt.empty_slot_cost,
+        opt.operational_savings - fcfs.operational_savings,
+    ):
+        assert f"{number:,}원" in text
+    assert "딸기" in text
+
+
+def test_benchmark_endpoint_carries_basis_fields(client):
+    body = client.post("/api/analysis/benchmark", json={"scenario_id": "default"}).json()
+    assert body["comparison_basis"] == "operational"
+    assert [b["key"] for b in body["bases"]] == ["operational", "settlement"]
+    assert len(body["basis_gaps"]) == len(body["methods"])
+    assert body["settlement_fcfs_explanation"].startswith("정산 기준 절감은 선착순")

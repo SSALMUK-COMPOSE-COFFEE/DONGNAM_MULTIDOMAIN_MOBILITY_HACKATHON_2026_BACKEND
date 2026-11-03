@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ParamRange(BaseModel):
@@ -150,11 +150,39 @@ class ReplanBenchmark(BaseModel):
     improvement_vs_manual: int
 
 
+BenchmarkBasisKey = Literal["operational", "settlement"]
+
+
+class BenchmarkBasis(BaseModel):
+    key: BenchmarkBasisKey
+    label: str
+    fields: list[str]
+    definition: str
+    source: str
+
+
+class MethodBasisGap(BaseModel):
+    method: str
+    settlement_savings: int
+    operational_savings: int
+    savings_gap: int
+    baseline_gap: int
+    settlement_cost_gap: int
+    tariff_pallets: int
+    tariff_sea_pallets: int
+    settlement_cost_gap_per_tariff_pallet: int | None
+    empty_slot_cost: int
+
+
 class BenchmarkResult(BaseModel):
     scenario_id: str
     methods: list[MethodResult]
     replan: ReplanBenchmark | None
     solve_ms: int
+    comparison_basis: BenchmarkBasisKey = "operational"
+    bases: list[BenchmarkBasis] = Field(default_factory=list)
+    basis_gaps: list[MethodBasisGap] = Field(default_factory=list)
+    settlement_fcfs_explanation: str = ""
 
 
 class ContainerEconomics(BaseModel):

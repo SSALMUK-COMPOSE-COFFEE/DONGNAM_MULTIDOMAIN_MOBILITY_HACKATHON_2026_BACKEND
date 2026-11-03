@@ -14,7 +14,9 @@ from freshswitch_backend.analysis.common import (
     solve_routed,
 )
 from freshswitch_backend.analysis.models import (
+    BenchmarkBasis,
     BenchmarkResult,
+    MethodBasisGap,
     MethodResult,
     ReplanBenchmark,
     ReplanBenchmarkRow,
@@ -246,7 +248,9 @@ def _timed(fn):
     return value, round((time.perf_counter() - started) * 1000)
 
 
-def compare_methods(scenario: Scenario, plan: Plan | None = None) -> list[MethodResult]:
+def _method_parts(
+    scenario: Scenario, plan: Plan | None = None
+) -> list[tuple[str, list[Part], int]]:
     if plan is None:
         optimizer, opt_ms = _timed(lambda: [(scenario, solve_routed(scenario), [])])
     else:
@@ -255,11 +259,133 @@ def compare_methods(scenario: Scenario, plan: Plan | None = None) -> list[Method
     greedy, greedy_ms = _timed(lambda: [routed_part(scenario, greedy_plan(scenario))])
     solo, solo_ms = _timed(lambda: [routed_part(sub, plan) for sub, plan in solo_plans(scenario)])
     return [
-        _result("optimizer", optimizer, opt_ms),
-        _result("fcfs", fcfs, fcfs_ms),
-        _result("greedy", greedy, greedy_ms),
-        _result("solo", solo, solo_ms),
+        ("optimizer", optimizer, opt_ms),
+        ("fcfs", fcfs, fcfs_ms),
+        ("greedy", greedy, greedy_ms),
+        ("solo", solo, solo_ms),
     ]
+
+
+def compare_methods(scenario: Scenario, plan: Plan | None = None) -> list[MethodResult]:
+    return [_result(method, parts, ms) for method, parts, ms in _method_parts(scenario, plan)]
+
+
+def empty_slot_cost(plan: Plan) -> int:
+    return sum(
+        round(c.container_cost * (c.capacity_pallets - c.pallets) / c.capacity_pallets)
+        for c in plan.containers
+        if c.used and c.capacity_pallets
+    )
+
+
+def _basis_gap(result: MethodResult, parts: list[Part]) -> MethodBasisGap:
+    tariffed = [s for _, plan, _ in parts for s in plan.settlements if s.basis != "operational"]
+    pallets = sum(s.sea_pallets + s.air_pallets for s in tariffed)
+    cost_gap = result.total_shipper_cost - result.total_operational_cost
+    return MethodBasisGap(
+        method=result.method,
+        settlement_savings=result.total_savings,
+        operational_savings=result.total_operational_savings,
+        savings_gap=result.total_savings - result.total_operational_savings,
+        baseline_gap=result.total_baseline_cost - result.total_operational_baseline_cost,
+        settlement_cost_gap=cost_gap,
+        tariff_pallets=pallets,
+        tariff_sea_pallets=sum(s.sea_pallets for s in tariffed),
+        settlement_cost_gap_per_tariff_pallet=round(cost_gap / pallets) if pallets else None,
+        empty_slot_cost=sum(empty_slot_cost(plan) for _, plan, _ in parts),
+    )
+
+
+def _tariff_names(scenario: Scenario, plan: Plan) -> list[str]:
+    names = {p.id: p.name for p in scenario.products}
+    return [names.get(t.product_id, t.product_id) for t in plan.settlement_tariffs]
+
+
+def _bases(scenario: Scenario, plan: Plan) -> list[BenchmarkBasis]:
+    names = ", ".join(_tariff_names(scenario, plan)) or "없음"
+    assumed = sorted({item for t in plan.settlement_tariffs for item in t.assumed_items})
+    return [
+        BenchmarkBasis(
+            key="operational",
+            label="운영비 기준",
+            fields=[
+                "total_operational_baseline_cost",
+                "total_operational_cost",
+                "total_operational_savings",
+            ],
+            definition=(
+                "실제로 드는 비용. 쓴 컨테이너 비용 전부(빈칸 포함)를 실린 로트에 파렛트 비례로 "
+                "나누고 집하 경로비·보관·품질손실 위험을 더한다. 기준선은 전 로트 항공. "
+                "방법 비교 화면은 이 기준을 쓴다"
+            ),
+            source="시나리오 cost_params(항목별 source, '가정' 표시 항목 포함)",
+        ),
+        BenchmarkBasis(
+            key="settlement",
+            label="정산 기준",
+            fields=[
+                "total_baseline_cost",
+                "total_shipper_cost",
+                "total_savings",
+                "total_fee",
+                "shippers_with_loss",
+            ],
+            definition=(
+                f"화주에게 청구하는 값. 정산표 품목({names})은 파렛트당 정액(항공·해상 단가)으로 "
+                "매기고 나머지 품목은 운영비를 그대로 쓴다. 정산표 단가에는 컨테이너가 얼마나 "
+                "찼는지가 들어가지 않는다. 수수료는 이 기준 절감으로 매긴다"
+            ),
+            source=(
+                "계획 settlement_tariffs(항목별 lines[].air_source·sea_source)"
+                + (f". 가정 항목: {', '.join(assumed)}" if assumed else "")
+            ),
+        ),
+    ]
+
+
+def _tariff_phrase(scenario: Scenario, plan: Plan) -> str:
+    sheets = zip(_tariff_names(scenario, plan), plan.settlement_tariffs, strict=True)
+    return ", ".join(
+        f"{name} 항공 {t.air_total:,}원 − 해상 {t.sea_total:,}원 = {t.savings_per_pallet:,}원"
+        for name, t in sheets
+    )
+
+
+def _cost_gap_phrase(gap: MethodBasisGap) -> str:
+    if gap.settlement_cost_gap_per_tariff_pallet is None:
+        return f"{gap.settlement_cost_gap:,}원"
+    return (
+        f"{gap.settlement_cost_gap:,}원(정산표 화주 {gap.tariff_pallets}파렛트, 파렛트당 "
+        f"{gap.settlement_cost_gap_per_tariff_pallet:,}원)"
+    )
+
+
+def settlement_fcfs_explanation(scenario: Scenario, plan: Plan, gaps: list[MethodBasisGap]) -> str:
+    by = {g.method: g for g in gaps}
+    opt, fcfs = by["optimizer"], by["fcfs"]
+    tail = (
+        f"화주 정산액 − 운영비(음수면 플랫폼이 떠안는 몫)는 선착순 {_cost_gap_phrase(fcfs)}, "
+        f"최적화 {_cost_gap_phrase(opt)}이다. 운영비 기준 절감은 최적화 {opt.operational_savings:,}원, "
+        f"선착순 {fcfs.operational_savings:,}원으로 최적화가 "
+        f"{opt.operational_savings - fcfs.operational_savings:,}원 더 아낀다"
+    )
+    if fcfs.settlement_savings <= opt.settlement_savings:
+        return (
+            f"이 계획에서는 정산 기준에서도 선착순 절감({fcfs.settlement_savings:,}원)이 "
+            f"최적화({opt.settlement_savings:,}원)보다 크지 않다. {tail}"
+        )
+    tariff = _tariff_phrase(scenario, plan)
+    unit = f"파렛트당 정액({tariff})" if tariff else "파렛트당 정액"
+    return (
+        f"정산 기준 절감은 선착순 {fcfs.settlement_savings:,}원이 최적화 "
+        f"{opt.settlement_savings:,}원보다 {fcfs.settlement_savings - opt.settlement_savings:,}원 "
+        f"크다. 정산표는 {unit}으로 매겨 컨테이너가 얼마나 찼는지 보지 않는다. 선착순은 정산표 "
+        f"화주 해상 파렛트가 {fcfs.tariff_sea_pallets - opt.tariff_sea_pallets}개 더 많아"
+        f"({fcfs.tariff_sea_pallets} vs {opt.tariff_sea_pallets}) 정산 절감이 늘지만, 쓴 컨테이너 "
+        f"빈칸 비용(컨테이너 비용 × 빈 파렛트 ÷ 용량)이 {fcfs.empty_slot_cost:,}원으로 최적화 "
+        f"{opt.empty_slot_cost:,}원보다 {fcfs.empty_slot_cost - opt.empty_slot_cost:,}원 크고 "
+        f"이 비용은 정산 단가에 잡히지 않는다. {tail}"
+    )
 
 
 def replan_benchmark(
@@ -304,11 +430,17 @@ def benchmark(
     scenario: Scenario, plan: Plan | None = None, air_locked: Iterable[str] = ()
 ) -> BenchmarkResult:
     started = time.perf_counter()
-    methods = compare_methods(scenario, plan)
+    runs = _method_parts(scenario, plan)
+    methods = [_result(method, parts, ms) for method, parts, ms in runs]
+    gaps = [_basis_gap(m, parts) for m, (_, parts, _) in zip(methods, runs, strict=True)]
+    optimizer = runs[0][1][0][1]
     replan_part = replan_benchmark(scenario, plan, air_locked)
     return BenchmarkResult(
         scenario_id=scenario.id,
         methods=methods,
         replan=replan_part,
         solve_ms=round((time.perf_counter() - started) * 1000),
+        bases=_bases(scenario, optimizer),
+        basis_gaps=gaps,
+        settlement_fcfs_explanation=settlement_fcfs_explanation(scenario, optimizer, gaps),
     )
