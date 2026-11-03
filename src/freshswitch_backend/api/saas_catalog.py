@@ -17,8 +17,10 @@ def org_scenario(principal: Principal, scenario_id: str = "default") -> Scenario
     base = get_scenario(scenario_id)
     if base is None:
         raise HTTPException(status_code=404, detail="시나리오를 찾을 수 없습니다")
-    scope = ANY_ORG if principal.org_type == "platform" else principal.org_id
-    return tenant_scenario(base, load_catalog(scope, base))
+    if principal.org_type == "platform":
+        return tenant_scenario(base, load_catalog(ANY_ORG, base))
+    scenario = tenant_scenario(base, load_catalog(principal.org_id, base))
+    return scenario.model_copy(update={"description": ""})
 
 
 @router.get("/catalog")

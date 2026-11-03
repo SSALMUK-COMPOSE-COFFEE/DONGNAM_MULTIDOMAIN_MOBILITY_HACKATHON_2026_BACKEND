@@ -28,3 +28,17 @@ def test_alert_stream_disables_proxy_buffering(client: TestClient) -> None:
     assert stream.status_code == 200
     assert stream.headers["cache-control"] == "no-cache, no-transform"
     assert stream.headers["x-accel-buffering"] == "no"
+
+
+def test_shipper_free_text_scenario_description_is_blank(
+    platform_client: TestClient, saas_login
+) -> None:
+    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
+    jinju = saas_login("shipper-jinju")
+    catalog = jinju.get("/api/saas/catalog").json()
+    assert catalog["description"] == ""
+    assert [s["id"] for s in catalog["shippers"]] == ["sh-jinju"]
+    detail = jinju.get(f"/api/saas/shipper/plans/{plan_id}").json()
+    assert detail["scenario"]["description"] == ""
+    platform = platform_client.get("/api/saas/catalog").json()
+    assert platform["description"]

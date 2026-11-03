@@ -285,6 +285,8 @@ class Anonymizer:
     def session(self, payload: dict[str, Any]) -> dict[str, Any]:
         result = self.walk(payload)
         scenario = result.get("scenario") or {}
+        if "description" in scenario:
+            scenario["description"] = ""
         for packhouse in scenario.get("packhouses", []):
             if packhouse.get("id") in self.hidden_packhouses:
                 packhouse.update(region="", lat=None, lon=None)
