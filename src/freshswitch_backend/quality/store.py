@@ -5,7 +5,7 @@ from datetime import datetime, time
 from pathlib import Path
 from typing import Literal
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, exists, func, or_, select
 from sqlalchemy.orm import Session
 
 from freshswitch_backend.coldchain import ColdchainError, NotFound, coldchain_store
@@ -15,7 +15,7 @@ from freshswitch_backend.execution.quality import ArrivalSettlementResult
 from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.persistence import Database, database, get_meta, set_meta
 from freshswitch_backend.persistence.orgs import org_sandbox
-from freshswitch_backend.persistence.tables import DEMO_ORG, DEMO_SCOPE, ObservationRow
+from freshswitch_backend.persistence.tables import DEMO_ORG, DEMO_SCOPE, ObservationRow, PlanRow
 from freshswitch_backend.planning.store import PlanSession
 from freshswitch_backend.planning.store import store as plan_store
 from freshswitch_backend.quality.learning import condition_uplift, outage_bucket, prior_model_rate
@@ -83,6 +83,18 @@ def _container_outage(plan_id: str, container_id: str, org_id: str = DEMO_ORG) -
         return state.outage.cumulative_minutes
     except (NotFound, ColdchainError):
         return None
+
+
+def _plan_alive():
+    return exists().where(PlanRow.plan_id == ObservationRow.plan_id)
+
+
+def _orphan_arrival():
+    return (ObservationRow.origin == "arrival") & ~_plan_alive()
+
+
+def _counted():
+    return or_(ObservationRow.origin != "arrival", _plan_alive())
 
 
 def _row(
@@ -208,7 +220,7 @@ class QualityHistory:
         with self._lock, self._db.begin() as db:
             rows = db.scalars(
                 select(ObservationRow)
-                .where(ObservationRow.scope == scope)
+                .where(ObservationRow.scope == scope, _counted())
                 .order_by(ObservationRow.seq)
             )
             stored = [Observation.model_validate(row.payload) for row in rows]
@@ -216,7 +228,9 @@ class QualityHistory:
 
     def get(self, obs_id: str, scope: LearningScope = "demo") -> Observation | None:
         with self._lock, self._db.begin() as db:
-            row = db.get(ObservationRow, obs_id)
+            row = db.scalars(
+                select(ObservationRow).where(ObservationRow.id == obs_id, _counted())
+            ).first()
             if row is not None:
                 return Observation.model_validate(row.payload) if row.scope == scope else None
             return next((o for o in self._pending_seeds(db, scope) if o.id == obs_id), None)
@@ -232,6 +246,10 @@ class QualityHistory:
             )
             return db.execute(target).rowcount > 0
 
+    def prune_orphans(self) -> int:
+        with self._lock, self._db.begin() as db:
+            return db.execute(delete(ObservationRow).where(_orphan_arrival())).rowcount
+
     def _append(
         self,
         db: Session,
@@ -239,9 +257,10 @@ class QualityHistory:
         scope: LearningScope,
         inspection_revision: int | None = None,
     ) -> None:
+        in_scope = ObservationRow.scope == scope
+        db.execute(delete(ObservationRow).where(in_scope, _orphan_arrival()))
         db.add(_row(observation, scope, inspection_revision))
         db.flush()
-        in_scope = ObservationRow.scope == scope
         cutoff = db.scalar(
             select(ObservationRow.seq)
             .where(in_scope)
@@ -308,6 +327,9 @@ class QualityHistory:
         scope = learning_scope(org_id)
         with self._lock, self._db.begin() as db:
             self._ensure_seeded(db, scope)
+            alive = db.scalar(
+                select(PlanRow.plan_id).where(PlanRow.plan_id == plan_id).with_for_update(read=True)
+            )
             existing = db.scalars(
                 select(ObservationRow).where(
                     ObservationRow.origin == "arrival",
@@ -350,6 +372,8 @@ class QualityHistory:
                 voyage_id=voyage_id,
                 note=result.note,
             )
+            if alive is None:
+                return observation
             if existing is not None:
                 existing.scope = scope
                 existing.product_id = observation.product_id

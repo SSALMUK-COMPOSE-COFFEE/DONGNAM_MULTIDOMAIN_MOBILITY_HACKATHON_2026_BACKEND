@@ -773,9 +773,10 @@ def reset(
 ) -> ResetResponse | SandboxResetResponse:
     if scope == "sandbox":
         return sandbox_reset_response(reset_sandbox())
+    cleared_sessions = store.clear(DEMO_ORG)
     cleared_quality, _ = quality_history.reset()
     return ResetResponse(
-        cleared_sessions=store.clear(DEMO_ORG),
+        cleared_sessions=cleared_sessions,
         cleared_coldchain_containers=coldchain_store.clear(DEMO_ORG),
         cleared_quality_observations=cleared_quality,
         cleared_lots=lot_store.clear(DEMO_ORG) if include_lots else 0,

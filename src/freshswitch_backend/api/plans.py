@@ -50,7 +50,7 @@ from freshswitch_backend.planning.store import (
     SessionConflict,
     store,
 )
-from freshswitch_backend.quality import learning_scope, with_learned_loss
+from freshswitch_backend.quality import learning_scope, quality_history, with_learned_loss
 from freshswitch_backend.replan import (
     DelayEvent,
     Event,
@@ -336,7 +336,9 @@ def read_plan(plan_id: str, org_id: OrgId) -> PlanSession:
 
 @router.delete("/{plan_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_plan(plan_id: str, org_id: OrgId) -> None:
-    if not store.delete(plan_id, org_id=org_id):
+    deleted = store.delete(plan_id, org_id=org_id)
+    quality_history.prune_orphans()
+    if not deleted:
         raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")
 
 
