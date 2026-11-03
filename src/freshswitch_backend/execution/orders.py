@@ -555,13 +555,6 @@ def build_order(
         f"포워더 확정 = min(집하 출발 기한, 제3자 요청 회신 기한). {dispatch_basis}. "
         f"선사 부킹 변경 회신 = CY 마감 − {p.booking_amendment_lead_hours.value:g}시간(가정)"
     )
-    if floored:
-        basis += (
-            f". 계산한 기한이 이미 지났거나 너무 가까워 하한을 적용: 화주 확인 ≥ 지시 생성 "
-            f"{fmt(now)} + 화주 응답 {p.shipper_response_hours.value:g}시간(가정), "
-            f"포워더 확정·제3자 회신 ≥ 화주 확인 하한 + 포워더 처리 "
-            f"{p.forwarder_processing_hours.value:g}시간"
-        )
 
     initiator = None
     if event_lot:
@@ -573,6 +566,7 @@ def build_order(
         moved_by_shipper[move.shipper_id].append(move)
     confirmations: list[ShipperConfirmation] = []
     notified: list[str] = []
+    harvest_floored = False
     deltas = {d.shipper_id: d for d in alternative.diff.shippers}
     for sid in sorted(set(deltas) | set(moved_by_shipper)):
         delta = deltas.get(sid)
@@ -619,7 +613,11 @@ def build_order(
         for ready in pulled_dates:
             harvest = day_start(ready) - timedelta(hours=p.harvest_notice_hours.value)
             deadline = min(deadline, harvest)
-        deadline = max(deadline, shipper_floor)
+        if deadline < shipper_floor:
+            if pulled_dates and deadline < shipper_deadline:
+                harvest_floored = True
+            deadline = shipper_floor
+            floored = True
         lot_ids = sorted(
             {m.lot_id for m in moved_by_shipper.get(sid, [])}
             | {
@@ -646,6 +644,18 @@ def build_order(
         )
     if confirmations:
         shipper_deadline = min(c.deadline for c in confirmations)
+    if harvest_floored:
+        basis += (
+            f". 화주 확인 ≤ 당겨진 출하일 0시 − 수확 통보 "
+            f"{p.harvest_notice_hours.value:g}시간(가정)"
+        )
+    if floored:
+        basis += (
+            f". 계산한 기한이 이미 지났거나 너무 가까워 하한을 적용: 화주 확인 ≥ 지시 생성 "
+            f"{fmt(now)} + 화주 응답 {p.shipper_response_hours.value:g}시간(가정), "
+            f"포워더 확정·제3자 회신 ≥ 화주 확인 하한 + 포워더 처리 "
+            f"{p.forwarder_processing_hours.value:g}시간"
+        )
 
     automatic = _automatic_actions(ctx, changed)
     status = "proposed" if confirmations else "shipper_confirmed"

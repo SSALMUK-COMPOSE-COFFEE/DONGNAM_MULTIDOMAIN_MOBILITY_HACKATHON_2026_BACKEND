@@ -1,8 +1,11 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
+import pytest
 from fastapi.testclient import TestClient
 
-from freshswitch_backend.domain.models import KST
+from freshswitch_backend.domain.models import KST, Quantity
+from freshswitch_backend.execution import orders as orders_module
+from freshswitch_backend.execution.params import ExecutionParams
 from freshswitch_backend.planning.store import store
 
 
@@ -84,6 +87,33 @@ def test_replan3_default_deadlines_unchanged(client: TestClient) -> None:
     dispatch = datetime.fromisoformat(order["deadlines"]["dispatch"])
     forwarder = datetime.fromisoformat(order["deadlines"]["forwarder"])
     assert forwarder <= dispatch
+
+
+def test_replan3_shipper_only_floor_is_written_in_basis(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    params = ExecutionParams(
+        harvest_notice_hours=Quantity(value=24 * 30, unit="시간", source="가정: 테스트")
+    )
+    monkeypatch.setattr(orders_module, "ExecutionParams", lambda: params)
+    now = datetime(2026, 11, 10, 9, 0, tzinfo=KST)
+    store.clock = lambda: now
+    plan_id = _create(client)
+    _alternatives(
+        client, plan_id, {"type": "reduce", "lot_id": "lot-sancheong-sb-1", "new_pallets": 3}
+    )
+    _apply(client, plan_id, "pull_forward")
+    order = _orders(client, plan_id)[-1]
+    floor = now + timedelta(hours=params.shipper_response_hours.value)
+    forwarder_floor = floor + timedelta(hours=params.forwarder_processing_hours.value)
+    assert all(datetime.fromisoformat(r["deadline"]) > forwarder_floor for r in order["requests"])
+    assert order["shipper_confirmations"]
+    basis = order["deadlines"]["basis"]
+    assert "하한" in basis
+    assert "수확 통보" in basis
+    assert datetime.fromisoformat(order["deadlines"]["shipper"]) == floor
+    for item in order["shipper_confirmations"]:
+        assert datetime.fromisoformat(item["deadline"]) == floor
 
 
 def _etas(routes: list[dict], container_lots: set[str]) -> set[tuple[str, str]]:
