@@ -11,6 +11,7 @@ from freshswitch_backend.api import (
     intake,
     lots,
     me,
+    orgs,
     plans,
     provenance,
     quality,
@@ -36,3 +37,4 @@ api_router.include_router(quality.router)
 api_router.include_router(provenance.router)
 api_router.include_router(auth.router)
 api_router.include_router(me.router)
+api_router.include_router(orgs.router)
