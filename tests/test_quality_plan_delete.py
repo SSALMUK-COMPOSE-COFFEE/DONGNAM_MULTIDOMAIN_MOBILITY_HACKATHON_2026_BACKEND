@@ -175,7 +175,7 @@ def test_failed_cleanup_is_finished_by_retried_delete(client: TestClient, monkey
     monkeypatch.setattr(quality_history, "prune_orphans", broken)
     with pytest.raises(RuntimeError):
         client.delete(f"/api/plans/{plan_id}")
-    assert len(_stored_arrivals("demo")) == 1
+    assert _stored_arrivals("demo") == []
     assert _cell_n(client) == n_before
     assert _arrival_ids("demo", plan_id) == set()
 
