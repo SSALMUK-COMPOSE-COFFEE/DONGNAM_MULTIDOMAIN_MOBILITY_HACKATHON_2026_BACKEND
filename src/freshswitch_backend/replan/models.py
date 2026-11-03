@@ -7,20 +7,27 @@ from freshswitch_backend.explain.models import Explanation
 from freshswitch_backend.planning.service import VoyagePickup
 
 
+def _unset(value: object) -> bool:
+    return value is None
+
+
 class CancelEvent(BaseModel):
     type: Literal["cancel"] = "cancel"
     lot_id: str
+    occurred_at: KstDatetime | None = Field(default=None, exclude_if=_unset)
 
 
 class ReduceEvent(BaseModel):
     type: Literal["reduce"] = "reduce"
     lot_id: str
     new_pallets: int = Field(gt=0)
+    occurred_at: KstDatetime | None = Field(default=None, exclude_if=_unset)
 
 
 class AirSwitchEvent(BaseModel):
     type: Literal["air_switch"] = "air_switch"
     lot_id: str
+    occurred_at: KstDatetime | None = Field(default=None, exclude_if=_unset)
 
 
 class DelayEvent(BaseModel):
@@ -29,11 +36,13 @@ class DelayEvent(BaseModel):
     new_etd: KstDatetime
     new_cy_cutoff: KstDatetime | None = None
     source: Literal["manual", "해수부", "예측"] = "manual"
+    occurred_at: KstDatetime | None = Field(default=None, exclude_if=_unset)
 
 
 class AddLotEvent(BaseModel):
     type: Literal["add_lot"] = "add_lot"
     lot: Lot
+    occurred_at: KstDatetime | None = Field(default=None, exclude_if=_unset)
 
 
 Event = Annotated[
@@ -42,6 +51,8 @@ Event = Annotated[
 ]
 
 AlternativeId = Literal["pull_forward", "next_voyage", "sail_as_is"]
+FixedReason = Literal["truck_departed", "dispatch_executed"]
+RouteChangeKind = Literal["added", "removed", "changed"]
 
 
 class ReplanError(ValueError):
@@ -107,11 +118,49 @@ class CancellationCharge(BaseModel):
     source: str
 
 
+class RouteChange(BaseModel):
+    voyage_id: str
+    truck_id: str
+    change: RouteChangeKind
+    packhouses_before: list[str]
+    packhouses_after: list[str]
+    packhouses_added: list[str]
+    packhouses_removed: list[str]
+    lot_ids_before: list[str]
+    lot_ids_after: list[str]
+    trips_before: int
+    trips_after: int
+    departure_before: KstDatetime | None
+    departure_after: KstDatetime | None
+    km_before: float
+    km_after: float
+    cost_before: int
+    cost_after: int
+
+
 class PlanDiff(BaseModel):
     moved_lots: list[LotMove]
     shippers: list[ShipperDelta]
     containers: list[ContainerFill]
     cancellation: CancellationCharge | None = None
+    route_changes: list[RouteChange] = Field(default_factory=list)
+
+
+class ExecutedDispatch(BaseModel):
+    voyage_id: str | None = None
+    truck_id: str
+    lot_ids: list[str]
+
+
+class FixedLot(BaseModel):
+    lot_id: str
+    reason_code: FixedReason
+    reason: str
+    voyage_id: str
+    truck_id: str
+    trip: int
+    packhouse_id: str
+    departure: KstDatetime
 
 
 class Alternative(BaseModel):
@@ -133,6 +182,8 @@ class ReplanResult(BaseModel):
     scope: Literal["container", "voyage"]
     free_lot_ids: list[str]
     fixed_lot_ids: list[str]
+    fixed_reasons: list[FixedLot] = Field(default_factory=list)
+    occurred_at: KstDatetime | None = Field(default=None, exclude_if=_unset)
     alternatives: list[Alternative]
     recommended_id: AlternativeId | None
     diff: PlanDiff | None

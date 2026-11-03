@@ -119,6 +119,8 @@ async def delay_forecast(
             session.plan,
             event,
             air_locked=session.air_locked_lot_ids,
+            routes=session.routes,
+            now=store.clock(),
             deadline=deadline,
         )
         annotate_cancellations(result, session.scenario, session.plan)

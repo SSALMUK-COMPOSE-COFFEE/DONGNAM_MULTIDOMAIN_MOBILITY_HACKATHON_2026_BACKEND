@@ -47,6 +47,11 @@ def _assumptions(req: PickupRequest) -> list[str]:
             f"가정: 항만 게이트 혼잡 시간({spans})에는 도착하지 않도록 출발을 늦춘다. "
             "피하면 cut-off 전 집하를 못 하는 정차지가 생길 때만 혼잡 시간 도착을 허용한다"
         )
+    if req.locked_routes:
+        lines.append(
+            f"고정: 이미 출발했거나 배차가 실행된 트럭 운행 {len(req.locked_routes)}건은 "
+            "경로·적재를 바꾸지 않고, 그 트럭은 항만 복귀 뒤에만 다시 배차한다"
+        )
     if req.incompatible_groups:
         lines.append(
             "규칙: 컨테이너 혼적 규칙(SO2 처리 여부·온도·CA 조건)이 맞지 않는 품목은 "
@@ -59,9 +64,43 @@ def _floor_min(dt: datetime) -> datetime:
     return dt.replace(second=0, microsecond=0)
 
 
+def _release_locked(req: PickupRequest) -> PickupRequest:
+    turnaround = timedelta(minutes=req.service_minutes)
+    free_at: dict[str, datetime] = {}
+    for route in [*req.locked_routes, *req.blocking_routes]:
+        back = route.port_eta + turnaround
+        free_at[route.truck_id] = max(back, free_at.get(route.truck_id, back))
+    trucks = [
+        t.model_copy(
+            update={
+                "available_from": max(
+                    [x for x in (t.available_from, free_at.get(t.id)) if x is not None],
+                    default=None,
+                )
+            }
+        )
+        for t in req.trucks
+    ]
+    return req.model_copy(update={"trucks": trucks})
+
+
+def _merge_locked(req: PickupRequest, routes: list[TruckRoute]) -> list[TruckRoute]:
+    last: dict[str, int] = {}
+    for route in req.locked_routes:
+        last[route.truck_id] = max(route.trip, last.get(route.truck_id, 0))
+    shifted = []
+    for route in sorted(routes, key=lambda r: (r.earliest_departure, r.trip)):
+        trip = last.get(route.truck_id, 0) + 1
+        last[route.truck_id] = trip
+        shifted.append(route.model_copy(update={"trip": trip}))
+    order = {t.id: i for i, t in enumerate(req.trucks)}
+    merged = [*req.locked_routes, *shifted]
+    return sorted(merged, key=lambda r: (order.get(r.truck_id, len(order)), r.trip))
+
+
 def solve_pickup(request: PickupRequest, time_limit_s: float = 5.0) -> PickupPlan:
     started = time.perf_counter()
-    req = request
+    req = _release_locked(request) if request.locked_routes or request.blocking_routes else request
     points = [(req.depot.lat, req.depot.lon)] + [(s.lat, s.lon) for s in req.stops]
     n = len(points)
     km = [
@@ -80,6 +119,10 @@ def solve_pickup(request: PickupRequest, time_limit_s: float = 5.0) -> PickupPla
     if req.trucks_available_from is not None:
         t0_candidates.append(req.trucks_available_from)
     t0 = _floor_min(min(t0_candidates, default=req.deadline))
+    if req.not_before is not None and req.not_before > t0:
+        available = max(req.not_before, req.trucks_available_from or req.not_before)
+        req = req.model_copy(update={"trucks_available_from": available})
+        t0 = _floor_min(min([*t0_candidates, available], default=req.deadline))
 
     def to_min(dt: datetime) -> int:
         return math.floor((dt - t0).total_seconds() / 60)
@@ -148,6 +191,10 @@ def solve_pickup(request: PickupRequest, time_limit_s: float = 5.0) -> PickupPla
         status = "NO_TRUCKS"
         dropped.extend(req.stops[node - 1].id for node in windows)
 
+    if req.locked_routes:
+        routes = _merge_locked(req, routes)
+        if status == "NO_STOPS":
+            status = "OK"
     if dropped and status == "OK":
         status = "PARTIAL"
     order = {s.id: i for i, s in enumerate(req.stops)}

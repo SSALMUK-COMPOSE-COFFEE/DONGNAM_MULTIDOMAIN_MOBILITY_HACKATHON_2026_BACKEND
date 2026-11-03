@@ -293,7 +293,13 @@ def _cumulative(
     alternative: Alternative,
     superseded: list[ExecutionOrder],
 ) -> Alternative:
-    diff = diff_plans(scenario_after, committed.plan, alternative.plan)
+    diff = diff_plans(
+        scenario_after,
+        committed.plan,
+        alternative.plan,
+        routes_before=committed.routes,
+        routes_after=alternative.routes,
+    )
     charges: list[CancellationCharge] = [
         o.cancellation for o in superseded if o.cancellation and o.cancellation.fee
     ]

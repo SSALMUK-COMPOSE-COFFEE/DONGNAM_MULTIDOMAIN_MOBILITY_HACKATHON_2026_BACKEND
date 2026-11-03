@@ -1,3 +1,7 @@
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import datetime, time
 from itertools import combinations
 
@@ -9,9 +13,34 @@ from freshswitch_backend.routing.models import (
     PickupRequest,
     PickupStop,
     PickupTruck,
+    TruckRoute,
 )
 
 DEFAULT_READY_TIME = time(8, 0)
+
+
+@dataclass(frozen=True)
+class _Locks:
+    routes: Mapping[str, list[TruckRoute]] = field(default_factory=dict)
+    not_before: datetime | None = None
+
+
+_LOCKED: ContextVar[_Locks | None] = ContextVar("locked_routes", default=None)
+
+
+@contextmanager
+def locked_routes(
+    by_voyage: Mapping[str, list[TruckRoute]], not_before: datetime | None = None
+) -> Iterator[None]:
+    token = _LOCKED.set(_Locks(dict(by_voyage), not_before))
+    try:
+        yield
+    finally:
+        _LOCKED.reset(token)
+
+
+def route_lot_ids(routes: list[TruckRoute]) -> set[str]:
+    return {lid for route in routes for stop in route.stops for lid in stop.lot_ids}
 
 
 def cargo_groups(products: list[Product]) -> tuple[dict[str, str], list[tuple[str, str]]]:
@@ -66,6 +95,15 @@ def build_pickup_request(
     if voyage_id not in voyages:
         raise KeyError(f"unknown voyage: {voyage_id}")
     voyage = voyages[voyage_id]
+    context = _LOCKED.get() or _Locks()
+    locked = options.pop("locked_routes", None)
+    if locked is None:
+        locked = list(context.routes.get(voyage_id, []))
+    blocking = options.pop("blocking_routes", None)
+    if blocking is None:
+        blocking = [r for v, trips in context.routes.items() if v != voyage_id for r in trips]
+    not_before = options.pop("not_before", context.not_before)
+    held = route_lot_ids(locked)
     ports = {p.id: p for p in scenario.ports}
     port = ports[voyage.origin]
     lots = {lot.id: lot for lot in scenario.lots}
@@ -77,6 +115,8 @@ def build_pickup_request(
     for lot_id in lot_ids:
         if lot_id not in lots:
             raise KeyError(f"unknown lot: {lot_id}")
+        if lot_id in held:
+            continue
         lot = lots[lot_id]
         key = (shippers[lot.shipper_id].packhouse_id, group_of.get(lot.product_id, lot.product_id))
         grouped.setdefault(key, []).append(lot)
@@ -118,5 +158,8 @@ def build_pickup_request(
         trucks=trucks,
         deadline=voyage.cy_cutoff,
         incompatible_groups=[(a, b) for a, b in conflicts if a in used and b in used],
+        locked_routes=locked,
+        blocking_routes=blocking,
+        not_before=not_before,
         **{"gate_windows": gate_windows(port), **options},
     )
