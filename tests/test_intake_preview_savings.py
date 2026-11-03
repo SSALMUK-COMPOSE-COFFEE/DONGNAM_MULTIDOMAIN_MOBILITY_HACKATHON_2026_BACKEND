@@ -3,6 +3,8 @@ from fastapi.testclient import TestClient
 
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import Scenario
+from freshswitch_backend.optimize.settlement import settle
+from freshswitch_backend.persistence.seed import shipper_org_id
 from freshswitch_backend.planning.service import build_plan
 
 INTAKE = "/api/intake/lots"
@@ -53,8 +55,12 @@ def test_strawberry_estimate_matches_plan_settlement(client: TestClient, scenari
     assert estimate["assumptions"] and "25%" in estimate["rule"]
 
 
-def test_grape_uses_pallet_usage_fee(client: TestClient, scenario: Scenario):
-    response = client.post(INTAKE, json=_body(_lot(scenario, "lot-sangju-gr-1")))
+PULL_FORWARD_NOTE = "출하를 1일 앞당긴다고 가정(조기 수확 손실 포함)"
+
+
+def test_grape_uses_pallet_usage_fee(saas_login, scenario: Scenario):
+    sangju = saas_login(shipper_org_id("sh-sangju"))
+    response = sangju.post(INTAKE, json=_body(_lot(scenario, "lot-sangju-gr-1")))
     assert response.status_code == 200, response.text
     estimate = response.json()["savings_estimate"]
     assert estimate["mode"] == "sea"
@@ -90,3 +96,41 @@ def test_shipper_session_gets_own_estimate(shipper_client: TestClient, scenario:
     assert estimate["mode"] == "sea"
     assert estimate["pallets"] == 8
     assert "산청" not in response.text
+
+
+def test_demo_grape_keeps_performance_fee(client: TestClient, scenario: Scenario):
+    response = client.post(INTAKE, json=_body(_lot(scenario, "lot-sangju-gr-1")))
+    assert response.status_code == 200, response.text
+    estimate = response.json()["savings_estimate"]
+    assert estimate["mode"] == "sea"
+    assert estimate["billing_rule"] == "performance"
+    assert "25%" in estimate["rule"]
+    assert estimate["savings"] > 0
+    assert (estimate["fee"], estimate["shipper_gain"]) == settle(estimate["savings"], 0.25)
+
+
+def test_no_plan_estimate_skips_pull_forward_options(client: TestClient, scenario: Scenario):
+    response = client.post(INTAKE, json=_body(_lot(scenario, "lot-miryang-sb-2")))
+    assert response.status_code == 200, response.text
+    body = response.json()
+    hints = {o["container_id"]: o for o in body["hints"]["sea_options"]}
+    assert hints["CA-01"]["feasible"] and hints["CA-01"]["pull_forward_days"] == 1
+    estimate = body["savings_estimate"]
+    assert estimate["mode"] == "sea"
+    assert estimate["container_id"] == "CA-03"
+    assert hints["CA-03"]["pull_forward_days"] == 0
+    assert not any("앞당긴다고" in note for note in estimate["assumptions"])
+    assert any("항공으로 배정될 수 있습니다" in note for note in estimate["assumptions"])
+
+
+def test_plan_estimate_discloses_pull_forward(client: TestClient, scenario: Scenario):
+    created = client.post("/api/plans", json={"scenario_id": "default"})
+    assert created.status_code in (200, 201), created.text
+    plan_id = created.json()["plan_id"]
+    body = _body(_lot(scenario, "lot-miryang-sb-2"), plan_id=plan_id)
+    response = client.post(INTAKE, json=body)
+    assert response.status_code == 200, response.text
+    estimate = response.json()["savings_estimate"]
+    assert estimate["mode"] == "sea"
+    assert estimate["container_id"] == "CA-01"
+    assert PULL_FORWARD_NOTE in estimate["assumptions"]

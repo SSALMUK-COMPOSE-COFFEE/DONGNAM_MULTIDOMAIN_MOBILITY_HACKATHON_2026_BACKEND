@@ -9,8 +9,8 @@ BASELINE_NOTE = "기준선: 이 출하를 혼자 항공으로 보낼 때 비용(
 FINAL_NOTE = "확정 정산은 계획 생성 뒤 실제 적재·집하 경로로 다시 계산합니다"
 
 
-def _rule(model: CostModel, lot: Lot) -> tuple[str, str]:
-    if lot.product_id in USAGE_FEE_PRODUCTS:
+def _rule(model: CostModel, lot: Lot, usage_fee_enabled: bool) -> tuple[str, str]:
+    if usage_fee_enabled and lot.product_id in USAGE_FEE_PRODUCTS:
         fee = f"{USAGE_FEE_PER_PALLET:,}원"
         return (
             "usage_fee",
@@ -39,19 +39,31 @@ def _load(model: CostModel, option: SeaHint, lot: Lot, plan: Plan | None) -> tup
     load = max(lot.pallets, round(capacity * TARGET_UTILIZATION))
     return load, (
         f"공동적재로 {option.container_id}가 목표 적재율 {TARGET_UTILIZATION:.0%}"
-        f"({load}/{capacity}파렛트)까지 찬다고 가정"
+        f"({load}/{capacity}파렛트)까지 찬다고 가정. 실제 계획에서 그만큼 차지 않으면 "
+        "이 출하가 항공으로 배정될 수 있습니다(plan_id를 주면 실제 적재로 계산)"
     )
 
 
+def _option(plan: Plan | None, hints: FeasibilityHints) -> SeaHint | None:
+    if plan is not None:
+        return hints.earliest_feasible
+    return next((o for o in hints.sea_options if o.feasible and o.pull_forward_days == 0), None)
+
+
 def estimate_savings(
-    scenario: Scenario, lot: Lot, plan: Plan | None, hints: FeasibilityHints
+    scenario: Scenario,
+    lot: Lot,
+    plan: Plan | None,
+    hints: FeasibilityHints,
+    *,
+    usage_fee_enabled: bool,
 ) -> SavingsEstimate | None:
     model = CostModel(scenario)
     basis = "tariff" if model.tariff(lot) is not None else "operational"
-    billing, rule = _rule(model, lot)
+    billing, rule = _rule(model, lot, usage_fee_enabled)
     baseline = round(model.settle_air_cost(lot).total)
     assumptions = [BASELINE_NOTE]
-    option = hints.earliest_feasible
+    option = _option(plan, hints)
     if option is not None:
         load, note = _load(model, option, lot, plan)
         assignment = Assignment(
@@ -74,6 +86,10 @@ def estimate_savings(
                 )
             else:
                 assumptions.append("품목 파렛트당 정산표(운임·내륙·품질손실 위험)로 계산")
+            if option.pull_forward_days > 0:
+                assumptions.append(
+                    f"출하를 {option.pull_forward_days}일 앞당긴다고 가정(조기 수확 손실 포함)"
+                )
             return SavingsEstimate(
                 mode="sea",
                 container_id=option.container_id,

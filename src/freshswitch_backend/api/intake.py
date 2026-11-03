@@ -120,7 +120,9 @@ def build_preview(
         )
     except IntakeError as exc:
         raise intake_error(exc) from exc
-    estimate = estimate_savings(scenario, preview.lot, plan, preview.hints)
+    estimate = estimate_savings(
+        scenario, preview.lot, plan, preview.hints, usage_fee_enabled=scope.org_id != DEMO_ORG
+    )
     return preview.model_copy(update={"savings_estimate": estimate}), scenario.id
 
 

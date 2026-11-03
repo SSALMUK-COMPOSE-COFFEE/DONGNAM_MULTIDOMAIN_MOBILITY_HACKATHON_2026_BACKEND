@@ -1,14 +1,20 @@
 from datetime import date, datetime
+from typing import get_args
 
 import pytest
 from fastapi.testclient import TestClient
 from test_saas_api import _lot_body
 
 from freshswitch_backend.data.loader import get_scenario
-from freshswitch_backend.domain.models import Scenario
+from freshswitch_backend.domain.models import AssignmentReasonCode, Lot, Scenario
 from freshswitch_backend.optimize import AIR, solve_plan
+from freshswitch_backend.optimize.costs import CostModel
+from freshswitch_backend.optimize.feasibility import sea_option
+from freshswitch_backend.optimize.solver import AIR_CODES, SEA_CODES, SEA_PRIORITY, _sea_reason
 from freshswitch_backend.persistence.seed import shipper_org_id
 from freshswitch_backend.planning.service import CUTOFF_REASON, build_plan
+from freshswitch_backend.replan.engine import replan
+from freshswitch_backend.replan.models import AddLotEvent
 
 LATE_LOT = "lot-miryang-sb-2"
 
@@ -161,3 +167,129 @@ def test_shipper_view_anonymizes_other_shipper_reasons(
     assert "miryang" not in text and "밀양" not in text
     for row in plan["unassigned"]:
         assert "reason_code" in row
+
+
+def test_reason_codes_cover_every_label() -> None:
+    codes = set(get_args(AssignmentReasonCode))
+    assert set(SEA_CODES.values()) <= set(SEA_PRIORITY)
+    assert set(SEA_PRIORITY) <= codes
+    covered = set(SEA_PRIORITY) | set(AIR_CODES.values())
+    extra = {"air_forbidden", "fixed", "capacity_or_cost", "pickup_cutoff_miss"}
+    assert codes == covered | extra | {"no_feasible_mode", "no_solution"}
+
+
+@pytest.mark.parametrize(
+    ("lot_update", "container_update", "shelf_life", "code"),
+    [
+        ({"destination": "SGSIN"}, {}, None, "destination_mismatch"),
+        ({"pallets": 21}, {}, None, "over_capacity"),
+        ({}, {"kind": "40RH"}, None, "ca_unsupported"),
+        ({"ready_date": date(2026, 11, 30)}, {}, None, "sea_deadline_miss"),
+        ({"sell_by_date": date(2026, 11, 16)}, {}, None, "sea_sell_by_miss"),
+        ({}, {}, 0, "sea_shelf_life_miss"),
+    ],
+)
+def test_sea_labels_map_to_codes(
+    scenario: Scenario, lot_update: dict, container_update: dict, shelf_life, code: str
+) -> None:
+    products = scenario.products
+    if shelf_life is not None:
+        products = [p.model_copy(update={"shelf_life_days": shelf_life}) for p in products]
+    model = CostModel(scenario.model_copy(update={"products": products}))
+    lot = next(lot for lot in scenario.lots if lot.id == "lot-jinju-sb-1")
+    container = scenario.containers[0].model_copy(update=container_update)
+    option, label = sea_option(model, lot.model_copy(update=lot_update), container, 0)
+    assert option is None
+    assert SEA_CODES[label] == code
+
+
+def test_sea_reason_picks_priority_and_names_only_its_containers() -> None:
+    reason = _sea_reason(
+        [
+            ("sea_deadline_miss", "출하일이 선적 마감 이후", "CA-01"),
+            ("sea_sell_by_miss", "도착일이 판매기한 초과", "CA-03"),
+            ("destination_mismatch", "목적지 불일치", "CA-02"),
+        ]
+    )
+    assert reason is not None
+    assert reason.code == "sea_sell_by_miss"
+    assert reason.message == "해상 배정 불가: 도착일이 판매기한 초과(CA-03)"
+
+
+def test_mixed_sea_rejections_use_sell_by_code(scenario: Scenario) -> None:
+    plan = build_plan(_with_lot(scenario, LATE_LOT, sell_by_date=date(2026, 11, 20))).plan
+    late = next(a for a in plan.assignments if a.lot_id == LATE_LOT)
+    assert late.mode == "air"
+    assert late.reason is not None
+    assert late.reason.code == "sea_sell_by_miss"
+    assert late.reason.message == "해상 배정 불가: 도착일이 판매기한 초과(CA-03). 항공 배정"
+    assert "CA-01" not in late.reason.message
+
+
+def _no_containers(scenario: Scenario) -> Scenario:
+    return scenario.model_copy(update={"containers": []}, deep=True)
+
+
+def test_no_containers_and_no_air_is_air_not_allowed(scenario: Scenario) -> None:
+    plan = solve_plan(_no_containers(scenario), allow_air=False)
+    assert {u.reason_code for u in plan.unassigned} == {"air_not_allowed"}
+    assert len(plan.unassigned) == len(scenario.lots)
+
+
+def test_no_containers_air_is_no_feasible_mode(scenario: Scenario) -> None:
+    plan = solve_plan(_no_containers(scenario))
+    assert len(plan.assignments) == len(scenario.lots)
+    assert {a.reason.code for a in plan.assignments if a.reason} == {"no_feasible_mode"}
+    assert all(a.reason is not None for a in plan.assignments)
+
+
+def test_air_sell_by_miss_code(scenario: Scenario) -> None:
+    tight = _with_lot(scenario, LATE_LOT, sell_by_date=date(2026, 11, 18))
+    plan = solve_plan(_no_containers(tight))
+    lost = next(u for u in plan.unassigned if u.lot_id == LATE_LOT)
+    assert lost.reason_code == "air_sell_by_miss"
+
+
+def test_air_shelf_life_miss_code(scenario: Scenario) -> None:
+    products = [p.model_copy(update={"shelf_life_days": 0}) for p in scenario.products]
+    spoiled = _no_containers(scenario).model_copy(update={"products": products})
+    plan = solve_plan(spoiled)
+    assert {u.reason_code for u in plan.unassigned} == {"air_shelf_life_miss"}
+
+
+def test_forbidden_air_is_air_forbidden(scenario: Scenario) -> None:
+    plan = solve_plan(_no_containers(scenario), forbidden=[(LATE_LOT, AIR)])
+    lost = next(u for u in plan.unassigned if u.lot_id == LATE_LOT)
+    assert lost.reason_code == "air_forbidden"
+
+
+def test_conflicting_fixed_is_no_solution(scenario: Scenario) -> None:
+    plan = solve_plan(scenario, fixed={lot.id: "CA-01" for lot in scenario.lots})
+    assert plan.unassigned
+    assert {u.reason_code for u in plan.unassigned} == {"no_solution"}
+
+
+def test_replan_add_lot_keeps_reason_codes(scenario: Scenario) -> None:
+    plan = build_plan(scenario.model_copy(deep=True)).plan
+    lot = Lot(
+        id="lot-jinju-sb-2",
+        shipper_id="sh-jinju",
+        product_id="strawberry",
+        pallets=2,
+        ready_date=date(2026, 11, 16),
+        destination="HKHKG",
+        sell_by_date=date(2026, 11, 23),
+    )
+    result = replan(scenario, plan, AddLotEvent(lot=lot), air_locked={LATE_LOT})
+    alts = {alt.id: alt.plan for alt in result.alternatives}
+    for alt_plan in alts.values():
+        locked = next(a for a in alt_plan.assignments if a.lot_id == LATE_LOT)
+        assert locked.mode == "air" and locked.reason is not None
+        assert locked.reason.code == "fixed"
+    pulled = next(a for a in alts["pull_forward"].assignments if a.lot_id == lot.id)
+    assert pulled.mode == "sea" and pulled.reason is None
+    as_is = next(a for a in alts["sail_as_is"].assignments if a.lot_id == lot.id)
+    assert as_is.mode == "air" and as_is.reason is not None
+    assert as_is.reason.code == "sea_forbidden"
+    stuck = next(u for u in alts["next_voyage"].unassigned if u.lot_id == lot.id)
+    assert stuck.reason_code == "sea_forbidden"
