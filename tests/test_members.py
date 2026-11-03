@@ -103,7 +103,7 @@ def test_invited_existing_user_switches_between_two_orgs() -> None:
     assert shipper.get("/api/saas/forwarder/plans").status_code == 200
     assert shipper.get("/api/saas/shipper/profile").status_code == 403
 
-    back = shipper.get("/api/me", headers={"X-Org-Id": shipper_org})
+    back = shipper.put("/api/auth/active-org", json={"org_id": shipper_org})
     assert back.status_code == 200
     assert back.json()["active_org"]["org_id"] == shipper_org
     assert shipper.get("/api/saas/shipper/profile").json()["org_id"] == shipper_org
