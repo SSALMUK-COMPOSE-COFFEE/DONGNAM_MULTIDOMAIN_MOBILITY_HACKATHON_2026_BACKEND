@@ -49,11 +49,39 @@ uv run --with pyserial python scripts/arduino/bridge.py --port /dev/ttyACM0 \
 | `--stdin` | | 표준 입력의 JSON 줄을 보낸다(파일 재생·테스트용) |
 | `--fake` | | 아두이노 없이 가짜 측정값. Enter를 누를 때마다 전원 토글 |
 | `--api` | `http://127.0.0.1:8000/api` | API 주소 (docker compose면 `http://127.0.0.1:18103/api`) |
-| `--container` | `CA-01` | 계획의 컨테이너 ID |
+| `--container` | `CA-01` | 계획의 컨테이너 ID. `--device-token`을 주면 기본값 없이 바인딩이 정한다 |
 | `--plan-id` | 없음 | 계획 ID. 바인딩으로 이미 연결했으면 생략 가능 |
 | `--time-scale` | `60` | 시각 가속. 60이면 실제 1초 = 1분, 4분 전원을 뽑으면 4시간 단전으로 계산 |
 | `--interval` | `2` | `--fake` 측정 간격(초) |
+| `--device-token` | env `FRESHSWITCH_DEVICE_TOKEN` | SaaS 등록 기기 토큰. `X-Device-Token` 헤더로 보낸다 |
 | `--dry-run` | | 보내지 않고 변환된 요청 본문만 출력 |
+
+## SaaS(`/test`)로 보내기
+
+SaaS 스택은 로그인 없는 판독을 받지 않는다. 조직에 등록한 기기의 토큰을 `X-Device-Token`으로
+보내야 하고, 어느 컨테이너·계획에 들어갈지는 서버 바인딩이 정한다.
+
+1. 플랫폼(또는 포워더)으로 로그인해 기기를 등록한다. 응답의 `device_token`은 이때 한 번만 나온다.
+   데모(sandbox) 조직은 기기 id가 `demo-`로 시작해야 하고, 실제 조직은 `demo-`·`sim-`을 쓸 수 없다.
+   - `POST /test/api/saas/devices` `{"device_id": "demo-arduino-01"}` → `{"device_token": "..."}`
+2. 같은 세션으로 기기를 계획 컨테이너에 바인딩한다.
+   - `POST /test/api/coldchain/bindings` `{"device_id": "demo-arduino-01", "container_id": "CA-01", "plan_id": "<계획 id>", "stage": "terminal"}`
+3. 브리지를 토큰과 함께 돌린다. `--container`·`--plan-id`는 생략한다(주면 바인딩과 같아야 한다).
+
+```bash
+export FRESHSWITCH_DEVICE_TOKEN=<1에서 받은 device_token>
+uv run python scripts/arduino/bridge.py --fake \
+  --api https://freshswitch.ssalhub.xyz/test/api --device-id demo-arduino-01
+
+# 실물 아두이노
+uv run --with pyserial python scripts/arduino/bridge.py --port /dev/cu.usbmodem1101 \
+  --api https://freshswitch.ssalhub.xyz/test/api --device-id demo-arduino-01 \
+  --device-token "$FRESHSWITCH_DEVICE_TOKEN"
+```
+
+판독이 들어가면 플랫폼 콜드체인 관제(`GET /test/api/coldchain/containers?plan_id=...`, SSE)가
+움직인다. 토큰이 틀리거나 빠지면 `전송 거부 401`, 바인딩이 없거나 컨테이너·계획이 바인딩과
+다르면 `전송 거부 422`가 찍힌다.
 
 ## 무대 순서 (`--time-scale 60` 기준 약 5분, 120이면 절반)
 
