@@ -42,6 +42,12 @@ LAST_SEEN_INTERVAL = timedelta(minutes=1)
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 INVALID_LOGIN = "이메일 또는 비밀번호가 올바르지 않습니다"
 TOO_MANY_REQUESTS = "요청이 너무 많습니다. 잠시 후 다시 시도하세요"
+LOGIN_LOCKED = "로그인 실패가 반복되어 잠시 막혔습니다. 잠시 후 다시 시도하세요"
+LOGIN_ROUTE = "login"
+LOGIN_FAILURE_THRESHOLD = 5
+LOGIN_LOCK_SECONDS = 60.0
+LOGIN_MAX_LOCK_SECONDS = 900.0
+LOGIN_FORGET_SECONDS = 3600.0
 DEMO_SESSION_CAP = 5000
 DEMO_SESSION_TTL = timedelta(hours=12)
 TRUSTED_PROXIES_ENV = "TRUSTED_PROXIES"
@@ -63,6 +69,7 @@ class RateRule:
 AUTH_RATE_RULES: dict[str, RateRule] = {
     "demo-login": RateRule(per_client=60, window_seconds=60),
     "signup": RateRule(per_client=30, window_seconds=600),
+    LOGIN_ROUTE: RateRule(per_client=30, window_seconds=300),
 }
 
 
@@ -99,6 +106,66 @@ class SlidingWindowLimiter:
                 return max(hits[0] + rule.window_seconds - now, 0.0)
             hits.append(now)
             return None
+
+    def refund(self, route: str, client: str) -> None:
+        with self._lock:
+            hits = self._hits.get((route, client))
+            if hits:
+                hits.pop()
+
+
+@dataclass
+class _LoginFailures:
+    count: int = 0
+    locked_until: float = 0.0
+    last: float = 0.0
+
+
+class LoginFailureGuard:
+    def __init__(
+        self,
+        threshold: int = LOGIN_FAILURE_THRESHOLD,
+        lock_seconds: float = LOGIN_LOCK_SECONDS,
+        max_lock_seconds: float = LOGIN_MAX_LOCK_SECONDS,
+        forget_seconds: float = LOGIN_FORGET_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._threshold = threshold
+        self._lock_seconds = lock_seconds
+        self._max_lock_seconds = max_lock_seconds
+        self._forget_seconds = forget_seconds
+        self._clock = clock
+        self._entries: dict[str, _LoginFailures] = {}
+        self._lock = threading.Lock()
+
+    def _stale(self, entry: _LoginFailures, now: float) -> bool:
+        return entry.locked_until <= now and entry.last <= now - self._forget_seconds
+
+    def _sweep(self, now: float) -> None:
+        for key in [k for k, entry in self._entries.items() if self._stale(entry, now)]:
+            del self._entries[key]
+
+    def attempt(self, key: str) -> float | None:
+        now = self._clock()
+        with self._lock:
+            if len(self._entries) > 10_000:
+                self._sweep(now)
+            entry = self._entries.get(key)
+            if entry is None or self._stale(entry, now):
+                entry = self._entries[key] = _LoginFailures()
+            if entry.locked_until > now:
+                return entry.locked_until - now
+            entry.count += 1
+            entry.last = now
+            if entry.count >= self._threshold:
+                steps = entry.count - self._threshold
+                lock = self._lock_seconds * 2 ** min(steps, 32)
+                entry.locked_until = now + min(lock, self._max_lock_seconds)
+            return None
+
+    def succeed(self, key: str) -> None:
+        with self._lock:
+            self._entries.pop(key, None)
 
 
 _limiter_lock = threading.Lock()
@@ -273,6 +340,20 @@ def auth_limiter(request: Request) -> SlidingWindowLimiter:
         return limiter
 
 
+def login_guard(request: Request) -> LoginFailureGuard:
+    state = request.app.state
+    with _limiter_lock:
+        guard = getattr(state, "login_failure_guard", None)
+        if guard is None:
+            guard = LoginFailureGuard()
+            state.login_failure_guard = guard
+        return guard
+
+
+def _retry_after(retry: float) -> dict[str, str]:
+    return {"Retry-After": str(max(1, math.ceil(retry)))}
+
+
 def rate_limit(route: str) -> Callable[[Request], None]:
     def dependency(request: Request) -> None:
         if not app_settings(request).saas_mode:
@@ -282,7 +363,7 @@ def rate_limit(route: str) -> Callable[[Request], None]:
             raise HTTPException(
                 status_code=429,
                 detail=TOO_MANY_REQUESTS,
-                headers={"Retry-After": str(max(1, math.ceil(retry)))},
+                headers=_retry_after(retry),
             )
 
     return dependency
@@ -543,6 +624,14 @@ def signup(body: SignupRequest, request: Request, response: Response) -> Me:
 
 @router.post("/login")
 def login(body: LoginRequest, request: Request, response: Response) -> Me:
+    limiter = auth_limiter(request)
+    guard = login_guard(request)
+    client = client_address(request)
+    retry = limiter.hit(LOGIN_ROUTE, client)
+    if retry is None:
+        retry = guard.attempt(body.email)
+    if retry is not None:
+        raise HTTPException(status_code=429, detail=LOGIN_LOCKED, headers=_retry_after(retry))
     with database.begin() as db:
         user = db.scalar(select(UserRow).where(func.lower(UserRow.email) == body.email))
         valid = verify_password(body.password, user.password_hash if user else _dummy_hash())
@@ -550,7 +639,10 @@ def login(body: LoginRequest, request: Request, response: Response) -> Me:
             raise HTTPException(status_code=401, detail=INVALID_LOGIN)
         if app_settings(request).saas_mode and (user.is_demo or is_demo_email(user.email)):
             raise HTTPException(status_code=401, detail=INVALID_LOGIN)
-        return _start_session(db, request, response, user)
+        me = _start_session(db, request, response, user)
+    limiter.refund(LOGIN_ROUTE, client)
+    guard.succeed(body.email)
+    return me
 
 
 def _demo_rank() -> dict[str, int]:

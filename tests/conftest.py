@@ -172,6 +172,13 @@ def frozen_clock():
 
 
 @pytest.fixture(autouse=True)
+def fresh_request_limits():
+    for name in ("auth_rate_limiter", "login_failure_guard", "replan_limiter"):
+        setattr(app.state, name, None)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def no_live_ulsan():
     app.dependency_overrides[ulsan_client_factory] = lambda: None
     yield
