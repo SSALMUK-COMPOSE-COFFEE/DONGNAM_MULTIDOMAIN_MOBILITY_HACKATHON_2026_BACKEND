@@ -28,6 +28,10 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.execute("DELETE FROM quality_observations WHERE scope <> 'demo'")
+    op.execute(
+        "DELETE FROM app_meta WHERE key IN ('quality_seeded:sandbox', 'quality_seeded:live')"
+    )
     op.drop_index("ix_quality_observations_scope_seq", table_name="quality_observations")
     op.drop_constraint("quality_observations_scope_check", "quality_observations", type_="check")
     op.drop_column("quality_observations", "scope")

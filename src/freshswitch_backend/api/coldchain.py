@@ -35,12 +35,14 @@ from freshswitch_backend.coldchain.models import (
 from freshswitch_backend.coldchain.simulator import PRESETS
 from freshswitch_backend.domain.models import Quantity
 from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.orgs import org_sandbox
 from freshswitch_backend.persistence.tables import DEMO_ORG, ShipperProfileRow
 
 DEVICE_TOKEN_HEADER = "X-Device-Token"
 STREAM_RECHECK_SECONDS = 5.0
 UNREGISTERED_DEVICE = "등록되지 않은 장치입니다. 조직 기기로 먼저 등록하세요"
 REGISTERED_DEVICE_REQUIRED = "조직에 등록된 장치와 X-Device-Token이 필요합니다"
+SIMULATOR_SANDBOX_ONLY = "시뮬레이터는 데모 세계(sandbox) 조직에서만 쓸 수 있습니다"
 
 router = APIRouter(prefix="/coldchain", tags=["coldchain"])
 OrgId = Annotated[str, Depends(current_org_id)]
@@ -327,6 +329,8 @@ def list_presets() -> list[PresetInfo]:
 
 @router.post("/simulate")
 def simulate(body: SimulationRequest, org_id: OrgId, principal: OptionalPrincipal) -> SimulationRun:
+    if principal is not None and not org_sandbox(principal.org_id):
+        raise HTTPException(status_code=403, detail=SIMULATOR_SANDBOX_ONLY)
     if not is_simulator_device(body.device_id):
         _device_org(body.device_id, org_id, principal)
     try:

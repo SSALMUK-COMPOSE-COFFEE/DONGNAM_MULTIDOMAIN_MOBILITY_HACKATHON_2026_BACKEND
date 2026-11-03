@@ -25,7 +25,9 @@ def _endpoints(*routers: APIRouter) -> frozenset[Endpoint]:
     )
 
 
-PUBLIC_ENDPOINTS = _endpoints(auth.router, health.router, showcase.router)
+PUBLIC_ENDPOINTS = _endpoints(auth.router, health.router, showcase.router) - {
+    auth.switch_active_org
+}
 DEVICE_ENDPOINTS: frozenset[Endpoint] = frozenset({coldchain.ingest})
 ADMIN_TOKEN_ENDPOINTS: frozenset[Endpoint] = frozenset(
     {demo.reset, quality.reset, quality.delete_observation, ops.demo_contamination}

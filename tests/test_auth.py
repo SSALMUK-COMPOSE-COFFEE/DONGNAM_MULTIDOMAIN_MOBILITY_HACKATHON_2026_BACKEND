@@ -278,7 +278,7 @@ def test_org_header_switches_and_rejects_outsiders(https_client: TestClient) -> 
         "role": "member",
         "sandbox": False,
     }
-    assert https_client.get("/api/me").json()["active_org"]["org_id"] == "forwarder-extra"
+    assert https_client.get("/api/me").json()["active_org"]["org_id"] == home
 
     outside = https_client.get("/api/me", headers={"X-Org-Id": "shipper-outside"})
     assert outside.status_code == 403

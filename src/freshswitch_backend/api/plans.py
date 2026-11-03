@@ -409,9 +409,19 @@ def read_order(plan_id: str, order_id: str, org_id: OrgId) -> ExecutionOrder:
 
 @router.post("/{plan_id}/orders/{order_id}/confirm")
 def confirm_order(
-    plan_id: str, order_id: str, body: ConfirmRequest, org_id: OrgId
+    plan_id: str,
+    order_id: str,
+    body: ConfirmRequest,
+    org_id: OrgId,
+    principal: OptionalPrincipal,
 ) -> ExecutionOrder:
     _session(plan_id, org_id)
+    if principal is not None:
+        raise HTTPException(
+            status_code=403,
+            detail="로그인 상태에서는 대신 확정할 수 없습니다. "
+            "화주는 화주 화면, 포워더는 배정된 포워더 화면에서 확정합니다",
+        )
     try:
         return store.confirm(plan_id, order_id, body, org_id=org_id)
     except KeyError as exc:

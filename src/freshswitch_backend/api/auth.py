@@ -1,11 +1,18 @@
+import argparse
 import hashlib
+import math
+import os
 import re
 import secrets
+import threading
+import time
 import uuid
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
+from ipaddress import IPv4Network, IPv6Network, ip_address, ip_network
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -33,11 +40,66 @@ UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 LAST_SEEN_INTERVAL = timedelta(minutes=1)
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 INVALID_LOGIN = "이메일 또는 비밀번호가 올바르지 않습니다"
+TOO_MANY_REQUESTS = "요청이 너무 많습니다. 잠시 후 다시 시도하세요"
+DEMO_SESSION_CAP = 5000
+DEMO_SESSION_TTL = timedelta(hours=12)
+TRUSTED_PROXIES_ENV = "TRUSTED_PROXIES"
+DEFAULT_TRUSTED_PROXIES = "127.0.0.0/8,::1/128,172.16.0.0/12"
 
 OrgType = Literal["platform", "shipper", "forwarder"]
 SignupOrgType = Literal["shipper", "forwarder"]
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@dataclass(frozen=True)
+class RateRule:
+    per_client: int
+    window_seconds: float
+
+
+AUTH_RATE_RULES: dict[str, RateRule] = {
+    "demo-login": RateRule(per_client=60, window_seconds=60),
+    "signup": RateRule(per_client=30, window_seconds=600),
+}
+
+
+class SlidingWindowLimiter:
+    def __init__(
+        self, rules: dict[str, RateRule], clock: Callable[[], float] = time.monotonic
+    ) -> None:
+        self._rules = rules
+        self._clock = clock
+        self._hits: dict[tuple[str, str], deque[float]] = {}
+        self._lock = threading.Lock()
+
+    def _window(self, key: tuple[str, str], now: float, window: float) -> deque[float]:
+        hits = self._hits.setdefault(key, deque())
+        while hits and hits[0] <= now - window:
+            hits.popleft()
+        return hits
+
+    def _sweep(self, now: float) -> None:
+        for key in list(self._hits):
+            rule = self._rules.get(key[0])
+            hits = self._hits[key]
+            if rule is None or not hits or hits[-1] <= now - rule.window_seconds:
+                del self._hits[key]
+
+    def hit(self, route: str, client: str) -> float | None:
+        rule = self._rules[route]
+        now = self._clock()
+        with self._lock:
+            if len(self._hits) > 10_000:
+                self._sweep(now)
+            hits = self._window((route, client), now, rule.window_seconds)
+            if len(hits) >= rule.per_client:
+                return max(hits[0] + rule.window_seconds - now, 0.0)
+            hits.append(now)
+            return None
+
+
+_limiter_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -111,12 +173,75 @@ class DemoLoginRequest(BaseModel):
     org_id: str | None = Field(default=None, max_length=64)
 
 
+class ActiveOrgRequest(BaseModel):
+    org_id: str = Field(min_length=1, max_length=64)
+
+
 def app_settings(request: Request) -> Settings:
     return getattr(request.app.state, "settings", None) or get_settings()
 
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+Network = IPv4Network | IPv6Network
+
+
+@lru_cache
+def _networks(raw: str) -> tuple[Network, ...]:
+    return tuple(ip_network(part.strip(), strict=False) for part in raw.split(",") if part.strip())
+
+
+def trusted_proxies() -> tuple[Network, ...]:
+    return _networks(os.environ.get(TRUSTED_PROXIES_ENV, DEFAULT_TRUSTED_PROXIES))
+
+
+def _is_trusted_proxy(host: str) -> bool:
+    try:
+        address = ip_address(host)
+    except ValueError:
+        return False
+    return any(address in network for network in trusted_proxies())
+
+
+def client_address(request: Request) -> str:
+    peer = request.client.host if request.client else "unknown"
+    if not _is_trusted_proxy(peer):
+        return peer
+    forwarded = [hop.strip() for hop in request.headers.get("x-forwarded-for", "").split(",")]
+    hops = [hop for hop in forwarded if hop]
+    if hops:
+        return hops[-1]
+    real = request.headers.get("x-real-ip", "").strip()
+    if real:
+        return real
+    return peer
+
+
+def auth_limiter(request: Request) -> SlidingWindowLimiter:
+    state = request.app.state
+    with _limiter_lock:
+        limiter = getattr(state, "auth_rate_limiter", None)
+        if limiter is None:
+            limiter = SlidingWindowLimiter(AUTH_RATE_RULES)
+            state.auth_rate_limiter = limiter
+        return limiter
+
+
+def rate_limit(route: str) -> Callable[[Request], None]:
+    def dependency(request: Request) -> None:
+        if not app_settings(request).saas_mode:
+            return
+        retry = auth_limiter(request).hit(route, client_address(request))
+        if retry is not None:
+            raise HTTPException(
+                status_code=429,
+                detail=TOO_MANY_REQUESTS,
+                headers={"Retry-After": str(max(1, math.ceil(retry)))},
+            )
+
+    return dependency
 
 
 def _token_hash(token: str) -> str:
@@ -214,7 +339,7 @@ def current_principal(request: Request) -> Principal | None:
         if session is None or session.expires_at <= now:
             raise _session_required(settings, stale_cookie=True)
         active = _choose(_memberships(db, session.user_id), requested, session.active_org_id)
-        if session.active_org_id != active.org_id:
+        if requested is None and session.active_org_id != active.org_id:
             session.active_org_id = active.org_id
         if session.last_seen_at is None or now - session.last_seen_at >= LAST_SEEN_INTERVAL:
             session.last_seen_at = now
@@ -253,11 +378,11 @@ def current_org_id(principal: OptionalPrincipal) -> str:
     return principal.org_id if principal is not None else DEMO_ORG
 
 
-def _set_cookie(response: Response, settings: Settings, token: str) -> None:
+def _set_cookie(response: Response, settings: Settings, token: str, ttl: timedelta) -> None:
     response.set_cookie(
         settings.session_cookie_name,
         token,
-        max_age=settings.session_ttl,
+        max_age=int(ttl.total_seconds()),
         path=settings.cookie_path,
         secure=settings.session_cookie_secure,
         httponly=True,
@@ -294,21 +419,47 @@ def _start_session(
             AuthSessionRow.user_id == user.id, AuthSessionRow.expires_at <= now
         )
     )
+    ttl = timedelta(seconds=settings.session_ttl)
+    if user.is_demo:
+        ttl = min(ttl, DEMO_SESSION_TTL)
+        surplus = (
+            select(AuthSessionRow.token_hash)
+            .where(AuthSessionRow.user_id == user.id)
+            .order_by(
+                AuthSessionRow.last_seen_at.desc().nulls_last(),
+                AuthSessionRow.created_at.desc(),
+                AuthSessionRow.token_hash,
+            )
+            .offset(DEMO_SESSION_CAP - 1)
+        )
+        db.execute(delete(AuthSessionRow).where(AuthSessionRow.token_hash.in_(surplus)))
     token = secrets.token_urlsafe(32)
     db.add(
         AuthSessionRow(
             token_hash=_token_hash(token),
             user_id=user.id,
             active_org_id=active.org_id,
-            expires_at=now + timedelta(seconds=settings.session_ttl),
+            expires_at=now + ttl,
             last_seen_at=now,
         )
     )
-    _set_cookie(response, settings, token)
+    _set_cookie(response, settings, token, ttl)
     return _me(user, memberships, active)
 
 
-@router.post("/signup", status_code=status.HTTP_201_CREATED)
+def purge_expired_sessions(now: datetime | None = None) -> int:
+    with database.begin() as db:
+        result = db.execute(
+            delete(AuthSessionRow).where(AuthSessionRow.expires_at <= (now or _now()))
+        )
+        return result.rowcount or 0
+
+
+@router.post(
+    "/signup",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(rate_limit("signup"))],
+)
 def signup(body: SignupRequest, request: Request, response: Response) -> Me:
     if is_demo_email(body.email):
         raise HTTPException(status_code=422, detail="데모 계정 도메인으로는 가입할 수 없습니다")
@@ -352,7 +503,7 @@ def _demo_rank() -> dict[str, int]:
     return {org.id: index for index, org in enumerate(demo_orgs())}
 
 
-@router.post("/demo-login")
+@router.post("/demo-login", dependencies=[Depends(rate_limit("demo-login"))])
 def demo_login(body: DemoLoginRequest, request: Request, response: Response) -> Me:
     with database.begin() as db:
         candidates = db.execute(
@@ -374,6 +525,25 @@ def demo_login(body: DemoLoginRequest, request: Request, response: Response) -> 
         return _start_session(db, request, response, user, org_id)
 
 
+@router.put("/active-org")
+def switch_active_org(body: ActiveOrgRequest, request: Request, _: AuthPrincipal) -> Me:
+    settings = app_settings(request)
+    token = request.cookies.get(settings.session_cookie_name)
+    if not token:
+        raise _session_required(settings, stale_cookie=False)
+    with database.begin() as db:
+        session = db.get(AuthSessionRow, _token_hash(token))
+        if session is None or session.expires_at <= _now():
+            raise _session_required(settings, stale_cookie=True)
+        user = db.get(UserRow, session.user_id)
+        if user is None:
+            raise _session_required(settings, stale_cookie=True)
+        memberships = _memberships(db, user.id)
+        active = _choose(memberships, body.org_id, None)
+        session.active_org_id = active.org_id
+        return _me(user, memberships, active)
+
+
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 def logout(request: Request) -> Response:
     settings = app_settings(request)
@@ -386,3 +556,14 @@ def logout(request: Request) -> Response:
     response = Response(status_code=status.HTTP_204_NO_CONTENT)
     _clear_cookie(response, settings)
     return response
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(prog="freshswitch_backend.api.auth")
+    parser.add_subparsers(dest="command", required=True).add_parser("purge-sessions")
+    parser.parse_args(argv)
+    print(f"purged={purge_expired_sessions()}")
+
+
+if __name__ == "__main__":
+    main()
