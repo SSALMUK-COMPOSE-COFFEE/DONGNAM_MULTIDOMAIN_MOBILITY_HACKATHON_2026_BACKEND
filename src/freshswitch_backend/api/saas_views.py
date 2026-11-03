@@ -330,7 +330,16 @@ def _scope_settlements(payload: dict[str, Any], own: set[str]) -> None:
     containers = [_own_container(c, own) for c in plan["container_settlements"]]
     operational_baseline = _cost_total(costs, "operational_baseline")
     operational = _cost_total(costs, "operational")
+    collections = [c for c in plan["lot_collections"] if c["shipper_id"] in own]
+    if plan["total_collection_route"] is not None:
+        plan["total_collection_route"] = sum(
+            (c.get("operational") or {}).get("collection", 0) for c in costs
+        )
     plan.update(
+        lot_collections=collections,
+        total_collection_estimate=sum(
+            (c.get("operational") or {}).get("collection_estimate") or 0 for c in costs
+        ),
         settlements=rows,
         shipper_costs=costs,
         container_settlements=[c for c in containers if c is not None],
