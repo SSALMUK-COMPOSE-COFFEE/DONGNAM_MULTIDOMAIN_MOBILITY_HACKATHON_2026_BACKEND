@@ -5,6 +5,7 @@ from saas_fixtures import REAL_PLATFORM_EMAIL, REAL_PLATFORM_PASSWORD, create_re
 from freshswitch_backend.config import get_settings
 from freshswitch_backend.main import create_app
 from freshswitch_backend.quality import quality_history
+from freshswitch_backend.quality.models import ObservationIn
 
 CSRF = {"X-Requested-With": "freshswitch"}
 
@@ -105,3 +106,34 @@ def test_demo_mode_logged_in_shipper_cannot_reset_quality(demo_tenants) -> None:
     _demo_login(client, "shipper")
     reset = client.post("/api/quality/reset", params={"seed": False}, headers=CSRF)
     assert reset.status_code == 403
+
+
+def test_demo_mode_admin_token_honours_scope(client: TestClient, reset_admin_headers) -> None:
+    body = ObservationIn(product_id="strawberry", pallets=1, actual_loss_pct=2)
+    live = quality_history.add(body, "live").id
+    demo_before = len(quality_history.observations())
+    wrong = client.post(
+        "/api/quality/reset",
+        params={"scope": "live"},
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+    assert wrong.status_code == 401
+    reset = client.post(
+        "/api/quality/reset", params={"scope": "live", "seed": False}, headers=reset_admin_headers
+    )
+    assert reset.status_code == 200
+    assert reset.json()["cleared"] == 1
+    assert quality_history.observations("live") == []
+    assert len(quality_history.observations()) == demo_before
+    again = quality_history.add(body, "live").id
+    assert again != live
+    removed = client.delete(
+        f"/api/quality/observations/{again}", params={"scope": "live"}, headers=reset_admin_headers
+    )
+    assert removed.status_code == 204
+    assert quality_history.observations("live") == []
+
+
+def test_demo_mode_anonymous_cannot_target_other_scope(client: TestClient) -> None:
+    response = client.post("/api/quality/reset", params={"scope": "sandbox", "seed": False})
+    assert response.status_code == 403

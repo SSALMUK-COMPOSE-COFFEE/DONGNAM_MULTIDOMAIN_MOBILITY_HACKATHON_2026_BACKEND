@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import delete, exists, func, select, text, true, update
+from sqlalchemy import delete, exists, func, or_, select, text, true, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -105,10 +105,7 @@ def release_lots(
 ) -> None:
     if lot_ids is not None and not lot_ids:
         return
-    referenced = exists().where(
-        PlanRow.payload["registered_lot_ids"].contains(func.jsonb_build_array(LotRow.id))
-    )
-    statement = update(LotRow).where(LotRow.status == "planned", ~referenced)
+    statement = update(LotRow).where(LotRow.status == "planned", ~_held_by_plan(LotRow.id))
     if lot_ids is not None:
         statement = statement.where(LotRow.id.in_(lot_ids))
     statement = statement.where(_lot_scope(org_id))
@@ -130,9 +127,20 @@ def sync_committed_lots(db: Session, lot_ids: list[str], lots: list[Lot], now: d
     if removed:
         db.execute(
             update(LotRow)
-            .where(LotRow.id.in_(removed), LotRow.status == "planned")
+            .where(LotRow.id.in_(removed), LotRow.status == "planned", ~_held_by_plan(LotRow.id))
             .values(status="cancelled", updated_at=now)
         )
+
+
+def _held_by_plan(lot_id: Any) -> Any:
+    held = func.jsonb_build_array(func.jsonb_build_object("id", lot_id))
+    return exists().where(
+        PlanRow.payload["registered_lot_ids"].contains(func.jsonb_build_array(lot_id)),
+        or_(
+            PlanRow.payload["scenario"]["lots"].contains(held),
+            PlanRow.committed["scenario"]["lots"].contains(held),
+        ),
+    )
 
 
 def _now() -> datetime:
@@ -222,6 +230,10 @@ class LotStore:
     def ids(self, org_id: str = DEMO_ORG) -> set[str]:
         with self._db.begin() as db:
             return set(db.scalars(select(LotRow.id).where(_lot_scope(org_id))))
+
+    def referenced(self, lot_id: str) -> bool:
+        with self._db.begin() as db:
+            return bool(db.scalar(select(_held_by_plan(lot_id))))
 
     def org_of(self, lot_id: str) -> str | None:
         with self._db.begin() as db:

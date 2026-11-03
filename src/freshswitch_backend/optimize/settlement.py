@@ -319,6 +319,7 @@ def shipper_costs_and_settlements(
     estimates: dict[str, float] = defaultdict(float)
     pallets: dict[str, list[int]] = {}
     kinds: dict[str, set[bool]] = defaultdict(set)
+    row_kinds: dict[tuple[str, str], set[bool]] = defaultdict(set)
     rows: dict[tuple[str, str], list[float]] = {}
     billing: dict[str, _Billing] = defaultdict(_Billing)
     row_billing: dict[tuple[str, str], _Billing] = defaultdict(_Billing)
@@ -350,6 +351,7 @@ def shipper_costs_and_settlements(
             row[0] += lot.pallets
             row[1] += baseline.total
             row[2] += settled.total
+            row_kinds[(a.container_id, sid)].add(model.tariff(lot) is not None)
             row_billing[(a.container_id, sid)].add(
                 rule, lot.pallets, sea, baseline.total, settled.total
             )
@@ -414,7 +416,7 @@ def shipper_costs_and_settlements(
                     baseline_cost=base_cost,
                     shared_cost=shared,
                     savings=base_cost - shared,
-                    basis=_basis(kinds[sid]),
+                    basis=_basis(row_kinds[(container.id, sid)]),
                     **bill.fields(),
                 )
             )

@@ -95,11 +95,13 @@ def reset_target(
     credential: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
     scope: Annotated[LearningScope | None, Query()] = None,
 ) -> ResetTarget:
-    if principal is None and not app_settings(request).saas_mode:
-        return ResetTarget(None, "demo")
     if credential is not None:
         require_demo_reset(credential)
         return ResetTarget(None, scope or "demo")
+    if principal is None and not app_settings(request).saas_mode:
+        if scope not in (None, "demo"):
+            raise HTTPException(status_code=403, detail=OTHER_SCOPE)
+        return ResetTarget(None, "demo")
     if principal is None:
         raise HTTPException(status_code=401, detail="로그인이 필요합니다")
     if app_settings(request).saas_mode and org_sandbox(principal.org_id):

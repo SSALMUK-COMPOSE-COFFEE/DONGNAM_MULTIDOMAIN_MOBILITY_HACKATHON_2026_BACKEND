@@ -25,12 +25,19 @@ LOT_LOCKED = (
 )
 LOT_SHIPPED = "이미 선적된 출하는 수정·삭제할 수 없습니다"
 LOCKED_STATUS_FORBIDDEN = "화주는 등록·취소 상태로만 바꿀 수 있습니다"
+LOT_STILL_REFERENCED = (
+    "취소된 출하가 아직 다른 계획에 남아 있어 되살릴 수 없습니다. 새 출하로 다시 등록해 주세요"
+)
 
 
 class LotLocked(Exception):
     def __init__(self, status: str) -> None:
         super().__init__(status)
         self.status = status
+
+
+class LotReferenced(Exception):
+    pass
 
 
 def _locked_detail(status: str | None) -> str:
@@ -141,7 +148,11 @@ def _validate_patch(
     ):
         product_id = values.get("product_id", lot.product_id)
         product = next((p for p in scenario.products if p.id == product_id), None)
-        if product is not None:
+        previous = next((p for p in scenario.products if p.id == lot.product_id), None)
+        defaulted = previous is not None and lot.sell_by_date == lot.ready_date + timedelta(
+            days=previous.shelf_life_days
+        )
+        if product is not None and (defaulted or ready > lot.sell_by_date):
             values["sell_by_date"] = ready + timedelta(days=product.shelf_life_days)
     sell_by = values.get("sell_by_date", lot.sell_by_date)
     if sell_by < ready:
@@ -162,12 +173,20 @@ def update_locked_lot(
     def change(lot: RegisteredLot) -> dict[str, Any]:
         if lot.status in LOCKED_STATUSES:
             raise LotLocked(lot.status)
+        if (
+            lot.status == "cancelled"
+            and patch.status == "registered"
+            and lot_store.referenced(lot.id)
+        ):
+            raise LotReferenced
         return _validate_patch(lot, patch, scope, recompute_sell_by=True)
 
     try:
         updated = lot_store.update(lot_id, change, org_id=org_id)
     except LotLocked as exc:
         raise HTTPException(status_code=409, detail=_locked_detail(exc.status)) from exc
+    except LotReferenced as exc:
+        raise HTTPException(status_code=409, detail=LOT_STILL_REFERENCED) from exc
     except IntakeError as exc:
         raise intake_error(exc) from exc
     if updated is None:
