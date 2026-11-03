@@ -1,13 +1,14 @@
 import re
 import time
 from collections.abc import Callable, Iterable
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from freshswitch_backend.domain.models import KST, Plan, Scenario
 from freshswitch_backend.optimize import AIR
 from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.optimize.feasibility import air_rejection, sea_option
+from freshswitch_backend.planning.budget import PlanningTimeout
 from freshswitch_backend.planning.budget import remaining as remaining_budget
 from freshswitch_backend.planning.service import (
     PlanWithRoutes,
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
     from freshswitch_backend.execution.models import ExecutionOrder
 
 UNASSIGNED = "UNASSIGNED"
+DISPATCH_RELEASED = "실행된 배차를 고정하면 실행 가능한 대안이 없어 고정을 풀고 계산했습니다"
 MAX_PULL_FORWARD_DAYS = 2
 SOLVED = ("OPTIMAL", "FEASIBLE")
 LABELS: dict[AlternativeId, str] = {
@@ -104,15 +106,18 @@ def fixed_routes(
             trip = f"{route.truck_id} {route.trip}회차"
             if departed and at is not None:
                 code = "truck_departed"
-                why = f"{trip} {_clock(route.earliest_departure)} 출발(이벤트 {_clock(at)} 기준)"
+                why = (
+                    f"{trip} {_clock(route.earliest_departure)} 출발(이벤트 {_clock(at)} 기준)"
+                    ": 경로·적재 고정"
+                )
             else:
                 code = "dispatch_executed"
-                why = f"{trip} 배차 실행됨"
+                why = f"{trip} 배차 실행됨: 트럭·출발 시각 고정(해상·항공 선택은 변경 가능)"
             reasons.extend(
                 FixedLot(
                     lot_id=lid,
                     reason_code=code,
-                    reason=f"{why}: 경로·적재 고정",
+                    reason=why,
                     voyage_id=voyage_pickup.voyage_id,
                     truck_id=route.truck_id,
                     trip=route.trip,
@@ -231,16 +236,26 @@ def apply_event(scenario: Scenario, event: Event) -> Scenario:
             voyage = next((v for v in scenario.voyages if v.id == voyage_id), None)
             if voyage is None:
                 raise ReplanError(f"항차를 찾을 수 없음: {voyage_id}")
+            base_etd = voyage.original_etd or voyage.etd
+            base_cutoff = voyage.original_cy_cutoff or voyage.cy_cutoff
+            if voyage.original_etd is not None and voyage.original_cy_cutoff is None:
+                base_cutoff = voyage.cy_cutoff + max(base_etd - voyage.etd, timedelta(0))
             cutoff = new_cutoff or voyage.cy_cutoff
-            if new_cutoff is None and new_etd < voyage.etd:
-                cutoff = voyage.cy_cutoff + (new_etd - voyage.etd)
+            if new_cutoff is None and new_etd < base_etd:
+                cutoff = base_cutoff + (new_etd - base_etd)
+            elif new_cutoff is None and voyage.etd < base_etd:
+                cutoff = base_cutoff
             if cutoff > new_etd:
                 raise ReplanError("선적 마감이 출항 시각보다 늦을 수 없음")
+            original_cutoff = voyage.original_cy_cutoff
+            if original_cutoff is None:
+                original_cutoff = voyage.cy_cutoff if voyage.original_etd is None else base_cutoff
             changed = voyage.model_copy(
                 update={
                     "etd": new_etd,
                     "cy_cutoff": cutoff,
-                    "original_etd": voyage.original_etd or voyage.etd,
+                    "original_etd": base_etd,
+                    "original_cy_cutoff": original_cutoff,
                 }
             )
             return scenario.model_copy(
@@ -253,6 +268,13 @@ def apply_event(scenario: Scenario, event: Event) -> Scenario:
                 raise ReplanError(f"화주를 찾을 수 없음: {lot.shipper_id}")
             if lot.product_id not in {p.id for p in scenario.products}:
                 raise ReplanError(f"품목을 찾을 수 없음: {lot.product_id}")
+            if lot.destination not in {p.id for p in scenario.ports}:
+                raise ReplanError(f"항구를 찾을 수 없음: {lot.destination}")
+            capacity = max((c.capacity_pallets for c in scenario.containers), default=20)
+            if lot.pallets > capacity:
+                raise ReplanError(f"컨테이너 1대 용량({capacity}파렛트)을 넘음: {lot.id}")
+            if lot.sell_by_date < lot.ready_date:
+                raise ReplanError(f"판매기한이 출하 가능일보다 빠름: {lot.id}")
             return scenario.model_copy(update={"lots": [*scenario.lots, lot]})
     raise ReplanError(f"알 수 없는 이벤트: {event}")
 
@@ -303,6 +325,9 @@ class _Context:
         air_locked: set[str],
         routes_before: list[VoyagePickup] | None,
         held: set[str],
+        before: Scenario | None = None,
+        unavailable: Iterable[str] = (),
+        pinned: Iterable[tuple[str, str, int]] = (),
     ) -> None:
         self.after = after
         self.current = current
@@ -313,6 +338,9 @@ class _Context:
         self.lot_ids = [lot.id for lot in after.lots]
         self.voyage_of = {c.id: c.voyage_id for c in after.containers}
         self.etd = {v.id: v.etd for v in after.voyages}
+        self.etd_before = {v.id: v.etd for v in (before or after).voyages}
+        self.unavailable = set(unavailable) - set(self.where.values())
+        self.pinned = set(pinned)
         self.air_locked = set(air_locked) & set(self.lot_ids)
         self.held = held & set(self.lot_ids)
         self.rule_switched: set[str] = set()
@@ -369,6 +397,9 @@ class _Context:
         }
         fixed.update({lid: AIR for lid in self.air_locked})
         return fixed
+
+    def booked_pairs(self) -> list[tuple[str, str]]:
+        return [(lid, cid) for lid in self.lot_ids for cid in sorted(self.unavailable)]
 
     def new_unassigned(self, plan: Plan) -> list[str]:
         return [u.lot_id for u in plan.unassigned if self.where.get(u.lot_id) != UNASSIGNED]
@@ -509,7 +540,9 @@ def _moved_for_next_voyage(ctx: _Context) -> tuple[set[str], set[str]]:
     if isinstance(ctx.event, AddLotEvent):
         lot = ctx.event.lot
         candidates = [
-            c for c in ctx.after.containers if sea_option(ctx.model, lot, c, 0)[0] is not None
+            c
+            for c in ctx.after.containers
+            if c.id not in ctx.unavailable and sea_option(ctx.model, lot, c, 0)[0] is not None
         ]
         if not candidates:
             return set(), set()
@@ -528,9 +561,11 @@ def _moved_for_next_voyage(ctx: _Context) -> tuple[set[str], set[str]]:
     return moved, ctx.scope_voyages()
 
 
-def _next_voyage_reasons(ctx: _Context, plan: Plan, moved: set[str], horizon) -> list[str]:
+def _next_voyage_reasons(
+    ctx: _Context, plan: Plan, moved: set[str], blocked: set[str]
+) -> list[str]:
     lots = {lot.id: lot for lot in ctx.after.lots}
-    later = [c for c in ctx.after.containers if ctx.etd[c.voyage_id] > horizon]
+    later = [c for c in ctx.after.containers if c.id not in blocked and c.id not in ctx.unavailable]
     reasons = []
     for u in plan.unassigned:
         if u.lot_id not in moved:
@@ -544,6 +579,18 @@ def _next_voyage_reasons(ctx: _Context, plan: Plan, moved: set[str], horizon) ->
             details.append(f"{container.voyage_id}/{container.id} {reason or '용량·혼적 부족'}")
         reasons.append(f"{u.lot_id}: " + ", ".join(details))
     return reasons
+
+
+def _late_pinned(ctx: _Context, routes: list[VoyagePickup]) -> list[str]:
+    cutoff = {v.id: v.cy_cutoff for v in ctx.after.voyages}
+    return [
+        f"{lid}: 배차가 실행된 트럭 {route.truck_id}이 선적 마감 뒤에 항만에 도착"
+        for vp in routes
+        for route in vp.pickup.routes
+        if (vp.voyage_id, route.truck_id, route.trip) in ctx.pinned
+        and route.port_eta > cutoff[vp.voyage_id]
+        for lid in sorted(route_lot_ids([route]))
+    ]
 
 
 def _alternative(
@@ -565,6 +612,7 @@ def _alternative(
         for lid in sorted(ctx.held)
         if where.get(lid) != ctx.where.get(lid)
     ]
+    reasons += _late_pinned(ctx, built.routes)
     diff = diff_plans(
         ctx.after, ctx.current, plan, routes_before=ctx.routes_before, routes_after=built.routes
     )
@@ -591,25 +639,76 @@ def replan(
     air_locked: Iterable[str] = (),
     routes: list[VoyagePickup] | None = None,
     dispatched: Iterable[ExecutedDispatch] = (),
+    unavailable_containers: Iterable[str] = (),
     now: datetime | None = None,
     time_limit_s: float = 8.0,
     deadline: float | None = None,
+) -> ReplanResult:
+    started = time.perf_counter()
+    dispatched = list(dispatched)
+    options = {
+        "air_locked": set(air_locked),
+        "routes": routes,
+        "unavailable": set(unavailable_containers),
+        "now": now,
+        "time_limit_s": time_limit_s,
+        "deadline": deadline,
+    }
+    result = _replan_with(scenario, current_plan, event, dispatched, **options)
+    pinned = any(f.reason_code == "dispatch_executed" for f in result.fixed_reasons)
+    first = time.perf_counter() - started
+    if result.recommended_id is None and pinned and _has_time(deadline, first):
+        try:
+            released = _replan_with(scenario, current_plan, event, [], **options)
+        except PlanningTimeout:
+            released = None
+        if released is not None and released.recommended_id is not None:
+            released.warnings.append(DISPATCH_RELEASED)
+            result = released
+    result.solve_ms = round((time.perf_counter() - started) * 1000)
+    return result
+
+
+def _has_time(deadline: float | None, needed: float) -> bool:
+    return deadline is None or deadline - time.perf_counter() > needed
+
+
+def _replan_with(
+    scenario: Scenario,
+    current_plan: Plan,
+    event: Event,
+    dispatched: list[ExecutedDispatch],
+    *,
+    air_locked: set[str],
+    routes: list[VoyagePickup] | None,
+    unavailable: set[str],
+    now: datetime | None,
+    time_limit_s: float,
+    deadline: float | None,
 ) -> ReplanResult:
     started = time.perf_counter()
     occurred_at = event_time(event, now)
     held, held_reasons = (
         fixed_routes(routes, occurred_at, dispatched) if routes is not None else ({}, [])
     )
+    departed = [f for f in held_reasons if f.reason_code == "truck_departed"]
     lot_id = getattr(event, "lot_id", None)
-    blocked_by = next((f for f in held_reasons if f.lot_id == lot_id), None)
+    blocked_by = next((f for f in departed if f.lot_id == lot_id), None)
     if blocked_by is not None:
         raise ReplanError(
             "이미 출발했거나 배차가 실행된 트럭에 실린 로트라 바꿀 수 없음: "
             f"{lot_id} ({blocked_by.reason})"
         )
     after = apply_event(scenario, event)
-    held_lots = route_lot_ids([r for trips in held.values() for r in trips])
-    ctx = _Context(after, current_plan, event, set(air_locked), routes, held_lots)
+    held_lots = {f.lot_id for f in departed}
+    pinned = {
+        (f.voyage_id, f.truck_id, f.trip)
+        for f in held_reasons
+        if f.reason_code == "dispatch_executed"
+    }
+    ctx = _Context(
+        after, current_plan, event, air_locked, routes, held_lots, scenario, unavailable, pinned
+    )
     with locked_routes(held, not_before=occurred_at):
         return _replan(ctx, held_reasons, occurred_at, started, time_limit_s, deadline)
 
@@ -632,6 +731,7 @@ def _replan(
         return solve_with_routes(
             after,
             fixed=ctx.fixed_for(free_lots),
+            forbidden=ctx.booked_pairs(),
             max_pull_forward_days=MAX_PULL_FORWARD_DAYS,
             time_limit_s=per_solve,
             deadline=deadline,
@@ -660,10 +760,16 @@ def _replan(
 
     moved, event_voyages = _moved_for_next_voyage(ctx)
     if moved and event_voyages:
-        horizon = max(ctx.etd[v] for v in event_voyages)
-        blocked = [c.id for c in after.containers if ctx.etd[c.voyage_id] <= horizon]
-        forbidden = [(lid, cid) for lid in moved for cid in blocked]
+        etd = ctx.etd_before if isinstance(event, DelayEvent) else ctx.etd
+        horizon = max(etd[v] for v in event_voyages)
+        blocked = {
+            c.id
+            for c in after.containers
+            if c.voyage_id in event_voyages or ctx.etd[c.voyage_id] <= horizon
+        }
+        forbidden = [(lid, cid) for lid in moved for cid in sorted(blocked)]
         forbidden += [(lid, AIR) for lid in moved]
+        forbidden += ctx.booked_pairs()
         next_fixed = {k: v for k, v in fixed.items() if k not in moved}
         next_built, next_ms = _timed(
             lambda: solve_with_routes(
@@ -682,7 +788,7 @@ def _replan(
                 next_built,
                 next_ms,
                 LABELS["next_voyage"],
-                _next_voyage_reasons(ctx, next_built.plan, moved, horizon),
+                _next_voyage_reasons(ctx, next_built.plan, moved, blocked),
             )
         )
 
@@ -693,10 +799,10 @@ def _replan(
         if lid in remaining and loc != UNASSIGNED and lid not in ctx.rule_switched
     }
     as_is_fixed.update({lid: AIR for lid in ctx.air_locked})
-    as_is_forbidden = []
+    as_is_forbidden = ctx.booked_pairs()
     if isinstance(event, AddLotEvent):
         used = {c.container_id for c in current_plan.containers if c.used}
-        as_is_forbidden = [(event.lot.id, cid) for cid in used]
+        as_is_forbidden += [(event.lot.id, cid) for cid in used]
     as_is_built, as_is_ms = _timed(
         lambda: solve_with_routes(
             after,
@@ -736,7 +842,12 @@ def _replan(
         scope=scope,
         free_lot_ids=sorted(free),
         fixed_lot_ids=sorted(fixed),
-        fixed_reasons=[f for f in held_reasons if f.lot_id in ctx.held],
+        fixed_reasons=[
+            f
+            for f in held_reasons
+            if f.lot_id in ctx.held
+            or (f.reason_code == "dispatch_executed" and f.lot_id in ctx.lot_ids)
+        ],
         occurred_at=occurred_at,
         alternatives=alternatives,
         recommended_id=best.id if best else None,

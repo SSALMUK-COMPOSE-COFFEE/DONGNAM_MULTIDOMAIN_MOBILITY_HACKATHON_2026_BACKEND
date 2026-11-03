@@ -12,7 +12,7 @@ from freshswitch_backend.explain import (
 from freshswitch_backend.explain.service import LLM_TIMEOUT_SECONDS
 from freshswitch_backend.observability import record_event
 from freshswitch_backend.optimize import AIR
-from freshswitch_backend.replan.engine import UNASSIGNED, locations
+from freshswitch_backend.replan.engine import UNASSIGNED, apply_event, locations
 from freshswitch_backend.replan.models import (
     AddLotEvent,
     AirSwitchEvent,
@@ -21,6 +21,7 @@ from freshswitch_backend.replan.models import (
     DelayEvent,
     Event,
     ReduceEvent,
+    ReplanError,
     ReplanResult,
 )
 
@@ -47,21 +48,40 @@ def event_summary(scenario: Scenario, event: Event) -> str:
             return f"{owner(lot_id)} {lots[lot_id].pallets}파렛트 항공 전환"
         case AddLotEvent(lot=lot):
             return f"{shippers.get(lot.shipper_id, lot.shipper_id)} {lot.pallets}파렛트 신규 출하"
-        case DelayEvent(voyage_id=voyage_id, new_etd=new_etd, new_cy_cutoff=new_cutoff):
+        case DelayEvent(voyage_id=voyage_id, new_etd=new_etd):
             voyage = next(v for v in scenario.voyages if v.id == voyage_id)
-            cutoff = (
-                f"CY 마감 {_when(new_cutoff)}로 변경"
-                if new_cutoff
-                else f"CY 마감 {_when(voyage.cy_cutoff)} 유지"
-            )
+            cutoff = f"CY 마감 {_when(voyage.cy_cutoff)} 유지"
+            applied = _cutoff_after(scenario, event)
+            if applied is not None and applied != voyage.cy_cutoff:
+                cutoff = f"CY 마감 {_when(voyage.cy_cutoff)}→{_when(applied)} 변경"
             return f"{voyage.vessel_name} 출항 {_when(voyage.etd)}→{_when(new_etd)} 변경({cutoff})"
     return "일정 변경"
+
+
+def _cutoff_after(scenario: Scenario, event: DelayEvent):
+    try:
+        after = apply_event(scenario, event)
+    except ReplanError:
+        return event.new_cy_cutoff
+    return next(v.cy_cutoff for v in after.voyages if v.id == event.voyage_id)
+
+
+def _lot_ids(alt: Alternative) -> set[str]:
+    plan = alt.plan
+    ids = {a.lot_id for a in plan.assignments} | {u.lot_id for u in plan.unassigned}
+    return ids | {m.lot_id for m in alt.diff.moved_lots}
+
+
+def _tail(reason: str, lot_ids: set[str]) -> str:
+    head, sep, tail = reason.partition(": ")
+    return tail if sep and head in lot_ids else reason
 
 
 def _reason(alt: Alternative) -> str | None:
     if alt.feasible:
         return None
-    tails = [r.split(": ", 1)[-1] for r in alt.infeasible_reasons]
+    lot_ids = _lot_ids(alt)
+    tails = [_tail(r, lot_ids) for r in alt.infeasible_reasons]
     return "; ".join(dict.fromkeys(tails)) or None
 
 
@@ -107,7 +127,7 @@ def _shipper_impacts(scenario: Scenario, alt: Alternative | None) -> list[Shippe
     for delta in alt.diff.shippers:
         moves = [m for m in alt.diff.moved_lots if m.shipper_id == delta.shipper_id]
         targets = [PLACE.get(m.to_location, m.to_location) for m in moves if m.to_location]
-        if delta.cost_delta == 0 and not moves:
+        if delta.cost_delta == 0 and not moves and not delta.cancellation_adjustment:
             continue
         impacts.append(
             ShipperImpact(
@@ -118,6 +138,7 @@ def _shipper_impacts(scenario: Scenario, alt: Alternative | None) -> list[Shippe
                 delta_krw=delta.cost_delta,
                 moved=", ".join(dict.fromkeys(targets)) or None,
                 pull_forward_days=max((m.pull_forward_days for m in moves), default=0),
+                cancellation_adjustment_krw=delta.cancellation_adjustment,
             )
         )
     return impacts

@@ -17,6 +17,7 @@ from freshswitch_backend.api.plans import (
     _fingerprint,
     apply_alternative,
     post_event,
+    replan_inputs,
 )
 from freshswitch_backend.api.saas_access import PlanAccess, plan_for
 from freshswitch_backend.domain.models import Lot
@@ -291,13 +292,17 @@ async def create_change_request(
     apply_event(session.scenario, event)
     estimate = None
     if body.type != "air_switch":
+        inputs = await run_in_threadpool(replan_inputs, session, access.owner_org_id)
         result = await compute_replan(
             replan,
             session.scenario,
             session.plan,
             event,
             air_locked=session.air_locked_lot_ids,
+            routes=session.routes,
+            now=store.clock(),
             deadline=request_deadline(),
+            **inputs,
         )
         annotate_cancellations(result, session.scenario, session.plan)
         estimate = _estimate(result)

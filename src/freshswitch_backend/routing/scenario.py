@@ -43,6 +43,28 @@ def route_lot_ids(routes: list[TruckRoute]) -> set[str]:
     return {lid for route in routes for stop in route.stops for lid in stop.lot_ids}
 
 
+def _carrying(
+    routes: list[TruckRoute], lots: Mapping[str, Lot], keep: set[str]
+) -> list[TruckRoute]:
+    kept = []
+    for route in routes:
+        stops, load = [], 0
+        for stop in route.stops:
+            ids = [lid for lid in stop.lot_ids if lid in keep]
+            if not ids:
+                continue
+            pallets = sum(lots[lid].pallets for lid in ids)
+            load += pallets
+            stops.append(stop.model_copy(update={"lot_ids": ids, "pallets": pallets}))
+        if stops:
+            stops = [
+                s.model_copy(update={"load_after": sum(x.pallets for x in stops[: i + 1])})
+                for i, s in enumerate(stops)
+            ]
+            kept.append(route.model_copy(update={"stops": stops, "load_pallets": load}))
+    return kept
+
+
 def cargo_groups(products: list[Product]) -> tuple[dict[str, str], list[tuple[str, str]]]:
     members: list[list[Product]] = []
     for product in products:
@@ -103,10 +125,11 @@ def build_pickup_request(
     if blocking is None:
         blocking = [r for v, trips in context.routes.items() if v != voyage_id for r in trips]
     not_before = options.pop("not_before", context.not_before)
+    lots = {lot.id: lot for lot in scenario.lots}
+    locked = _carrying(locked, lots, set(lot_ids) & set(lots))
     held = route_lot_ids(locked)
     ports = {p.id: p for p in scenario.ports}
     port = ports[voyage.origin]
-    lots = {lot.id: lot for lot in scenario.lots}
     shippers = {s.id: s for s in scenario.shippers}
     packhouses = {p.id: p for p in scenario.packhouses}
     group_of, conflicts = cargo_groups(scenario.products)

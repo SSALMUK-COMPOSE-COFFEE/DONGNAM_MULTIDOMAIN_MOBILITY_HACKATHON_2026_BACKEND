@@ -191,5 +191,6 @@ class ReplanResult(BaseModel):
     recommended_id: AlternativeId | None
     diff: PlanDiff | None
     solve_ms: int
+    warnings: list[str] = Field(default_factory=list)
     explanation: Explanation | None = None
     scenario_after: Scenario | None = Field(default=None, exclude=True)

@@ -195,17 +195,10 @@ def test_replan_marks_alternatives_on_booked_containers(platform_client, saas_lo
     )
     assert response.status_code == 200, response.text
     body = response.json()
-    clashing = [a for a in body["alternatives"] if "CA-03" in _sea(a["plan"])]
-    assert clashing
-    for alternative in clashing:
-        assert not alternative["feasible"]
-        assert any("CA-03" in reason for reason in alternative["infeasible_reasons"])
-        assert body["recommended_id"] != alternative["id"]
-        assert f"'{alternative['label']}' 불가" in body["explanation"]["operator_summary"]
-    assert not any(a["feasible"] for a in body["alternatives"])
-    assert body["recommended_id"] is None
-    assert body["diff"] is None
-    assert "실행 가능한 대안이 없습니다" in body["explanation"]["operator_summary"]
+    assert not [a for a in body["alternatives"] if "CA-03" in _sea(a["plan"])]
+    assert body["recommended_id"] == "pull_forward"
+    assert body["diff"] is not None
+    assert "실행 가능한 대안이 없습니다" not in body["explanation"]["operator_summary"]
 
 
 def test_mark_booked_moves_recommendation_diff_and_explanation(client):

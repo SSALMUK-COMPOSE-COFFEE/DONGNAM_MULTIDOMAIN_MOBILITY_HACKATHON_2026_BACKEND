@@ -97,6 +97,7 @@ class Voyage(Sourced):
     cy_cutoff: KstDatetime
     transit_days: float
     original_etd: KstDatetime | None = None
+    original_cy_cutoff: KstDatetime | None = Field(default=None, exclude_if=lambda v: v is None)
     call_sign: str | None = None
 
 

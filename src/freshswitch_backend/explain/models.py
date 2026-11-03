@@ -27,6 +27,7 @@ class ShipperImpact(BaseModel):
     delta_krw: int
     moved: str | None = None
     pull_forward_days: int = 0
+    cancellation_adjustment_krw: int = 0
 
 
 class ExplainContext(BaseModel):

@@ -51,7 +51,13 @@ from freshswitch_backend.planning.store import (
     store,
 )
 from freshswitch_backend.quality import learning_scope, with_learned_loss
-from freshswitch_backend.replan import DelayEvent, Event, ReplanResult, replan
+from freshswitch_backend.replan import (
+    DelayEvent,
+    Event,
+    ReplanResult,
+    executed_dispatches,
+    replan,
+)
 from freshswitch_backend.replan.explanation import explain_replan, llm_enabled
 from freshswitch_backend.replan.models import AlternativeId
 
@@ -334,6 +340,15 @@ def delete_plan(plan_id: str, org_id: OrgId) -> None:
         raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")
 
 
+def replan_inputs(session: PlanSession, org_id: str) -> dict:
+    return {
+        "dispatched": executed_dispatches(store.orders(session.plan_id, org_id=org_id)),
+        "unavailable_containers": store.booked_containers(
+            org_id, session.scenario.id, session.plan_id
+        ),
+    }
+
+
 @router.post("/{plan_id}/events")
 async def post_event(
     plan_id: str,
@@ -348,6 +363,7 @@ async def post_event(
     )
     if replayed is not None:
         return replayed
+    inputs = await run_in_threadpool(replan_inputs, session, org_id)
     result = await compute_replan(
         replan,
         session.scenario,
@@ -357,6 +373,7 @@ async def post_event(
         routes=session.routes,
         now=store.clock(),
         deadline=deadline,
+        **inputs,
     )
     annotate_cancellations(result, session.scenario, session.plan)
     result.explanation = await explain_replan(
@@ -461,9 +478,20 @@ def confirm_order(
 
 @router.post("/{plan_id}/orders/{order_id}/requests/{request_id}")
 def answer_request(
-    plan_id: str, order_id: str, request_id: str, body: RequestResultBody, org_id: OrgId
+    plan_id: str,
+    order_id: str,
+    request_id: str,
+    body: RequestResultBody,
+    org_id: OrgId,
+    principal: OptionalPrincipal,
 ) -> ExecutionOrder:
     _session(plan_id, org_id)
+    if principal is not None:
+        raise HTTPException(
+            status_code=403,
+            detail="로그인 상태에서는 대신 회신을 기록할 수 없습니다. "
+            "선사·터미널·항공사 회신은 배정된 포워더 화면에서 기록합니다",
+        )
     try:
         return store.answer_request(plan_id, order_id, request_id, body, org_id=org_id)
     except KeyError as exc:

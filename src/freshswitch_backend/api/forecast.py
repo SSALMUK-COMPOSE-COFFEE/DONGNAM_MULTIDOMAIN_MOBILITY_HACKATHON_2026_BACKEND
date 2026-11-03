@@ -12,6 +12,7 @@ from freshswitch_backend.api.computation import (
     explanation_budget,
     request_deadline,
 )
+from freshswitch_backend.api.plans import replan_inputs
 from freshswitch_backend.api.vessels import (
     UlsanClientFactory,
     load_ulsan_congestion,
@@ -204,6 +205,7 @@ async def delay_forecast(
     where: dict[str, str] = {}
     air: list[str] = []
     if event is not None:
+        inputs = await run_in_threadpool(replan_inputs, session, org_id)
         result = await compute_replan(
             replan,
             session.scenario,
@@ -213,6 +215,7 @@ async def delay_forecast(
             routes=session.routes,
             now=store.clock(),
             deadline=deadline,
+            **inputs,
         )
         annotate_cancellations(result, session.scenario, session.plan)
         result.explanation = await explain_replan(

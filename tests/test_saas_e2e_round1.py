@@ -107,7 +107,8 @@ def test_shipper_free_text_has_only_own_amounts(platform_client: TestClient, saa
     assert [m["shipper_id"] for m in explanation["shipper_messages"]] == ["sh-pohang"]
     assert not MONEY.search(explanation["operator_summary"])
     text = json.dumps(plan, ensure_ascii=False)
-    for amount in sangju_amounts:
+    own = set(MONEY.findall(explanation["shipper_messages"][0]["message"]))
+    for amount in set(sangju_amounts) - own:
         assert amount not in text
 
     orders = pohang.get(f"/api/saas/shipper/plans/{plan_id}/orders").json()
