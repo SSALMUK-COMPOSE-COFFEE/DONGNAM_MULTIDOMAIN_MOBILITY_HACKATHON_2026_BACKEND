@@ -221,6 +221,7 @@ def preview_plan(
 
 
 def _sessions(principal: Principal, limit: int, offset: int) -> list[PlanSession]:
+    store.expire_due(PlanRow.org_id == principal.org_id)
     with database.begin() as db:
         rows = db.scalars(
             select(PlanRow)

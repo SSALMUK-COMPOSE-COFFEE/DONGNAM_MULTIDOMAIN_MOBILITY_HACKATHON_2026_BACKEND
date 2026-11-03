@@ -77,6 +77,7 @@ def list_plans(
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[PlanListItem]:
+    store.expire_due(visible_plans(principal))
     with database.begin() as db:
         rows = db.scalars(
             select(PlanRow)

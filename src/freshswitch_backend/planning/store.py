@@ -3,7 +3,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -19,12 +19,21 @@ from freshswitch_backend.execution.models import (
     OrderStatus,
     ReplanCandidate,
     RequestResultBody,
+    ShipperConfirmation,
 )
-from freshswitch_backend.execution.orders import build_order
+from freshswitch_backend.execution.orders import (
+    CONSOLIDATOR_LABEL,
+    REASON_TEXT,
+    build_order,
+    fmt,
+    short_name,
+)
+from freshswitch_backend.execution.params import ExecutionParams
 from freshswitch_backend.execution.quality import (
     ArrivalInspection,
     ArrivalRequest,
     ArrivalSettlementResult,
+    QualityError,
     arrival_settlement,
     current_inspections,
     planned_loss_rate,
@@ -117,6 +126,15 @@ class IdempotencyMismatch(ValueError):
     pass
 
 
+class InspectionPending(SessionConflict, QualityError):
+    def __init__(self, lot_id: str) -> None:
+        super().__init__(
+            f"확정 대기 중인 실행 지시가 {lot_id}의 배정·수량·손실률을 바꿉니다. "
+            "실행 지시가 확정되거나 거절·만료된 뒤 도착 검수를 기록하세요"
+        )
+        self.lot_id = lot_id
+
+
 class HistoryEntry(BaseModel):
     seq: int
     replan_id: str
@@ -198,6 +216,7 @@ class _Snapshot(BaseModel):
     routes: list[VoyagePickup]
     air_locked_lot_ids: list[str]
     arrival_inspections: list[ArrivalInspection] = Field(default_factory=list)
+    applied_charges: list[CancellationCharge] | None = None
 
 
 @dataclass
@@ -538,14 +557,27 @@ def _snapshot(session: PlanSession) -> _Snapshot:
         routes=session.routes,
         air_locked_lot_ids=session.air_locked_lot_ids,
         arrival_inspections=session.arrival_inspections,
+        applied_charges=[],
     )
+
+
+def _charged(charge: CancellationCharge | None) -> list[CancellationCharge]:
+    return [charge] if charge is not None and charge.fee else []
+
+
+def _earlier_charges(
+    committed: _Snapshot, superseded: list[ExecutionOrder]
+) -> list[CancellationCharge]:
+    if committed.applied_charges is not None:
+        return list(committed.applied_charges)
+    return [c for o in superseded for c in _charged(o.cancellation)]
 
 
 def _cumulative(
     committed: _Snapshot,
     scenario_after: Scenario,
     alternative: Alternative,
-    superseded: list[ExecutionOrder],
+    charges: list[CancellationCharge],
 ) -> Alternative:
     diff = diff_plans(
         scenario_after,
@@ -554,11 +586,6 @@ def _cumulative(
         routes_before=committed.routes,
         routes_after=alternative.routes,
     )
-    charges: list[CancellationCharge] = [
-        o.cancellation for o in superseded if o.cancellation and o.cancellation.fee
-    ]
-    if alternative.diff.cancellation and alternative.diff.cancellation.fee:
-        charges.append(alternative.diff.cancellation)
     adjustments: dict[str, int] = {}
     for charge in charges:
         payer = charge.payer_shipper_id
@@ -570,6 +597,79 @@ def _cumulative(
         delta.cancellation_adjustment = adjustments.get(delta.shipper_id, 0)
     diff.cancellation = charges[-1] if charges else alternative.diff.cancellation
     return alternative.model_copy(update={"diff": diff})
+
+
+def _charge_text(charge: CancellationCharge, names: dict[str, str]) -> str:
+    recipients = [
+        f"{short_name(names.get(t.shipper_id, t.shipper_id))} {t.amount:,}원"
+        for t in charge.transfers
+    ]
+    if charge.consolidator_amount > 0:
+        recipients.append(
+            f"{CONSOLIDATOR_LABEL[charge.consolidator]} {charge.consolidator_amount:,}원"
+        )
+    payer = short_name(names.get(charge.payer_shipper_id, charge.payer_shipper_id))
+    return f"{payer} {charge.fee:,}원 → {', '.join(recipients)}"
+
+
+def _charge_payers(
+    order: ExecutionOrder,
+    charges: list[CancellationCharge],
+    alternative: Alternative,
+    scenarios: tuple[Scenario, Scenario],
+) -> None:
+    names = {s.id: s.name for scenario in reversed(scenarios) for s in scenario.shippers}
+    deltas = {d.shipper_id: d for d in alternative.diff.shippers}
+    default_deadline = order.deadlines.forwarder - timedelta(
+        hours=ExecutionParams().forwarder_processing_hours.value
+    )
+    confirmations = {c.shipper_id: c for c in order.shipper_confirmations}
+    added = False
+    for sid in sorted({c.payer_shipper_id for c in charges}):
+        item = confirmations.get(sid)
+        if item is None:
+            delta = deltas.get(sid)
+            cost_delta = delta.cost_delta if delta else 0
+            adjustment = delta.cancellation_adjustment if delta else 0
+            item = ShipperConfirmation(
+                shipper_id=sid,
+                shipper_name=names.get(sid, sid),
+                lot_ids=sorted({c.lot_id for c in charges if c.payer_shipper_id == sid}),
+                reasons=[],
+                reason_text=[],
+                cost_before=delta.cost_before if delta else 0,
+                cost_after=delta.cost_after if delta else 0,
+                cost_delta=cost_delta,
+                cancellation_adjustment=adjustment,
+                net_cost_delta=cost_delta + adjustment,
+                deadline=default_deadline,
+            )
+            confirmations[sid] = item
+            added = True
+        if "cancellation_fee" not in item.reasons:
+            item.reasons.append("cancellation_fee")
+            item.reason_text.append(REASON_TEXT["cancellation_fee"])
+    order.shipper_confirmations = [confirmations[sid] for sid in sorted(confirmations)]
+    order.notified_shipper_ids = [s for s in order.notified_shipper_ids if s not in confirmations]
+    if added:
+        order.deadlines.shipper = min(c.deadline for c in order.shipper_confirmations)
+    if added and order.status == "shipper_confirmed":
+        order.status = "proposed"
+        order.log = [entry for entry in order.log if entry.status_after == "proposed"]
+    if len(charges) > 1:
+        for action in order.automatic:
+            if action.kind == "settlement_recompute":
+                head = action.description.split(". 취소 부담금 ", 1)[0]
+                listed = ", ".join(_charge_text(c, names) for c in charges)
+                action.description = f"{head}. 취소 부담금 {listed}"
+
+
+def _deadline_passed(order: ExecutionOrder, now: datetime) -> str | None:
+    if order.status == "proposed" and order.deadlines.shipper <= now:
+        return f"화주 확인 기한({fmt(order.deadlines.shipper)})"
+    if order.deadlines.forwarder <= now:
+        return f"포워더 확정 기한({fmt(order.deadlines.forwarder)})"
+    return None
 
 
 class SessionStore:
@@ -632,21 +732,35 @@ class SessionStore:
             state.release = set()
 
     def _has_due(self, db: Session, plan_id: str) -> bool:
+        return bool(self._due_plans(db, OrderRow.plan_id == plan_id))
+
+    def _due_plans(self, db: Session, where: Any) -> list[str]:
         now = self.clock()
-        rows = db.scalars(
-            select(OrderRow.payload).where(
-                OrderRow.plan_id == plan_id,
-                OrderRow.status.in_(("proposed", "shipper_confirmed")),
-            )
+        rows = db.execute(
+            select(OrderRow.plan_id, OrderRow.payload)
+            .join(PlanRow, PlanRow.plan_id == OrderRow.plan_id)
+            .where(OrderRow.status.in_(("proposed", "shipper_confirmed")), where)
+            .order_by(OrderRow.seq)
         )
-        for payload in rows:
+        due: list[str] = []
+        for plan_id, payload in rows:
             order = ExecutionOrder.model_validate(payload)
             deadline = (
                 order.deadlines.shipper if order.status == "proposed" else order.deadlines.forwarder
             )
-            if now > deadline:
-                return True
-        return False
+            if now > deadline and plan_id not in due:
+                due.append(plan_id)
+        return due
+
+    def expire_due(self, where: Any) -> int:
+        if where is None:
+            return 0
+        with self._lock:
+            with self._db.begin() as db:
+                due = self._due_plans(db, where)
+            for plan_id in due:
+                self._expire(plan_id, ANY_ORG)
+            return len(due)
 
     def _expire(self, plan_id: str, org_id: str = DEMO_ORG) -> None:
         with self._db.begin() as db:
@@ -751,6 +865,7 @@ class SessionStore:
     def summaries(
         self, limit: int = 100, offset: int = 0, org_id: str = DEMO_ORG
     ) -> list[PlanSummary]:
+        self.expire_due(_plan_scope(org_id))
         with self._db.begin() as db:
             rows = db.scalars(
                 select(PlanRow)
@@ -974,9 +1089,11 @@ class SessionStore:
         committed = state.committed
         before = session
         ordered = alternative
+        charges = _charged(alternative.diff.cancellation)
         if committed.version != session.version:
             before = committed
-            ordered = _cumulative(committed, scenario, alternative, superseded)
+            charges = [*_earlier_charges(committed, superseded), *charges]
+            ordered = _cumulative(committed, scenario, alternative, charges)
         order = build_order(
             plan_id=plan_id,
             replan_id=pending.replan_id,
@@ -991,6 +1108,14 @@ class SessionStore:
             event=event,
             now=now,
         )
+        if charges:
+            _charge_payers(order, charges, ordered, (before.scenario, scenario))
+        passed = _deadline_passed(order, now)
+        if passed:
+            raise SessionConflict(
+                f"이 대안의 실행 지시는 만드는 순간 {passed}이 이미 지나 적용할 수 없습니다. "
+                "다른 대안을 고르거나 이벤트를 다시 보내세요"
+            )
         entry = HistoryEntry(
             seq=len(session.history) + 1,
             replan_id=pending.replan_id,
@@ -1020,6 +1145,7 @@ class SessionStore:
             }
         )
         state.session = updated
+        state.committed = committed.model_copy(update={"applied_charges": charges})
         state.orders[order.order_id] = order
         self._save(db, state)
         if row.org_id != DEMO_ORG and row.needs_replan:
@@ -1132,7 +1258,7 @@ class SessionStore:
             }
         )
         state.session.status = state.settled_status()
-        state.committed = snapshot.model_copy(update={"version": version})
+        state.committed = snapshot.model_copy(update={"version": version, "applied_charges": []})
         order.rolled_back_to_version = snapshot.version
 
     def _commit(self, state: _State, order: ExecutionOrder, now: datetime) -> None:
@@ -1357,6 +1483,7 @@ class SessionStore:
             )
             .exists()
         )
+        self.expire_due(PlanRow.org_id == org_id)
         with self._db.begin() as db:
             rows = db.scalars(
                 select(PlanRow)
@@ -1571,6 +1698,12 @@ class SessionStore:
             result, inspections = arrival_settlement(
                 plan_id, session.scenario, session.plan, session.arrival_inspections, body, now
             )
+            committed = state.committed
+            pending = session.status == "pending_confirmation"
+            if pending and not _unchanged(
+                committed.scenario, committed.plan, session.scenario, session.plan, body.lot_id
+            ):
+                raise InspectionPending(body.lot_id)
             updated = session.model_copy(
                 update={
                     "arrival_inspections": inspections,
@@ -1579,28 +1712,38 @@ class SessionStore:
                 }
             )
             state.session = updated
-            if updated.status != "pending_confirmation":
+            if pending:
+                record = next(i for i in inspections if i.lot_id == body.lot_id)
+                kept = [i for i in committed.arrival_inspections if i.lot_id != body.lot_id]
+                state.committed = committed.model_copy(
+                    update={"arrival_inspections": [*kept, record]}
+                )
+            else:
                 state.committed = _snapshot(updated)
             self._save(db, state)
             return result, updated.model_copy(deep=True)
 
     @staticmethod
     def _carry_inspections(session: PlanSession, scenario: Scenario, plan: Plan):
-        before = {a.lot_id: a for a in session.plan.assignments}
-        after = {a.lot_id: a for a in plan.assignments}
-        lots_before = {lot.id: lot for lot in session.scenario.lots}
-        lots_after = {lot.id: lot for lot in scenario.lots}
-        kept = []
-        for inspection in current_inspections(plan, session.arrival_inspections):
-            lid = inspection.lot_id
-            if before.get(lid) != after.get(lid) or lots_before.get(lid) != lots_after.get(lid):
-                continue
-            if planned_loss_rate(session.scenario, session.plan, lid) != planned_loss_rate(
-                scenario, plan, lid
-            ):
-                continue
-            kept.append(inspection)
-        return kept
+        return [
+            inspection
+            for inspection in current_inspections(plan, session.arrival_inspections)
+            if _unchanged(session.scenario, session.plan, scenario, plan, inspection.lot_id)
+        ]
+
+
+def _unchanged(
+    scenario_before: Scenario, plan_before: Plan, scenario: Scenario, plan: Plan, lot_id: str
+) -> bool:
+    before = next((a for a in plan_before.assignments if a.lot_id == lot_id), None)
+    after = next((a for a in plan.assignments if a.lot_id == lot_id), None)
+    lot_before = next((lot for lot in scenario_before.lots if lot.id == lot_id), None)
+    lot_after = next((lot for lot in scenario.lots if lot.id == lot_id), None)
+    if before is None or before != after or lot_before != lot_after:
+        return False
+    return planned_loss_rate(scenario_before, plan_before, lot_id) == planned_loss_rate(
+        scenario, plan, lot_id
+    )
 
 
 def _plan_scope(org_id: str) -> Any:

@@ -125,6 +125,7 @@ def delete_lot(lot_id: str, principal: ShipperPrincipal) -> None:
 
 
 def _sessions(principal: Principal) -> list[PlanSession]:
+    store.expire_due(visible_plans(principal))
     with database.begin() as db:
         rows = db.scalars(
             select(PlanRow)
