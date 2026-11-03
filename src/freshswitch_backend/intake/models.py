@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field, field_validator
 from freshswitch_backend.domain.ids import ID_MAX_LENGTH, EntityId
 from freshswitch_backend.domain.models import Lot, Mode
 from freshswitch_backend.lots.models import RegisteredLot
+from freshswitch_backend.quality.models import ExpectedLoss
 from freshswitch_backend.replan.models import AddLotEvent
 
 
@@ -108,3 +109,4 @@ class IntakePreview(BaseModel):
     next_step: str
     registered: RegisteredLot | None = None
     savings_estimate: SavingsEstimate | None = None
+    expected_loss: ExpectedLoss | None = None

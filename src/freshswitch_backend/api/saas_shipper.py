@@ -28,6 +28,8 @@ from freshswitch_backend.api.saas_views import (
     shipper_plan_item,
     shipper_settlements,
 )
+from freshswitch_backend.data.loader import get_scenario
+from freshswitch_backend.domain.models import Scenario
 from freshswitch_backend.execution.card import EnteredNumbers
 from freshswitch_backend.execution.models import (
     ConfirmRequest,
@@ -46,6 +48,9 @@ from freshswitch_backend.planning.store import (
     SessionConflict,
     store,
 )
+from freshswitch_backend.quality import learning_scope, quality_history
+from freshswitch_backend.quality.disclosure import LossDisclosure
+from freshswitch_backend.quality.models import ExpectedLoss
 
 THIRD_PARTY_ROLES = frozenset({"carrier", "terminal", "airline"})
 THIRD_PARTY_ANSWER_FORBIDDEN = "선사·터미널·항공사 요청의 회신은 배정된 포워더가 기록합니다"
@@ -59,6 +64,10 @@ ShipperPrincipal = Annotated[Principal, Depends(require_role("shipper"))]
 class ShipperLotCreate(IntakeRequest):
     shipper: str | None = None
     shipper_org_id: str | None = None
+
+
+class ShipperLot(RegisteredLot):
+    expected_loss: ExpectedLoss
 
 
 class ShipperDecision(BaseModel):
@@ -102,13 +111,31 @@ def list_lots(
     ready_to: date | None = None,
     limit: Annotated[int, Query(ge=1, le=1000)] = 200,
     offset: Annotated[int, Query(ge=0)] = 0,
-) -> list[RegisteredLot]:
-    return lot_store.search(
+) -> list[ShipperLot]:
+    lots = lot_store.search(
         LotFilter(
             status=status, ready_from=ready_from, ready_to=ready_to, limit=limit, offset=offset
         ),
         org_id=principal.org_id,
     )
+    disclosure = LossDisclosure(learning_scope(principal.org_id))
+    scenarios: dict[str, Scenario] = {}
+
+    def scenario_for(scenario_id: str) -> Scenario:
+        if scenario_id not in scenarios:
+            found = get_scenario(scenario_id)
+            scenarios[scenario_id] = found or quality_history.reference_scenario()
+        return scenarios[scenario_id]
+
+    return [
+        ShipperLot(
+            **lot.model_dump(),
+            expected_loss=disclosure.for_lot(
+                scenario_for(lot.scenario_id), lot.product_id, lot.destination
+            ),
+        )
+        for lot in lots
+    ]
 
 
 @router.post("/lots", status_code=status.HTTP_201_CREATED)

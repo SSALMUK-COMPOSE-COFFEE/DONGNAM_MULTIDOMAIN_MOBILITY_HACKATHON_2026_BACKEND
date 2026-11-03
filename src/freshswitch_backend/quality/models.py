@@ -105,6 +105,14 @@ class LossTable(BaseModel):
     adjustments: list[LossAdjustment]
 
 
+class ExpectedLoss(BaseModel):
+    rate: float
+    mode: Mode
+    basis: str
+    n_observations: int
+    source: str | None = None
+
+
 class ObservationList(BaseModel):
     seed_label: str
     count: int

@@ -14,6 +14,8 @@ from freshswitch_backend.intake.tenants import load_catalog, tenant_scenario
 from freshswitch_backend.lots import ANY_ORG, LotConflict, Reservation, lot_store
 from freshswitch_backend.persistence.tables import DEMO_ORG
 from freshswitch_backend.planning.store import store
+from freshswitch_backend.quality import learning_scope
+from freshswitch_backend.quality.disclosure import lot_expected_loss
 
 router = APIRouter(prefix="/intake", tags=["intake"])
 
@@ -121,7 +123,11 @@ def build_preview(
     except IntakeError as exc:
         raise intake_error(exc) from exc
     estimate = estimate_savings(scenario, preview.lot, plan, preview.hints)
-    return preview.model_copy(update={"savings_estimate": estimate}), scenario.id
+    loss = lot_expected_loss(
+        scenario, preview.lot.product_id, preview.lot.destination, learning_scope(scope.org_id)
+    )
+    update = {"savings_estimate": estimate, "expected_loss": loss}
+    return preview.model_copy(update=update), scenario.id
 
 
 def register(body: IntakeRequest, scope: IntakeScope = DEMO_SCOPE) -> IntakePreview:
