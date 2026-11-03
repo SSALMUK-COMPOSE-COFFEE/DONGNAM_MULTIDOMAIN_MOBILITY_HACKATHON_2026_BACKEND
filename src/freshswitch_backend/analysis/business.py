@@ -3,6 +3,8 @@ from collections import defaultdict
 from itertools import product
 from typing import Literal
 
+from pydantic import BaseModel
+
 from freshswitch_backend.analysis.benchmark import routed_part, solo_plans
 from freshswitch_backend.analysis.common import solve_routed
 from freshswitch_backend.analysis.models import (
@@ -598,4 +600,302 @@ def business_matrix(
         highlights=_highlights(rows),
         break_even_rows=sum(1 for r in rows if r.breaks_even),
         solve_ms=round((time.perf_counter() - started) * 1000),
+    )
+
+
+FORWARDER_SENSITIVITY_SHARE = 0.4
+DEFAULT_YEARS = 5
+DEFAULT_BASE_FEE_PER_PALLET = 20_000
+DEFAULT_BASE_FEE_FROM_YEAR = 2
+SOM_SOURCE = "changelog/03 SOM: 5년 차 딸기 1,316t + 포도 1,990t(기획서 점유율 가정)"
+YEAR_ONE_TONNES = {pid: tonnes for pid, tonnes, _ in SEASON_VOLUMES}
+YEAR_FIVE_TONNES = {"strawberry": 1_316.0, "grape_so2": 1_990.0}
+DEFAULT_SUBSIDIES = (100_000_000, 100_000_000, 0, 0, 0)
+SUBSIDY_SOURCE = (
+    "가정: 1년 차 예비창업패키지·2년 차 초기창업패키지 각 최대 1억 원 수준을 받는다고 본 값. "
+    "선정 여부·금액 확인 필요(https://www.k-startup.go.kr)"
+)
+SPACE_SALE_UPSIDE = 190_000_000
+SPACE_SALE_SOURCE = (
+    "D13: 5년 차 13.2억 중 공간 판매 마진 약 1.9억은 매출에서 빼고 '확장 시 +1.9억'으로 따로 적는다"
+)
+
+
+class YearVolume(BaseModel):
+    year: int
+    tonnes: dict[str, float]
+    pallets: dict[str, int]
+    source: str
+
+
+class YearSubsidy(BaseModel):
+    year: int
+    amount: int
+    source: str
+
+
+class YearRow(BaseModel):
+    year: int
+    stage: str
+    pallets: int
+    revenue: int
+    performance_fee: int
+    usage_fee: int
+    forwarder_cost: int
+    contribution: int
+    fixed_cost: int
+    subsidy: int
+    net_before_subsidy: int
+    net_after_subsidy: int
+    cumulative_before_subsidy: int
+    cumulative_after_subsidy: int
+    excluded_upside: int = 0
+
+
+class YearLine(BaseModel):
+    forwarder_share: float
+    forwarder_label: str
+    base_fee_mode: BaseFeeMode
+    fixed_level: Literal["full", "mvp_cash"]
+    fixed_label: str
+    rows: list[YearRow]
+    breakeven_year_before_subsidy: int | None
+    breakeven_year_after_subsidy: int | None
+    payback_year_before_subsidy: int | None
+    payback_year_after_subsidy: int | None
+
+
+class BusinessYears(BaseModel):
+    scenario_id: str
+    years: int
+    fee_rate: float
+    base_fee_per_pallet: int
+    base_fee_from_year: int
+    savings_per_pallet: dict[str, int]
+    savings_source: str
+    volumes: list[YearVolume]
+    subsidies: list[YearSubsidy]
+    fixed_levels: list[FixedLevel]
+    rules: list[str]
+    lines: list[YearLine]
+    excluded_upside_source: str
+
+
+def _stage(year: int, base_fee_from_year: int) -> str:
+    if year >= 4:
+        return "3단계: 공간 판매 시작(D13에 따라 공간 판매 마진은 매출에서 뺌)"
+    if year >= base_fee_from_year:
+        return "2단계: 성과보수 + 파렛트 이용료"
+    return "1단계: 성과보수(포도는 이용료), 운송은 포워더 실행"
+
+
+def year_volumes(years: int, volume_scale: float = 1.0) -> list[YearVolume]:
+    result = []
+    for year in range(1, years + 1):
+        weight = (year - 1) / 4
+        tonnes = {
+            pid: round(
+                (YEAR_ONE_TONNES[pid] + (YEAR_FIVE_TONNES[pid] - YEAR_ONE_TONNES[pid]) * weight)
+                * volume_scale,
+                1,
+            )
+            for pid in YEAR_ONE_TONNES
+        }
+        if year == 1:
+            source = f"{PROPOSAL} 8-3: 1년 차 딸기 109t·포도 298t(점유율은 기획서 가정)"
+        elif year == 5:
+            source = SOM_SOURCE
+        else:
+            source = "가정: 1년 차(기획서 8-3)와 5년 차(SOM) 사이 직선 보간"
+        if volume_scale != 1.0:
+            source += f". 물량 배율 {volume_scale:g}(쿼리 가정)"
+        result.append(
+            YearVolume(
+                year=year,
+                tonnes=tonnes,
+                pallets={pid: round(t * 1000 / PALLET_KG) for pid, t in tonnes.items()},
+                source=source,
+            )
+        )
+    return result
+
+
+def _year_fee(
+    params: CostParams,
+    product_id: str,
+    savings: int,
+    fee_rate: float,
+    base_fee: int,
+    mode: BaseFeeMode,
+) -> tuple[float, float]:
+    if uses_usage_fee(params, product_id):
+        return 0.0, float(max(usage_fee(params, 1), base_fee))
+    performance = fee_rate * max(0, savings)
+    if mode == "additive":
+        return performance, float(base_fee)
+    if base_fee > performance:
+        return 0.0, float(base_fee)
+    return performance, 0.0
+
+
+def _first_year(values: list[tuple[int, int]]) -> int | None:
+    return next((year for year, value in values if value >= 0), None)
+
+
+def _year_levels(fixed_cost: int, mvp_cash_fixed_cost: int) -> tuple[FixedLevel, FixedLevel]:
+    full, mvp = FIXED_LEVELS
+    return (
+        full.model_copy(
+            update={
+                "annual_cost": fixed_cost,
+                "source": full.source if fixed_cost == full.annual_cost else "쿼리로 넣은 가정",
+            }
+        ),
+        mvp.model_copy(
+            update={
+                "annual_cost": mvp_cash_fixed_cost,
+                "source": mvp.source
+                if mvp_cash_fixed_cost == mvp.annual_cost
+                else "쿼리로 넣은 가정",
+            }
+        ),
+    )
+
+
+def _year_line(
+    params: CostParams,
+    measured: dict[str, int],
+    volumes: list[YearVolume],
+    amounts: list[int],
+    rate: float,
+    base_fee_per_pallet: int,
+    base_fee_from_year: int,
+    share: tuple[float, str],
+    mode: BaseFeeMode,
+    level: FixedLevel,
+) -> YearLine:
+    rows = []
+    cumulative_before = cumulative_after = 0
+    for volume in volumes:
+        base_fee = base_fee_per_pallet if volume.year >= base_fee_from_year else 0
+        performance = usage = 0.0
+        for pid, n in volume.pallets.items():
+            perf, use = _year_fee(params, pid, measured.get(pid, 0), rate, base_fee, mode)
+            performance += n * perf
+            usage += n * use
+        revenue = round(performance + usage)
+        performance_fee = round(performance)
+        forwarder = round(revenue * share[0])
+        contribution = revenue - forwarder
+        net_before = contribution - level.annual_cost
+        subsidy = amounts[volume.year - 1]
+        cumulative_before += net_before
+        cumulative_after += net_before + subsidy
+        rows.append(
+            YearRow(
+                year=volume.year,
+                stage=_stage(volume.year, base_fee_from_year),
+                pallets=sum(volume.pallets.values()),
+                revenue=revenue,
+                performance_fee=performance_fee,
+                usage_fee=revenue - performance_fee,
+                forwarder_cost=forwarder,
+                contribution=contribution,
+                fixed_cost=level.annual_cost,
+                subsidy=subsidy,
+                net_before_subsidy=net_before,
+                net_after_subsidy=net_before + subsidy,
+                cumulative_before_subsidy=cumulative_before,
+                cumulative_after_subsidy=cumulative_after,
+                excluded_upside=SPACE_SALE_UPSIDE if volume.year == 5 else 0,
+            )
+        )
+    return YearLine(
+        forwarder_share=share[0],
+        forwarder_label=share[1],
+        base_fee_mode=mode,
+        fixed_level=level.key,
+        fixed_label=level.label,
+        rows=rows,
+        breakeven_year_before_subsidy=_first_year([(r.year, r.net_before_subsidy) for r in rows]),
+        breakeven_year_after_subsidy=_first_year([(r.year, r.net_after_subsidy) for r in rows]),
+        payback_year_before_subsidy=_first_year(
+            [(r.year, r.cumulative_before_subsidy) for r in rows]
+        ),
+        payback_year_after_subsidy=_first_year(
+            [(r.year, r.cumulative_after_subsidy) for r in rows]
+        ),
+    )
+
+
+def business_years(
+    scenario: Scenario,
+    years: int = DEFAULT_YEARS,
+    fee_rate: float | None = None,
+    base_fee_per_pallet: int = DEFAULT_BASE_FEE_PER_PALLET,
+    base_fee_from_year: int = DEFAULT_BASE_FEE_FROM_YEAR,
+    sensitivity_share: float = FORWARDER_SENSITIVITY_SHARE,
+    fixed_cost: int = ANNUAL_FIXED_COST,
+    mvp_cash_fixed_cost: int = MVP_CASH_FIXED_COST,
+    subsidies: list[int] | None = None,
+    volume_scale: float = 1.0,
+) -> BusinessYears | None:
+    if _season_pallets(scenario) is None:
+        return None
+    params = scenario.cost_params
+    rate = params.platform_fee_rate.value if fee_rate is None else fee_rate
+    measured = savings_per_pallet(solve_routed(scenario))
+    volumes = year_volumes(years, volume_scale)
+    given = list(DEFAULT_SUBSIDIES if subsidies is None else subsidies)
+    amounts = [given[i] if i < len(given) else 0 for i in range(years)]
+    source = SUBSIDY_SOURCE if subsidies is None else "쿼리로 넣은 가정"
+    levels = _year_levels(fixed_cost, mvp_cash_fixed_cost)
+    shares = (
+        (
+            DEFAULT_FORWARDER_SHARE,
+            f"기준선 {DEFAULT_FORWARDER_SHARE:.0%}({FORWARDER_SHARE_SOURCE})",
+        ),
+        (sensitivity_share, f"민감도 {sensitivity_share:.0%}({FORWARDER_SHARE_SENSITIVITY_LABEL})"),
+    )
+    modes: tuple[BaseFeeMode, ...] = ("deducted", "additive")
+    lines = [
+        _year_line(
+            params,
+            measured,
+            volumes,
+            amounts,
+            rate,
+            base_fee_per_pallet,
+            base_fee_from_year,
+            share,
+            mode,
+            level,
+        )
+        for share, mode, level in product(shares, modes, levels)
+    ]
+    rules = [
+        "매출 = Σ 품목별 연 파렛트 × 파렛트당 과금(파렛트당 절감은 이 시나리오 최적화 결과 평균)",
+        f"포도: 파렛트 이용료 {usage_fee(params, 1):,}원(기획서 8-1). 기본 이용료가 더 크면 그 값",
+        (
+            f"{base_fee_from_year}년 차부터 딸기에도 기본 이용료 파렛트당 {base_fee_per_pallet:,}원. "
+            "차감형(deducted) = max(기본 이용료, 성과보수), 가산형(additive) = 기본 이용료 + 성과보수"
+        ),
+        "공헌이익 = 매출 − 포워더 배분. 순이익 = 공헌이익 − 연 고정비(지원금 후는 + 지원금)",
+        "손익분기 연차 = 그해 순이익이 처음 0 이상인 해. 회수 연차 = 누적 손익이 처음 0 이상인 해",
+        f"공간 판매 마진은 매출에 넣지 않는다({SPACE_SALE_SOURCE})",
+    ]
+    return BusinessYears(
+        scenario_id=scenario.id,
+        years=years,
+        fee_rate=rate,
+        base_fee_per_pallet=base_fee_per_pallet,
+        base_fee_from_year=base_fee_from_year,
+        savings_per_pallet=measured,
+        savings_source="이 시나리오 최적화 결과의 품목별 파렛트당 화주 절감 평균(평시 운임, 총비용 기준)",
+        volumes=volumes,
+        subsidies=[YearSubsidy(year=i + 1, amount=amounts[i], source=source) for i in range(years)],
+        fixed_levels=list(levels),
+        rules=rules,
+        lines=lines,
+        excluded_upside_source=SPACE_SALE_SOURCE,
     )
