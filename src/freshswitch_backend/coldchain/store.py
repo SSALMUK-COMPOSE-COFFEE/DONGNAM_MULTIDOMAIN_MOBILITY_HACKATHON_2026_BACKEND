@@ -51,6 +51,7 @@ from freshswitch_backend.persistence.tables import (
     AlertRow,
     BindingRow,
     ContainerRow,
+    DeviceRow,
     ReadingRow,
     RunRow,
 )
@@ -76,6 +77,10 @@ class ColdchainError(ValueError):
 
 
 class NotFound(LookupError):
+    pass
+
+
+class DeviceDenied(ColdchainError):
     pass
 
 
@@ -113,6 +118,14 @@ class _Run:
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _device_owner(db: Session, device_id: str) -> str:
+    return db.scalar(select(DeviceRow.org_id).where(DeviceRow.device_id == device_id)) or DEMO_ORG
+
+
+def _foreign_device(device_id: str) -> str:
+    return f"다른 조직에 등록된 장치입니다: {device_id}"
 
 
 def _record_key(plan_id: str | None, container_id: str, org_id: str = DEMO_ORG) -> str:
@@ -354,6 +367,8 @@ class ColdchainStore:
 
     def bind(self, body: BindingRequest, org_id: str = DEMO_ORG) -> Binding:
         with self._lock, self._db.begin() as db:
+            if _device_owner(db, body.device_id) not in (DEMO_ORG, org_id):
+                raise DeviceDenied(_foreign_device(body.device_id))
             plan_id = self._resolve_plan(db, body.container_id, body.plan_id, org_id)
             self.require_plan(plan_id, body.container_id, org_id)
             binding = Binding(
@@ -487,7 +502,19 @@ class ColdchainStore:
         bindings: dict[str, Binding | None] = {}
         checked: dict[tuple[str | None, str], tuple[str | None, str | None]] = {}
         live: dict[str, bool] = {}
+        owners: dict[str, str] = {}
         for index, item in enumerate(items):
+            if item.device_id not in owners:
+                owners[item.device_id] = _device_owner(db, item.device_id)
+            if owners[item.device_id] not in (DEMO_ORG, org_id):
+                rejected.append(
+                    IngestRejected(
+                        index=index,
+                        device_id=item.device_id,
+                        reason=_foreign_device(item.device_id),
+                    )
+                )
+                continue
             if item.device_id not in bindings:
                 bindings[item.device_id] = self._binding(db, item.device_id, org_id)
             binding = bindings[item.device_id]
@@ -779,6 +806,8 @@ class ColdchainStore:
         preset = PRESETS[body.preset]
         with self._lock:
             with self._db.begin() as db:
+                if _device_owner(db, body.device_id) not in (DEMO_ORG, org_id):
+                    raise DeviceDenied(_foreign_device(body.device_id))
                 self._make_run_room(db, org_id)
                 plan_id = self._resolve_plan(db, body.container_id, body.plan_id, org_id)
                 self.require_plan(plan_id, body.container_id, org_id)

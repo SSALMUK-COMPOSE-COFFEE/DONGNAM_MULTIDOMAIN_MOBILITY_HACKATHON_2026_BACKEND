@@ -14,6 +14,7 @@ from freshswitch_backend.api import (
     plans,
     provenance,
     quality,
+    saas_devices,
     scenarios,
     settlement,
     vessels,
@@ -36,3 +37,4 @@ api_router.include_router(quality.router)
 api_router.include_router(provenance.router)
 api_router.include_router(auth.router)
 api_router.include_router(me.router)
+api_router.include_router(saas_devices.router)
