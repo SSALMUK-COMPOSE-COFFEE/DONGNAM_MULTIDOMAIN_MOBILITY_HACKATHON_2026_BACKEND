@@ -87,7 +87,7 @@ def test_unassigned_with_options_is_capacity_or_cost(scenario: Scenario) -> None
     assert fits[0].reason_code == "capacity_or_cost"
 
 
-def test_pickup_cutoff_is_tagged(scenario: Scenario) -> None:
+def _tight(scenario: Scenario) -> Scenario:
     voyages = [
         v.model_copy(update={"cy_cutoff": datetime.fromisoformat("2026-11-17T09:00+09:00")})
         if v.id == "V-2611A"
@@ -95,7 +95,11 @@ def test_pickup_cutoff_is_tagged(scenario: Scenario) -> None:
         for v in scenario.voyages
     ]
     tight = _with_lot(scenario, "lot-sancheong-sb-1", ready_date=date(2026, 11, 17))
-    tight = tight.model_copy(update={"voyages": voyages})
+    return tight.model_copy(update={"voyages": voyages})
+
+
+def test_pickup_cutoff_is_tagged(scenario: Scenario) -> None:
+    tight = _tight(scenario)
     air = build_plan(tight).plan
     moved = next(a for a in air.assignments if a.lot_id == "lot-sancheong-sb-1")
     assert moved.mode == "air"
@@ -106,6 +110,13 @@ def test_pickup_cutoff_is_tagged(scenario: Scenario) -> None:
     )
     assert lost.reason_code == "pickup_cutoff_miss"
     assert CUTOFF_REASON in lost.reason
+
+
+def test_route_resolve_keeps_original_air_reason(scenario: Scenario) -> None:
+    plan = build_plan(_tight(scenario), max_rounds=1).plan
+    reasons = {a.lot_id: a.reason.code for a in plan.assignments if a.reason is not None}
+    assert reasons["lot-sancheong-sb-1"] == "pickup_cutoff_miss"
+    assert reasons[LATE_LOT] == "capacity_or_cost"
 
 
 def test_demo_plan_response_carries_reason_fields(client: TestClient) -> None:

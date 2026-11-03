@@ -240,6 +240,7 @@ def solve_with_routes(
             for cid in containers_of[voyage_id]:
                 forbidden.append((lid, cid))
                 reasons[(lid, cid)] = CUTOFF_REASON
+    carried: dict[str, AssignmentReason | None] = {}
     still = _dropped(routes)
     if still:
         kept = {
@@ -247,6 +248,7 @@ def solve_with_routes(
             for a in plan.assignments
             if a.lot_id not in still
         }
+        carried = {a.lot_id: a.reason for a in plan.assignments if a.lot_id in kept}
         for lid, (voyage_id, stop_id) in still.items():
             dropped_at.setdefault(lid, (voyage_id, stop_id))
             for c in scenario.containers:
@@ -275,10 +277,7 @@ def solve_with_routes(
         for lid, (voyage_id, stop_id) in {**dropped_at, **still}.items()
     ]
     unassigned = [_cutoff_unassigned(u) if u.lot_id in dropped_at else u for u in plan.unassigned]
-    assignments = [
-        _cutoff_air(a, dropped_at[a.lot_id][0]) if a.mode == "air" and a.lot_id in dropped_at else a
-        for a in plan.assignments
-    ]
+    assignments = [_final_reason(a, dropped_at, carried) for a in plan.assignments]
     return with_routes(
         scenario,
         plan,
@@ -292,6 +291,20 @@ def solve_with_routes(
 def _cutoff_unassigned(lot: UnassignedLot) -> UnassignedLot:
     reason = lot.reason if CUTOFF_REASON in lot.reason else f"{CUTOFF_REASON}; {lot.reason}"
     return lot.model_copy(update={"reason": reason, "reason_code": "pickup_cutoff_miss"})
+
+
+def _final_reason(
+    assignment: Assignment,
+    dropped_at: Mapping[str, tuple[str, str]],
+    carried: Mapping[str, AssignmentReason | None],
+) -> Assignment:
+    if assignment.mode != "air":
+        return assignment
+    if assignment.lot_id in dropped_at:
+        return _cutoff_air(assignment, dropped_at[assignment.lot_id][0])
+    if assignment.lot_id in carried:
+        return assignment.model_copy(update={"reason": carried[assignment.lot_id]})
+    return assignment
 
 
 def _cutoff_air(assignment: Assignment, voyage_id: str) -> Assignment:
