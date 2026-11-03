@@ -1,0 +1,48 @@
+name: deploy-saas
+
+on:
+  push:
+    branches: [feat/saas]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-saas
+  cancel-in-progress: false
+
+env:
+  COMPOSE_FILE: docker-compose.saas.yml
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, freshswitch-backend]
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: /srv/freshswitch/saas-backend
+    steps:
+      - name: checkout
+        run: |
+          git fetch --depth 1 origin "$GITHUB_SHA"
+          git checkout --force --detach "$GITHUB_SHA"
+
+      - name: build and up
+        run: docker compose up -d --build --remove-orphans
+
+      - name: health
+        run: |
+          port=$(sed -n 's/^SAAS_HOST_PORT=//p' .env)
+          for _ in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:${port:-18106}/test/api/health"; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose logs --tail 100 api
+          exit 1
+
+      - name: seed
+        run: docker compose exec -T api python -m freshswitch_backend.persistence.seed
+
+      - name: prune
+        if: always()
+        run: docker image prune -f
