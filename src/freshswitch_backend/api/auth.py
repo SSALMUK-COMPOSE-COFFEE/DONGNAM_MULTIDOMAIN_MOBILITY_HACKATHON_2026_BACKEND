@@ -44,7 +44,7 @@ TOO_MANY_REQUESTS = "요청이 너무 많습니다. 잠시 후 다시 시도하�
 DEMO_SESSION_CAP = 5000
 DEMO_SESSION_TTL = timedelta(hours=12)
 TRUSTED_PROXIES_ENV = "TRUSTED_PROXIES"
-DEFAULT_TRUSTED_PROXIES = "127.0.0.0/8,::1/128,172.16.0.0/12"
+DEFAULT_TRUSTED_PROXIES = "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
 
 OrgType = Literal["platform", "shipper", "forwarder"]
 SignupOrgType = Literal["shipper", "forwarder"]

@@ -202,6 +202,8 @@ def test_client_address_trusts_configured_proxies_only(monkeypatch) -> None:
     forwarded = {"X-Forwarded-For": "6.6.6.6, 8.8.8.8"}
     assert auth.client_address(request("127.0.0.1", forwarded)) == "8.8.8.8"
     assert auth.client_address(request("172.18.0.1", {"X-Real-IP": "9.9.9.9"})) == "9.9.9.9"
+    assert auth.client_address(request("192.168.240.1", forwarded)) == "8.8.8.8"
+    assert auth.client_address(request("10.0.3.1", forwarded)) == "8.8.8.8"
     assert auth.client_address(request("203.0.113.9", forwarded)) == "203.0.113.9"
     monkeypatch.setenv(auth.TRUSTED_PROXIES_ENV, "203.0.113.0/24")
     assert auth.client_address(request("203.0.113.9", forwarded)) == "8.8.8.8"
