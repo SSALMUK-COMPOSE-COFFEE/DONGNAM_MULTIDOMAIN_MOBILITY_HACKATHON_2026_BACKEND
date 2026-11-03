@@ -241,8 +241,11 @@ class Anonymizer:
         own = set(own_shipper_ids)
         own_packhouses = {s.packhouse_id for s in scenario.shippers if s.id in own}
         packhouses = {p.id: p for p in scenario.packhouses}
-        shipper_ids = [s.id for s in scenario.shippers]
-        shipper_ids += sorted({lot.shipper_id for lot in scenario.lots} - set(shipper_ids))
+        listed = [s.id for s in scenario.shippers]
+        with_lots = {lot.shipper_id for lot in scenario.lots}
+        shipper_ids = [sid for sid in listed if sid in with_lots]
+        shipper_ids += sorted(with_lots - set(listed))
+        shipper_ids += [sid for sid in listed if sid not in with_lots]
         names = {s.id: s for s in scenario.shippers}
         own_shorts = {short_name(s.name) for s in scenario.shippers if s.id in own}
         tokens: dict[str, str] = {}
