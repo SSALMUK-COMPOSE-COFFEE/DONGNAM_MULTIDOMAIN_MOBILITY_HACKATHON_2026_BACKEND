@@ -230,3 +230,24 @@ def test_saas_readiness_uncaught_error_still_runs_cleanup(saas_app, monkeypatch)
 
 def test_template_fallback_check() -> None:
     assert saas_readiness.template_fallback() == "fallback=provider_error"
+
+
+def test_seeded_registered_lots_are_baseline_but_new_or_planned_lots_drift(
+    client: TestClient, demo_tenants, reset_admin_headers
+) -> None:
+    from freshswitch_backend.persistence.seed import seed_lots
+    from freshswitch_backend.persistence.tables import LotRow
+
+    with database.begin() as db:
+        assert seed_lots(db) > 0
+    report = client.get(CONTAMINATION, headers=reset_admin_headers).json()
+    assert report["contaminated"] is False
+    assert all(not org["drift"] for org in report["orgs"])
+
+    with database.begin() as db:
+        seeded = db.query(LotRow).filter(LotRow.shipper_org_id == SHIPPER_ORG_ID).first()
+        seeded.status = "planned"
+    report = client.get(CONTAMINATION, headers=reset_admin_headers).json()
+    shipper = next(o for o in report["orgs"] if o["org_id"] == SHIPPER_ORG_ID)
+    assert report["contaminated"] is True
+    assert shipper["drift"] == {"lots": 1}

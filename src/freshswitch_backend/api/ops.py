@@ -3,10 +3,11 @@ from typing import Any
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from freshswitch_backend.api.access import require_demo_reset
+from freshswitch_backend.data.loader import load_scenarios
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.seed import DemoOrg, demo_orgs
 from freshswitch_backend.persistence.tables import (
@@ -30,6 +31,7 @@ router = APIRouter(prefix="/ops", tags=["ops"])
 
 SEEDED_SCOPES = ("demo", "sandbox")
 SEED_ORIGIN = "seed"
+SEED_LOT_STATUS = "registered"
 
 
 class OrgDrift(BaseModel):
@@ -107,9 +109,19 @@ def _grouped(
     return Counter(dict(db.execute(query.group_by(column)).all()))
 
 
+def _seed_lot_ids() -> set[str]:
+    return {lot.id for scenario in load_scenarios().values() for lot in scenario.lots}
+
+
 def _counts(db: Session, ids: list[str]) -> dict[str, Counter]:
     return {
-        "lots": _grouped(db, LotRow.shipper_org_id, ids),
+        "lots": _grouped(
+            db,
+            LotRow.shipper_org_id,
+            ids,
+            None,
+            ~and_(LotRow.id.in_(_seed_lot_ids()), LotRow.status == SEED_LOT_STATUS),
+        ),
         "plans": _grouped(db, PlanRow.org_id, ids),
         "orders": _grouped(
             db, PlanRow.org_id, ids, (OrderRow, OrderRow.plan_id == PlanRow.plan_id)
