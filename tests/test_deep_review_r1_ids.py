@@ -103,10 +103,10 @@ def test_coldchain3_device_id_rule(saas, bad: str) -> None:
     assert created.status_code == 422, created.text
 
 
-@pytest.mark.parametrize("bad", ["x/y", "x y", "=1+1"])
-def test_coldchain3_simulation_device_id_rule(client: TestClient, bad: str) -> None:
-    simulated = client.post("/api/coldchain/simulate", json={"device_id": bad})
-    assert simulated.status_code == 422
+@pytest.mark.parametrize("legacy", ["x/y", "x y", "센서 1"])
+def test_coldchain3_simulation_keeps_legacy_device_ids(client: TestClient, legacy: str) -> None:
+    simulated = client.post("/api/coldchain/simulate", json={"device_id": legacy})
+    assert simulated.status_code == 200, simulated.text
 
 
 def test_coldchain3_valid_device_can_be_deleted(saas) -> None:

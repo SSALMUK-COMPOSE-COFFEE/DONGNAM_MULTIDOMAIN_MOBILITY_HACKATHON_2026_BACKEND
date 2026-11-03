@@ -3,7 +3,6 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from freshswitch_backend.domain.ids import EntityId
 from freshswitch_backend.domain.models import KstDatetime, Quantity
 from freshswitch_backend.routing.models import GateStatus
 
@@ -274,7 +273,7 @@ class SimulationRequest(BaseModel):
     preset: SimulationPreset = "power_cut_restore"
     container_id: str = "CA-01"
     plan_id: str | None = None
-    device_id: EntityId = "sim-01"
+    device_id: str = "sim-01"
     stage: Stage = "terminal"
     start: KstDatetime | None = None
     interval_seconds: float = Field(default=0, ge=0, le=10)
