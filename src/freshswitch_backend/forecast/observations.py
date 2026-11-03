@@ -1,6 +1,8 @@
 from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime
+from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 
 from freshswitch_backend.domain.models import Voyage
@@ -11,18 +13,22 @@ from freshswitch_backend.forecast.history import (
     terminal_of,
     vessel_key,
 )
+from freshswitch_backend.integrations.mof_snapshot import load_demo_fixture
 from freshswitch_backend.integrations.mof_vessel import (
+    KST,
     MAX_GAP_HOURS,
     DepartureMatch,
     PlannedVoyage,
     VesselMovement,
     match_departures,
+    normalize_call_sign,
 )
 from freshswitch_backend.persistence import Database, database
 from freshswitch_backend.persistence.tables import DelayObservationRow
-from freshswitch_backend.quality import learning_scope
+from freshswitch_backend.quality import LearningScope, learning_scope
 
 OWN_SOURCE = "자체 관측: schedule-check로 매칭된 실제 출항(계획 ETD 대비 해수부 출항일시)"
+DEMO_SCOPE: LearningScope = "demo"
 
 
 def planned_voyages(voyages: Iterable[Voyage]) -> list[PlannedVoyage]:
@@ -32,7 +38,25 @@ def planned_voyages(voyages: Iterable[Voyage]) -> list[PlannedVoyage]:
     ]
 
 
-def _row(match: DepartureMatch) -> dict[str, object] | None:
+def _movement_key(movement: VesselMovement) -> tuple[str, datetime] | None:
+    if not movement.call_sign or movement.departure_at is None:
+        return None
+    return normalize_call_sign(movement.call_sign), movement.departure_at.astimezone(UTC)
+
+
+def _synthetic_keys() -> set[tuple[str, datetime]]:
+    fixture = load_demo_fixture()
+    if fixture is None:
+        return set()
+    return {key for m in fixture.movements if (key := _movement_key(m)) is not None}
+
+
+def real_movements(movements: Sequence[VesselMovement]) -> list[VesselMovement]:
+    synthetic = _synthetic_keys()
+    return [m for m in movements if _movement_key(m) not in synthetic]
+
+
+def _row(match: DepartureMatch) -> dict[str, Any] | None:
     movement = match.movement
     if movement.departure_at is None:
         return None
@@ -57,16 +81,28 @@ def _row(match: DepartureMatch) -> dict[str, object] | None:
     }
 
 
+def _unique(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    best: dict[tuple[Any, Any], dict[str, Any]] = {}
+    for row in rows:
+        key = (row["vessel_key"], row["planned_departure_at"])
+        kept = best.get(key)
+        if kept is None or abs(row["delay_hours"]) < abs(kept["delay_hours"]):
+            best[key] = row
+    return list(best.values())
+
+
 def record_matches(
     org_id: str,
     matches: Iterable[DepartureMatch],
     plan_id: str | None = None,
     target: Database | None = None,
 ) -> int:
-    rows = [r for m in matches if (r := _row(m)) is not None]
+    scope = learning_scope(org_id)
+    if scope == DEMO_SCOPE:
+        return 0
+    rows = _unique([r for m in matches if (r := _row(m)) is not None])
     if not rows:
         return 0
-    scope = learning_scope(org_id)
     values = [{**r, "org_id": org_id, "scope": scope, "plan_id": plan_id} for r in rows]
     statement = insert(DelayObservationRow).values(values)
     statement = statement.on_conflict_do_update(
@@ -95,12 +131,28 @@ def record_schedule_check(
     org_id: str,
     voyages: Iterable[Voyage],
     movements: Sequence[VesselMovement],
+    *,
+    trusted: bool,
     plan_id: str | None = None,
     max_gap_hours: float = MAX_GAP_HOURS,
     target: Database | None = None,
 ) -> int:
-    matches = match_departures(planned_voyages(voyages), movements, max_gap_hours)
+    if not trusted or learning_scope(org_id) == DEMO_SCOPE:
+        return 0
+    matches = match_departures(planned_voyages(voyages), real_movements(movements), max_gap_hours)
     return record_matches(org_id, matches, plan_id, target)
+
+
+def clear_observations(scope: LearningScope, target: Database | None = None) -> int:
+    with (target or database).begin() as db:
+        result = db.execute(delete(DelayObservationRow).where(DelayObservationRow.scope == scope))
+    return result.rowcount or 0
+
+
+def clear_org_observations(org_id: str, target: Database | None = None) -> int:
+    with (target or database).begin() as db:
+        result = db.execute(delete(DelayObservationRow).where(DelayObservationRow.org_id == org_id))
+    return result.rowcount or 0
 
 
 def own_records(org_id: str, target: Database | None = None) -> list[DepartureRecord]:
@@ -118,8 +170,8 @@ def own_records(org_id: str, target: Database | None = None) -> list[DepartureRe
             vessel_name=r.vessel_name,
             vessel_kind=r.vessel_kind,
             terminal=r.terminal,
-            planned_departure_at=r.planned_departure_at,
-            departure_at=r.departure_at,
+            planned_departure_at=r.planned_departure_at.astimezone(KST),
+            departure_at=r.departure_at.astimezone(KST),
             delay_hours=r.delay_hours,
         )
         for r in latest.values()
