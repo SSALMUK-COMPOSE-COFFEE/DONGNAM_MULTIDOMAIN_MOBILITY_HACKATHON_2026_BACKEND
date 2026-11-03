@@ -2,14 +2,12 @@ name: freshswitch-saas
 
 services:
   api:
-    build: .
-    env_file: .env
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env.saas
     environment:
-      DATABASE_URL: ${DATABASE_URL:-}
       POSTGRES_HOST: db
-      POSTGRES_USER: ${POSTGRES_USER:-freshswitch}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-freshswitch}
-      POSTGRES_DB: ${POSTGRES_DB:-freshswitch}
       SAAS_MODE: "true"
       API_PREFIX: /test/api
       SESSION_COOKIE_PATH: /test
@@ -20,15 +18,12 @@ services:
         condition: service_healthy
         restart: true
     ports:
-      - "127.0.0.1:${SAAS_HOST_PORT:-18106}:8000"
+      - "127.0.0.1:18106:8000"
 
   db:
     image: postgres:17-alpine
     restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-freshswitch}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-freshswitch}
-      POSTGRES_DB: ${POSTGRES_DB:-freshswitch}
+    env_file: .env.saas
     command:
       - postgres
       - -c
