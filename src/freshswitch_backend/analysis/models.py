@@ -187,6 +187,9 @@ class BenchmarkResult(BaseModel):
     settlement_fcfs_explanation: str = ""
 
 
+PlatformBasis = Literal["performance", "tariff", "usage_fee", "mixed"]
+
+
 class ContainerEconomics(BaseModel):
     container_id: str
     pallets: int
@@ -194,7 +197,10 @@ class ContainerEconomics(BaseModel):
     fill: float
     container_cost: int
     savings: int
+    operational_savings: int = 0
     margin_per_pallet: int
+    margin_basis: Literal["operational"] = "operational"
+    platform_basis: PlatformBasis = "performance"
     breakeven_savings_pallets: float | None
     breakeven_platform_pallets: float | None
     breakeven_platform_fill: float | None
@@ -236,6 +242,7 @@ class SeasonProjection(BaseModel):
     lines: list[SeasonLine]
     revenue: int
     forwarder_share: int
+    variable_cost: int = 0
     fixed_cost: int
     platform_net: int
     breakeven_pallets: int | None
@@ -263,6 +270,7 @@ class BasisComparison(BaseModel):
     fee_rate: float
     season_revenue_performance: int
     season_revenue_proposal_rule: int
+    variable_cost_per_pallet: int = 0
     breakeven_pallets: int | None
 
 

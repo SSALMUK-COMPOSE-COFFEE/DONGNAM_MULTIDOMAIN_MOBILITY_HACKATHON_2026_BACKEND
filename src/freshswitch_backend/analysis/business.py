@@ -18,6 +18,7 @@ from freshswitch_backend.analysis.models import (
     FixedLevel,
     MatrixHighlight,
     MatrixRow,
+    PlatformBasis,
     SeasonLine,
     SeasonProjection,
     VoyageEconomics,
@@ -38,6 +39,7 @@ PALLET_KG = 415
 PROPOSAL = "기획서 ㅍ3"
 FREIGHT_DIFFERENCE_PER_PALLET = 664_000
 MVP_CASH_FIXED_COST = 15_000_000
+MAX_VARIABLE_COST_PER_PALLET = 1_000_000
 FEE_RATES = (0.20, 0.25, 0.30, 0.40)
 BASE_FEES = (0, 20_000, 30_000)
 FORWARDER_SHARES = (0.0, 0.4)
@@ -77,7 +79,13 @@ class _LotMoney:
     def __init__(self, plan: Plan) -> None:
         self.savings: dict[str, float] = {}
         self.fee: dict[str, float] = {}
+        self.operational: dict[str, float] = {}
         sea_pallets = {c.shipper_id: c.sea_pallets for c in plan.shipper_costs}
+        operational = {
+            c.shipper_id: c.operational_baseline.total - c.operational.total
+            for c in plan.shipper_costs
+            if c.operational is not None and c.operational_baseline is not None
+        }
         by_shipper = {s.shipper_id: s for s in plan.settlements}
         for a in plan.assignments:
             if a.mode != "sea":
@@ -87,10 +95,18 @@ class _LotMoney:
             share = a.pallets / total if settlement and total else 0.0
             self.savings[a.lot_id] = settlement.savings * share if settlement else 0.0
             self.fee[a.lot_id] = settlement.fee * share if settlement else 0.0
+            op_savings = operational.get(a.shipper_id)
+            if op_savings is None:
+                op_savings = settlement.savings if settlement else 0.0
+            self.operational[a.lot_id] = op_savings * share
 
 
 def _breakeven(numerator: float, margin: float) -> float | None:
     return round(numerator / margin, 2) if margin > 0 else None
+
+
+def _platform_basis(rules: set[PlatformBasis]) -> PlatformBasis:
+    return next(iter(rules)) if len(rules) == 1 else "mixed"
 
 
 def voyage_economics(
@@ -102,8 +118,9 @@ def voyage_economics(
 ) -> list[VoyageEconomics]:
     params = scenario.cost_params
     fee_rate = params.platform_fee_rate.value
-    keep = fee_rate * (1 - forwarder_share)
-    usage_keep = params.billing.usage_fee_per_pallet_krw.value * (1 - forwarder_share)
+    kept = 1 - forwarder_share
+    usage_per_pallet = params.billing.usage_fee_per_pallet_krw.value
+    tariff_fee = {t.product_id: t.fee_per_pallet for t in plan.settlement_tariffs}
     money = _LotMoney(plan)
     lots_in: dict[str, list] = defaultdict(list)
     for a in plan.assignments:
@@ -129,13 +146,27 @@ def voyage_economics(
                 else money.fee[a.lot_id]
                 for a in items
             )
-            margin = (savings + fixed) / load.pallets if load.pallets else 0.0
-            usage_only = bool(items) and all(uses_usage_fee(params, a.product_id) for a in items)
-            if usage_only:
-                platform = _breakeven(ops_per_container, usage_keep)
-            else:
-                platform = (
-                    _breakeven(ops_per_container / keep + fixed, margin) if keep > 0 else None
+            operational = sum(money.operational[a.lot_id] for a in items)
+            margin = (operational + fixed) / load.pallets if load.pallets else 0.0
+            per_pallet = offset = 0.0
+            rules: set[PlatformBasis] = set()
+            for a in items:
+                if uses_usage_fee(params, a.product_id):
+                    rules.add("usage_fee")
+                    per_pallet += usage_per_pallet * a.pallets
+                elif a.product_id in tariff_fee:
+                    rules.add("tariff")
+                    per_pallet += tariff_fee[a.product_id] * a.pallets
+                else:
+                    rules.add("performance")
+                    share = fixed * a.pallets / load.pallets
+                    per_pallet += fee_rate * (money.operational[a.lot_id] + share)
+                    offset += fee_rate * share
+            platform = None
+            if load.pallets:
+                platform = _breakeven(
+                    load.pallets * (ops_per_container + kept * offset),
+                    kept * per_pallet - variable_cost_per_pallet * load.pallets,
                 )
             rows.append(
                 ContainerEconomics(
@@ -145,7 +176,10 @@ def voyage_economics(
                     fill=load.utilization,
                     container_cost=fixed,
                     savings=round(savings),
+                    operational_savings=round(operational),
                     margin_per_pallet=round(margin),
+                    margin_basis="operational",
+                    platform_basis=_platform_basis(rules),
                     breakeven_savings_pallets=_breakeven(fixed, margin),
                     breakeven_platform_pallets=platform,
                     breakeven_platform_fill=round(platform / load.capacity_pallets, 4)
@@ -178,7 +212,7 @@ def voyage_economics(
                 fixed_cost_allocation=ops_cost_per_voyage,
                 usage_fee_rule_revenue=round(usage_rule_total),
                 breakeven_containers=_breakeven(
-                    ops_cost_per_voyage, fee_total * (1 - forwarder_share) / len(used)
+                    ops_cost_per_voyage, (fee_total * kept - variable) / len(used)
                 ),
                 containers=rows,
             )
@@ -187,7 +221,7 @@ def voyage_economics(
 
 
 def season_projection(
-    scenario: Scenario, plan: Plan, forwarder_share: float
+    scenario: Scenario, plan: Plan, forwarder_share: float, variable_cost_per_pallet: int = 0
 ) -> SeasonProjection | None:
     product_ids = {p.id for p in scenario.products}
     if not all(pid in product_ids for pid, _, _ in SEASON_VOLUMES):
@@ -226,13 +260,16 @@ def season_projection(
         )
     revenue = sum(line.revenue for line in lines)
     forwarder = round(revenue * forwarder_share)
-    net_per_pallet = (revenue - forwarder) / sum(line.pallets for line in lines)
+    total_pallets = sum(line.pallets for line in lines)
+    variable = variable_cost_per_pallet * total_pallets
+    net_per_pallet = (revenue - forwarder - variable) / total_pallets
     return SeasonProjection(
         lines=lines,
         revenue=revenue,
         forwarder_share=forwarder,
+        variable_cost=variable,
         fixed_cost=ANNUAL_FIXED_COST,
-        platform_net=revenue - forwarder - ANNUAL_FIXED_COST,
+        platform_net=revenue - forwarder - variable - ANNUAL_FIXED_COST,
         breakeven_pallets=round(ANNUAL_FIXED_COST / net_per_pallet) if net_per_pallet > 0 else None,
         source=f"{PROPOSAL} 8-3 물량(점유율은 기획서 가정), 8-1 고정비 연 1.5억 원(가정). "
         "파렛트당 절감액은 이 시나리오 최적화 결과 평균",
@@ -288,8 +325,8 @@ def business(
         total_platform_net=sum(v.platform_net for v in voyages),
         total_contribution_margin=sum(v.contribution_margin for v in voyages),
         total_fixed_cost_allocation=sum(v.fixed_cost_allocation for v in voyages),
-        season=season_projection(scenario, plan, forwarder_share),
-        basis=basis_comparison(scenario, plan, forwarder_share),
+        season=season_projection(scenario, plan, forwarder_share, variable_cost_per_pallet),
+        basis=basis_comparison(scenario, plan, forwarder_share, variable_cost_per_pallet),
     )
 
 
@@ -322,7 +359,7 @@ def _proposal_revenue(
 
 
 def basis_comparison(
-    scenario: Scenario, plan: Plan, forwarder_share: float
+    scenario: Scenario, plan: Plan, forwarder_share: float, variable_cost_per_pallet: int = 0
 ) -> list[BasisComparison]:
     pallets = _season_pallets(scenario)
     if pallets is None:
@@ -353,7 +390,7 @@ def basis_comparison(
         total = sum(pallets.values())
         performance = round(sum(n * per_pallet[pid] * fee_rate for pid, n in pallets.items()))
         proposal = _proposal_revenue(scenario.cost_params, pallets, per_pallet, fee_rate)
-        per_pallet_keep = proposal / total * (1 - forwarder_share)
+        per_pallet_keep = proposal / total * (1 - forwarder_share) - variable_cost_per_pallet
         result.append(
             BasisComparison(
                 basis=basis,
@@ -366,6 +403,7 @@ def basis_comparison(
                 fee_rate=fee_rate,
                 season_revenue_performance=performance,
                 season_revenue_proposal_rule=proposal,
+                variable_cost_per_pallet=variable_cost_per_pallet,
                 breakeven_pallets=round(ANNUAL_FIXED_COST / per_pallet_keep)
                 if per_pallet_keep > 0
                 else None,
@@ -470,6 +508,15 @@ def _describe(row: MatrixRow) -> str:
     return " + ".join(row.needs) if row.needs else "기획서 기준 그대로"
 
 
+NO_BREAKEVEN = "손익분기 없음(파렛트당 공헌이익 ≤ 0)"
+
+
+def _breakeven_text(row: MatrixRow) -> str:
+    if row.breakeven_pallets is None:
+        return NO_BREAKEVEN
+    return f"손익분기 연 {row.breakeven_pallets:,}파렛트"
+
+
 def _highlights(rows: list[MatrixRow], limit: int = 5) -> list[MatrixHighlight]:
     winners = sorted((r for r in rows if r.breaks_even), key=lambda r: (len(r.needs), -r.net))
     picked: list[MatrixRow] = []
@@ -483,9 +530,7 @@ def _highlights(rows: list[MatrixRow], limit: int = 5) -> list[MatrixHighlight]:
             break
     result = [
         MatrixHighlight(
-            summary=(
-                f"흑자 {row.net:,}원, 손익분기 연 {row.breakeven_pallets:,}파렛트: {_describe(row)}"
-            ),
+            summary=f"흑자 {row.net:,}원, {_breakeven_text(row)}: {_describe(row)}",
             needs=row.needs,
             row=row,
         )
@@ -498,7 +543,7 @@ def _highlights(rows: list[MatrixRow], limit: int = 5) -> list[MatrixHighlight]:
             MatrixHighlight(
                 summary=(
                     f"사업 예산(연 {best.fixed_cost:,}원) 기준으로는 모든 조합이 1년 차 적자. "
-                    f"가장 나은 조합도 {best.net:,}원(손익분기 연 {best.breakeven_pallets:,}파렛트): "
+                    f"가장 나은 조합도 {best.net:,}원({_breakeven_text(best)}): "
                     f"{_describe(best)}"
                 ),
                 needs=best.needs,

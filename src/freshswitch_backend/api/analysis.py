@@ -19,6 +19,7 @@ from freshswitch_backend.analysis import (
     fuel_shock,
     sensitivity,
 )
+from freshswitch_backend.analysis.business import MAX_VARIABLE_COST_PER_PALLET
 from freshswitch_backend.api.auth import OptionalPrincipal
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import Scenario
@@ -156,7 +157,7 @@ def run_business(
     plan_id: str | None = None,
     forwarder_share: float = Query(DEFAULT_FORWARDER_SHARE, ge=0, le=1),
     ops_cost_per_voyage: int = Query(DEFAULT_OPS_COST_PER_VOYAGE, ge=0),
-    variable_cost_per_pallet: int = Query(0, ge=0),
+    variable_cost_per_pallet: int = Query(0, ge=0, le=MAX_VARIABLE_COST_PER_PALLET),
 ) -> BusinessResult:
     return business(
         _source(scenario_id, plan_id, org_id),
@@ -173,7 +174,7 @@ def run_business_matrix(
     plan_id: str | None = None,
     base_fee_mode: Literal["deducted", "additive"] = "deducted",
     grape_rule: Literal["usage_fee", "performance", "solo_baseline"] = "usage_fee",
-    variable_cost_per_pallet: int = Query(0, ge=0),
+    variable_cost_per_pallet: int = Query(0, ge=0, le=MAX_VARIABLE_COST_PER_PALLET),
 ) -> BusinessMatrix:
     result = business_matrix(
         _source(scenario_id, plan_id, org_id), base_fee_mode, grape_rule, variable_cost_per_pallet
