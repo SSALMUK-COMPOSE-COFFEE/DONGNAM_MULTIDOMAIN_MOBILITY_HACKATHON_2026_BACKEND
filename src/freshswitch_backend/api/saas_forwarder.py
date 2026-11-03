@@ -14,7 +14,14 @@ from freshswitch_backend.api.saas_views import (
     plan_item,
     without_settlement,
 )
-from freshswitch_backend.execution.models import ConfirmRequest, RequestResultBody
+from freshswitch_backend.domain.models import Scenario
+from freshswitch_backend.execution.card import ExecutionCard, build_execution_card
+from freshswitch_backend.execution.models import (
+    ConfirmRequest,
+    ExecutionOrder,
+    RequestResultBody,
+)
+from freshswitch_backend.execution.orders import saas_requests
 from freshswitch_backend.notifications import notify_order_committed
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.tables import PlanRow
@@ -33,6 +40,16 @@ ForwarderPrincipal = Annotated[Principal, Depends(require_role("forwarder"))]
 class ForwarderDecision(BaseModel):
     accept: bool
     note: str | None = None
+
+
+def _order_view(order: ExecutionOrder, scenario: Scenario) -> ForwarderOrder:
+    view = forwarder_order_view(order)
+    view.requests = saas_requests(order.plan_id, view.requests, scenario)
+    return view
+
+
+def _card(session: PlanSession) -> ExecutionCard:
+    return build_execution_card(session.plan_id, session.version, session.scenario, session.plan)
 
 
 @router.get("/plans")
@@ -56,13 +73,22 @@ def list_plans(
 
 @router.get("/plans/{plan_id}")
 def read_plan(plan_id: str, principal: ForwarderPrincipal) -> dict[str, Any]:
-    return without_settlement(plan_for(plan_id, principal).session)
+    session = plan_for(plan_id, principal).session
+    payload = without_settlement(session)
+    payload["execution_card"] = _card(session).model_dump(mode="json")
+    return payload
+
+
+@router.get("/plans/{plan_id}/execution-card")
+def read_execution_card(plan_id: str, principal: ForwarderPrincipal) -> ExecutionCard:
+    return _card(plan_for(plan_id, principal).session)
 
 
 @router.get("/plans/{plan_id}/orders")
 def list_orders(plan_id: str, principal: ForwarderPrincipal) -> list[ForwarderOrder]:
     access = plan_for(plan_id, principal)
-    return [forwarder_order_view(o) for o in store.orders(plan_id, org_id=access.owner_org_id)]
+    scenario = access.session.scenario
+    return [_order_view(o, scenario) for o in store.orders(plan_id, org_id=access.owner_org_id)]
 
 
 @router.post("/plans/{plan_id}/orders/{order_id}/confirm")
@@ -80,7 +106,7 @@ def confirm_order(
     except SessionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     notify_order_committed(access.session, order, access.owner_org_id, store.clock())
-    return forwarder_order_view(order)
+    return _order_view(order, access.session.scenario)
 
 
 @router.post("/plans/{plan_id}/orders/{order_id}/requests/{request_id}")
@@ -102,4 +128,4 @@ def answer_request(
         ) from exc
     except SessionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return forwarder_order_view(order)
+    return _order_view(order, access.session.scenario)

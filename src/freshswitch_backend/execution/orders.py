@@ -4,6 +4,13 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
 from freshswitch_backend.domain.models import KST, Lot, Plan, Scenario
+from freshswitch_backend.execution.card import (
+    DEFAULT_PALLET_KG,
+    cutoff_timeline,
+    gross_cargo_kg,
+    mock_booking_no,
+    vgm_kg,
+)
 from freshswitch_backend.execution.models import (
     AutomaticAction,
     ConfirmationReason,
@@ -198,6 +205,7 @@ def build_order(
     event: Event,
     now: datetime,
     params: ExecutionParams | None = None,
+    saas: bool = False,
 ) -> ExecutionOrder:
     ctx = _Ctx(
         scenario_before,
@@ -456,6 +464,8 @@ def build_order(
                 ),
             )
 
+    if saas:
+        requests.items = saas_requests(plan_id, requests.items, scenario_after, p)
     request_deadlines = [r.deadline for r in requests.items]
     forwarder = min([dispatch, *request_deadlines])
     shipper_deadline = forwarder - timedelta(hours=p.forwarder_processing_hours.value)
@@ -593,6 +603,106 @@ def build_order(
         cancellation=charge,
         log=log,
     )
+
+
+SAAS_REQUEST_KINDS = ("booking_amendment", "booking_cancel", "booking_new")
+
+
+def _net_per_pallet(scenario: Scenario, lot_ids: list[str]) -> float:
+    products = {p.id: p for p in scenario.products}
+    weighted = 0.0
+    pallets = 0
+    for lot in scenario.lots:
+        if lot.id not in lot_ids:
+            continue
+        product = products.get(lot.product_id)
+        weighted += lot.pallets * (product.pallet_kg if product else DEFAULT_PALLET_KG)
+        pallets += lot.pallets
+    return weighted / pallets if pallets else DEFAULT_PALLET_KG
+
+
+def _scenario_setting(scenario: Scenario, lot_ids: list[str]) -> str:
+    products = {p.id: p for p in scenario.products}
+    found = sorted({lot.product_id for lot in scenario.lots if lot.id in lot_ids})
+    texts = []
+    for pid in found:
+        product = products.get(pid)
+        if product is None:
+            continue
+        gas = ""
+        if product.o2_pct is not None or product.co2_pct is not None:
+            gas = f", O2 {product.o2_pct:g}%·CO2 {product.co2_pct:g}%"
+        texts.append(f"{product.name} {product.temp_min_c:g}~{product.temp_max_c:g}°C{gas}")
+    return "; ".join(texts) or "품목 조건 없음(선사 기본 설정)"
+
+
+def saas_request_text(
+    plan_id: str,
+    request: ExternalRequest,
+    scenario: Scenario,
+    params: ExecutionParams | None = None,
+) -> str:
+    p = params or ExecutionParams()
+    voyages = {v.id: v for v in scenario.voyages}
+    containers = {c.id: c for c in scenario.containers}
+    voyage = voyages.get(request.voyage_id or "")
+    container = containers.get(request.container_id or "")
+    if request.kind not in SAAS_REQUEST_KINDS or voyage is None or container is None:
+        return request.text
+    ports = {port.id: port.name for port in scenario.ports}
+    per_pallet = _net_per_pallet(scenario, request.lot_ids)
+    pb, pa = request.pallets_before, request.pallets_after
+    gb = gross_cargo_kg(per_pallet * pb, pb, p)
+    ga = gross_cargo_kg(per_pallet * pa, pa, p)
+    tare = p.container_tare_kg.value
+    cid = request.container_id
+    booking = mock_booking_no(plan_id, cid)
+    cutoffs = cutoff_timeline(voyage, p)
+    head = (
+        f"{voyage.vessel_name}({voyage.id}, {voyage.terminal}, ETD {fmt(voyage.etd)}) "
+        f"{ports.get(voyage.origin, voyage.origin)}→"
+        f"{ports.get(voyage.destination, voyage.destination)}"
+    )
+    lots = ", ".join(request.lot_ids) or "없음"
+    timeline = (
+        f"SI 마감 {fmt(cutoffs.si_cutoff)}, VGM 마감 {fmt(cutoffs.vgm_cutoff)}, "
+        f"CY 반입 마감 {fmt(cutoffs.cy_cutoff)}"
+    )
+    if request.kind == "booking_amendment":
+        return (
+            f"[SI 정정 + VGM 재제출 요청] {head} 부킹 {booking}(모의)의 컨테이너 {cid}"
+            f"({container.kind}) 적재를 {pb}→{pa}파렛트, 화물 총중량 {gb:,}→{ga:,}kg"
+            f"(순중량 + 파렛트·포장)으로 SI 정정하고 VGM {vgm_kg(gb, p):,}→{vgm_kg(ga, p):,}kg"
+            f"(컨테이너 자중 {tare:,.0f}kg 포함)으로 재제출합니다. 컨테이너 수·종류가 같아 "
+            f"부킹은 그대로 둡니다. 대상 출하: {lots}. {timeline}. "
+            f"회신 기한 {fmt(request.deadline)}."
+        )
+    if request.kind == "booking_cancel":
+        return (
+            f"[부킹 변경 요청: 컨테이너 1대 취소] {head} 부킹 {booking}(모의)의 컨테이너 {cid}"
+            f"({container.kind}, {pb}파렛트·화물 총중량 {gb:,}kg)를 취소합니다. "
+            f"대상 출하: {lots}. CA 장비 반납 일정과 취소 조건 회신 부탁드립니다. "
+            f"회신 기한 {fmt(request.deadline)}."
+        )
+    return (
+        f"[부킹 변경 요청: 컨테이너 1대 추가] {head} {container.kind} 1대({cid}), "
+        f"{pa}파렛트·화물 총중량 {ga:,}kg(VGM {vgm_kg(ga, p):,}kg, 컨테이너 자중 "
+        f"{tare:,.0f}kg 포함). 대상 출하: {lots}. 설정: "
+        f"{_scenario_setting(scenario, request.lot_ids)}. 장비 PTI·공컨테이너 반출 일정 "
+        f"회신 부탁드립니다. {timeline}. 회신 기한 {fmt(request.deadline)}."
+    )
+
+
+def saas_requests(
+    plan_id: str,
+    requests: list[ExternalRequest],
+    scenario: Scenario,
+    params: ExecutionParams | None = None,
+) -> list[ExternalRequest]:
+    return [
+        r.model_copy(update={"text": saas_request_text(plan_id, r, scenario, params)})
+        for r in requests
+    ]
 
 
 def _automatic_actions(

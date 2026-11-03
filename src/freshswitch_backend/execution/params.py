@@ -35,6 +35,28 @@ class ExecutionParams(BaseModel):
         "시간",
         "가정: 출하일 0시 기준 항공 화물 예약·반입 리드타임(인천 육송 약 5시간 + 보관)",
     )
+    pallet_tare_kg: Quantity = _q(
+        25,
+        "kg/파렛트",
+        "가정: 수출용 목재 파렛트(1,100×1,100 T11) 자중 약 20~25kg 상단. 실측 확인 필요",
+    )
+    packaging_kg_per_pallet: Quantity = _q(
+        35,
+        "kg/파렛트",
+        "가정: 화물 순중량 415kg 파렛트의 골판지 수출 상자·코너보드·스트레치 랩 합계. "
+        "상자 규격별 실측 확인 필요",
+    )
+    container_tare_kg: Quantity = _q(
+        4800,
+        "kg/대",
+        "가정: 40ft 리퍼 하이큐브(CA 장치 포함) 자중 약 4,500~4,900kg. 선사 장비 CSC 표기 확인 필요. "
+        "SOLAS VI/2 VGM = 화물·포장·파렛트·고정재 총중량 + 컨테이너 자중",
+    )
+    vgm_cutoff_lead_hours: Quantity = _q(
+        12,
+        "시간",
+        "가정: VGM 제출 마감이 CY 반입 마감보다 앞선다(선사·터미널별 상이, 부킹 확인서 기준)",
+    )
     cancellation_fee_rate: Quantity = _q(
         1.0,
         "비율",
