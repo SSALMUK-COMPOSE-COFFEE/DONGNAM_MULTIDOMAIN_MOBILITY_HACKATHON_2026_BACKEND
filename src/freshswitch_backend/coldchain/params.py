@@ -19,7 +19,9 @@ class ColdchainParams(BaseModel):
         f"{JLST}: 단전 없음 손실률 1~2%(모의) 중앙값. 시나리오 딸기 기본 손실률과 같음",
     )
     reference_outage_loss_rate: Quantity = _q(
-        0.07, "비율", f"{JLST}: 단전 있음(누적 5시간 56분) 손실률 6~8%(실측) 중앙값"
+        0.07,
+        "비율",
+        f"{JLST}: 단전 있음(누적 5시간 56분) 손실률 6~8% 중앙값(현장 실증, 손실은 패널 평가)",
     )
     reference_max_loss_rate: Quantity = _q(
         0.08, "비율", f"{JLST}: 단전 있음 6~8% 상한. 시나리오 딸기 해상 손실 상한과 같음"
@@ -73,9 +75,9 @@ class ColdchainParams(BaseModel):
     insurance_continuous_minutes: Quantity = _q(
         480,
         "분",
-        "GCMI Clauses 2025(SVV, 스위스 보험협회): 냉동기 고장 연속 8시간은 육상·항공·보관 구간 조건. "
-        "해상 구간(2006년판 24시간)과 Institute Frozen Food Clauses는 연속 24시간이라 "
-        "부산→홍콩 해상 적용 여부 확인 필요. "
+        "GCMI Clauses 2025(SVV, 스위스 보험협회) Clause TR 4/2023e 2.b: 냉동기 고장 연속 8시간은 "
+        "육상·항공·보관 구간 조건이고, 하천·해상 구간은 증권마다 시간(X)을 따로 정한다. "
+        "Institute Frozen Food Clauses는 연속 24시간이라 부산→홍콩 해상 적용 시간은 증권 확인 필요. "
         "https://svv.ch/sites/default/files/media/documents/2026-07/GCMI_Clauses_2025.pdf",
     )
     max_gap_minutes: Quantity = _q(
