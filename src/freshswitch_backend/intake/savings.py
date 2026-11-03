@@ -1,30 +1,31 @@
-from freshswitch_backend.analysis.business import USAGE_FEE_PER_PALLET, USAGE_FEE_PRODUCTS
-from freshswitch_backend.domain.models import Assignment, Lot, Plan, Scenario
+from freshswitch_backend.domain.models import Assignment, BillingRule, Lot, Plan, Scenario
 from freshswitch_backend.intake.models import FeasibilityHints, SavingsEstimate, SeaHint
 from freshswitch_backend.optimize.costs import CostModel
-from freshswitch_backend.optimize.settlement import lot_settle_cost, settle
+from freshswitch_backend.optimize.settlement import billing_rule, charge, lot_settle_cost
 
 TARGET_UTILIZATION = 0.85
 BASELINE_NOTE = "기준선: 이 출하를 혼자 항공으로 보낼 때 비용(시나리오 정산 규칙)"
 FINAL_NOTE = "확정 정산은 계획 생성 뒤 실제 적재·집하 경로로 다시 계산합니다"
 
 
-def _rule(model: CostModel, lot: Lot, usage_fee_enabled: bool) -> tuple[str, str]:
-    if usage_fee_enabled and lot.product_id in USAGE_FEE_PRODUCTS:
-        fee = f"{USAGE_FEE_PER_PALLET:,}원"
+def _rule(model: CostModel, lot: Lot) -> tuple[BillingRule, str]:
+    billing = model.params.billing
+    if billing_rule(model.params, lot.product_id) == "usage_fee":
+        fee = f"{round(billing.usage_fee_per_pallet_krw.value):,}원"
         return (
             "usage_fee",
-            f"파렛트 이용료 {fee} × 파렛트 수, 성과보수 없음(결정 D1 기본값, 기획서 8-1)",
+            f"파렛트 이용료 {fee} × 파렛트 수, 성과보수 없음({billing.usage_fee_source})",
         )
     rate = model.params.platform_fee_rate.value
     return "performance", f"절감액의 {rate:.0%} 성과보수(기획서 8-1)"
 
 
-def _fee(model: CostModel, lot: Lot, billing: str, savings: int) -> tuple[int, int]:
-    if billing == "usage_fee":
-        fee = USAGE_FEE_PER_PALLET * lot.pallets
-        return fee, savings - fee
-    return settle(savings, model.params.platform_fee_rate.value)
+def _fee(model: CostModel, lot: Lot, billing: BillingRule, savings: int) -> tuple[int, int]:
+    usage = billing == "usage_fee"
+    bill = charge(
+        model.params, billing, savings, 0 if usage else savings, lot.pallets if usage else 0
+    )
+    return bill.fee, bill.shipper_gain
 
 
 def _load(model: CostModel, option: SeaHint, lot: Lot, plan: Plan | None) -> tuple[int, str]:
@@ -55,12 +56,10 @@ def estimate_savings(
     lot: Lot,
     plan: Plan | None,
     hints: FeasibilityHints,
-    *,
-    usage_fee_enabled: bool,
 ) -> SavingsEstimate | None:
     model = CostModel(scenario)
     basis = "tariff" if model.tariff(lot) is not None else "operational"
-    billing, rule = _rule(model, lot, usage_fee_enabled)
+    billing, rule = _rule(model, lot)
     baseline = round(model.settle_air_cost(lot).total)
     assumptions = [BASELINE_NOTE]
     option = _option(plan, hints)

@@ -3,7 +3,7 @@ from fastapi.testclient import TestClient
 
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import Scenario
-from freshswitch_backend.optimize.settlement import settle
+from freshswitch_backend.optimize.settlement import billing_rule, usage_fee
 from freshswitch_backend.persistence.seed import shipper_org_id
 from freshswitch_backend.planning.service import build_plan
 
@@ -70,7 +70,7 @@ def test_grape_uses_pallet_usage_fee(saas_login, scenario: Scenario):
     assert estimate["shipper_gain"] == estimate["savings"] - estimate["fee"]
     assert estimate["savings"] == estimate["baseline_cost"] - estimate["shared_cost"] > 0
     assert estimate["assumed_container_pallets"] == 17
-    assert "D1" in estimate["rule"]
+    assert "기획서" in estimate["rule"] and "성과보수 없음" in estimate["rule"]
     assert any("85%" in note for note in estimate["assumptions"])
 
 
@@ -98,15 +98,23 @@ def test_shipper_session_gets_own_estimate(shipper_client: TestClient, scenario:
     assert "산청" not in response.text
 
 
-def test_demo_grape_keeps_performance_fee(client: TestClient, scenario: Scenario):
+def test_demo_grape_uses_usage_fee_like_settlement(client: TestClient, scenario: Scenario):
     response = client.post(INTAKE, json=_body(_lot(scenario, "lot-sangju-gr-1")))
     assert response.status_code == 200, response.text
     estimate = response.json()["savings_estimate"]
+    params = scenario.cost_params
     assert estimate["mode"] == "sea"
-    assert estimate["billing_rule"] == "performance"
-    assert "25%" in estimate["rule"]
-    assert estimate["savings"] > 0
-    assert (estimate["fee"], estimate["shipper_gain"]) == settle(estimate["savings"], 0.25)
+    assert estimate["billing_rule"] == billing_rule(params, "grape_so2") == "usage_fee"
+    assert estimate["fee"] == usage_fee(params, 13)
+    assert estimate["shipper_gain"] == estimate["savings"] - estimate["fee"]
+    settled = next(
+        s
+        for s in build_plan(scenario.model_copy(deep=True)).plan.settlements
+        if s.shipper_id == "sh-sangju"
+    )
+    assert settled.billing_rule == "usage_fee"
+    assert estimate["fee"] == settled.fee
+    assert estimate["baseline_cost"] == settled.baseline_cost
 
 
 def test_no_plan_estimate_skips_pull_forward_options(client: TestClient, scenario: Scenario):
