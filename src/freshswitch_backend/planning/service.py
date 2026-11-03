@@ -1,3 +1,4 @@
+import time
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta
@@ -11,6 +12,7 @@ from freshswitch_backend.domain.models import (
     Plan,
     Scenario,
 )
+from freshswitch_backend.observability import record_event
 from freshswitch_backend.optimize import AIR, solve_plan
 from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.optimize.solver import resettle_plan
@@ -281,4 +283,16 @@ def solve_with_routes(
 
 
 def build_plan(scenario: Scenario, **options) -> PlanWithRoutes:
-    return solve_with_routes(scenario, **options)
+    started = time.perf_counter()
+    status = "error"
+    try:
+        built = solve_with_routes(scenario, **options)
+        status = built.plan.status
+        return built
+    finally:
+        record_event(
+            "plan.build",
+            status=status,
+            lot_count=len(scenario.lots),
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
+        )

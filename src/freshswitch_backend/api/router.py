@@ -12,6 +12,7 @@ from freshswitch_backend.api import (
     login_gate,
     lots,
     me,
+    ops,
     orgs,
     plans,
     provenance,
@@ -51,3 +52,4 @@ api_router.include_router(saas_forwarder.router)
 api_router.include_router(orgs.router)
 api_router.include_router(saas_devices.router)
 api_router.include_router(showcase.router)
+api_router.include_router(ops.router)
