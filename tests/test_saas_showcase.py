@@ -37,7 +37,15 @@ NESTED_KEYS = {
     "ports": {"id", "name", "lat", "lon"},
     "products": {"id", "name", "so2_treated"},
     "voyages": {"id", "vessel_name", "origin", "destination", "transit_days"},
-    "routes": {"voyage_id", "truck_id", "trip", "cargo_group", "load_pallets", "stops"},
+    "routes": {
+        "voyage_id",
+        "truck_id",
+        "trip",
+        "cargo_group",
+        "load_pallets",
+        "stops",
+        "stop_pallets",
+    },
 }
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
@@ -155,3 +163,22 @@ def test_demo_mode_showcase_ignores_anonymous_demo_plans(client: TestClient) -> 
     assert response.status_code == 200
     _assert_shape(response.json())
     assert SECRET_VESSEL not in response.text
+
+
+def test_showcase_routes_carry_pallets_per_stop(saas_app) -> None:
+    body = _anonymous(saas_app).get(SHOWCASE).json()
+    routes = build_plan(_default().model_copy(deep=True)).routes
+    expected = {
+        (voyage.voyage_id, truck.truck_id, truck.trip): [
+            s.pallets for s in sorted(truck.stops, key=lambda s: s.sequence)
+        ]
+        for voyage in routes
+        for truck in voyage.pickup.routes
+    }
+    assert body["routes"]
+    for route in body["routes"]:
+        assert len(route["stop_pallets"]) == len(route["stops"])
+        assert all(pallets > 0 for pallets in route["stop_pallets"])
+        assert sum(route["stop_pallets"]) == route["load_pallets"]
+        key = (route["voyage_id"], route["truck_id"], route["trip"])
+        assert route["stop_pallets"] == expected[key]

@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import Scenario
 from freshswitch_backend.planning.service import PlanWithRoutes, build_plan
+from freshswitch_backend.routing.models import TruckRoute
 
 router = APIRouter(prefix="/public", tags=["public"])
 
@@ -67,6 +68,7 @@ class ShowcaseRoute(_Strict):
     cargo_group: str | None
     load_pallets: int
     stops: list[str]
+    stop_pallets: list[int]
 
 
 class Showcase(_Strict):
@@ -164,17 +166,21 @@ def _summarize(scenario: Scenario, built: PlanWithRoutes) -> Showcase:
             for v in voyages
         ],
         routes=[
-            ShowcaseRoute(
-                voyage_id=voyage.voyage_id,
-                truck_id=truck.truck_id,
-                trip=truck.trip,
-                cargo_group=truck.cargo_group,
-                load_pallets=truck.load_pallets,
-                stops=[s.packhouse_id for s in sorted(truck.stops, key=lambda s: s.sequence)],
-            )
-            for voyage in routes
-            for truck in voyage.pickup.routes
+            _route(voyage.voyage_id, truck) for voyage in routes for truck in voyage.pickup.routes
         ],
+    )
+
+
+def _route(voyage_id: str, truck: TruckRoute) -> ShowcaseRoute:
+    stops = sorted(truck.stops, key=lambda s: s.sequence)
+    return ShowcaseRoute(
+        voyage_id=voyage_id,
+        truck_id=truck.truck_id,
+        trip=truck.trip,
+        cargo_group=truck.cargo_group,
+        load_pallets=truck.load_pallets,
+        stops=[s.packhouse_id for s in stops],
+        stop_pallets=[s.pallets for s in stops],
     )
 
 
