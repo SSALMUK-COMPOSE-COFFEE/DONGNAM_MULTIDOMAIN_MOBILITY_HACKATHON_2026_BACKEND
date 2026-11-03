@@ -37,7 +37,7 @@ router = APIRouter(prefix="/saas/platform", tags=["saas-platform"])
 PlatformPrincipal = Annotated[Principal, Depends(require_role("platform"))]
 MonthQuery = Annotated[str | None, Query(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")]
 CONFIRMED_ORDERS = frozenset({"forwarder_confirmed", "executed"})
-REGIONS = (("부울경", ("부산", "울산", "경남")), ("경북", ("경북", "대구")))
+REGIONS = (("부울경", ("부산", "울산", "경남", "경상남도")), ("경북", ("경북", "대구", "경상북도")))
 OTHER_REGION = "기타"
 
 
@@ -108,9 +108,13 @@ class BusinessLine(BaseModel):
     contribution_margin: int
     fixed_cost_allocation: int
     platform_net: int
+    settlement_gap: int
+    platform_net_with_settlement: int
     annual_contribution: int | None
     annual_fixed_cost: int
     annual_net: int | None
+    annual_settlement_gap: int | None
+    annual_net_with_settlement: int | None
     breakeven_pallets_per_voyage: float | None
     remaining_pallets_per_voyage: float | None
 
@@ -169,7 +173,7 @@ def _rate(numerator: int, denominator: int, definition: str, empty: str) -> Metr
 
 def region_of(label: str) -> str:
     return next(
-        (name for name, prefixes in REGIONS if label.startswith(prefixes)),
+        (name for name, prefixes in REGIONS if label.strip().startswith(prefixes)),
         OTHER_REGION,
     )
 
@@ -338,6 +342,20 @@ def _empty_slot_cost(plan: Plan) -> int:
     )
 
 
+def _refunded(session: PlanSession) -> Plan:
+    fees = {
+        r.shipper_id: r.fee for r in adjusted_settlements(session.plan, session.arrival_inspections)
+    }
+    return session.plan.model_copy(
+        update={
+            "settlements": [
+                s.model_copy(update={"fee": fees.get(s.shipper_id, s.fee)})
+                for s in session.plan.settlements
+            ]
+        }
+    )
+
+
 def _business_line(
     sessions: list[PlanSession],
     share: float,
@@ -349,7 +367,11 @@ def _business_line(
     voyage_ids: set[str] = set()
     for session in sessions:
         voyages = voyage_economics(
-            session.scenario, session.plan, share, ops_cost_per_voyage, variable_cost_per_pallet
+            session.scenario,
+            _refunded(session),
+            share,
+            ops_cost_per_voyage,
+            variable_cost_per_pallet,
         )
         voyage_ids.update(v.voyage_id for v in voyages)
         plans.append(
@@ -371,6 +393,9 @@ def _business_line(
     count = len(voyage_ids)
     annual_fixed = ops_cost_per_voyage * VOYAGES_PER_YEAR
     annual = round(contribution / count * VOYAGES_PER_YEAR) if count else None
+    gap = sum(p.tariff_operational_gap for p in plans)
+    annual_gap = round(gap / count * VOYAGES_PER_YEAR) if count else None
+    annual_net = annual - annual_fixed if annual is not None else None
     per_pallet = contribution / pallets if pallets else 0
     breakeven = round(ops_cost_per_voyage / per_pallet, 1) if per_pallet > 0 else None
     return BusinessLine(
@@ -385,9 +410,15 @@ def _business_line(
         contribution_margin=contribution,
         fixed_cost_allocation=fixed,
         platform_net=contribution - fixed,
+        settlement_gap=gap,
+        platform_net_with_settlement=contribution - fixed + gap,
         annual_contribution=annual,
         annual_fixed_cost=annual_fixed,
-        annual_net=annual - annual_fixed if annual is not None else None,
+        annual_net=annual_net,
+        annual_settlement_gap=annual_gap,
+        annual_net_with_settlement=annual_net + annual_gap
+        if annual_net is not None and annual_gap is not None
+        else None,
         breakeven_pallets_per_voyage=breakeven,
         remaining_pallets_per_voyage=round(max(0.0, breakeven - pallets / count), 1)
         if breakeven is not None and count
@@ -427,13 +458,17 @@ def platform_business(
                 value=ops_cost_per_voyage,
                 unit="원/항차",
                 source=f"가정: {PROPOSAL} 8-1 고정비 연 {ANNUAL_FIXED_COST:,}원 ÷ 연 "
-                f"{VOYAGES_PER_YEAR}항차(주 1회)",
+                f"{VOYAGES_PER_YEAR}항차(주 1회)"
+                if ops_cost_per_voyage == DEFAULT_OPS_COST_PER_VOYAGE
+                else "쿼리로 넣은 가정",
             ),
             Assumption(
                 key="variable_cost_per_pallet",
                 value=variable_cost_per_pallet,
                 unit="원/파렛트",
-                source="가정: 항차마다 드는 플랫폼 변동비. 기본 0원",
+                source="가정: 항차마다 드는 플랫폼 변동비. 기본 0원"
+                if variable_cost_per_pallet == 0
+                else "쿼리로 넣은 가정",
             ),
             Assumption(
                 key="voyages_per_year",
@@ -445,12 +480,16 @@ def platform_business(
         empty_slot_cost=sum(p.empty_slot_cost for p in lines[0].plans),
         empty_slot_definition=(
             "쓴 컨테이너의 빈 칸 비용 = 컨테이너 비용 × 빈 파렛트 ÷ 용량. "
-            "정산 단가(파렛트당)로 받지 못하는 몫. 순이익에서 빼지 않은 참고 항목"
+            "정산 단가(파렛트당)로 받지 못하는 몫. 정산 차이(settlement_gap)에 이미 들어 있어 "
+            "따로 빼지 않는 참고 항목"
         ),
         tariff_operational_gap=sum(p.tariff_operational_gap for p in lines[0].plans),
         tariff_operational_definition=(
             "화주 정산액(total_shared_cost) − 운영비(total_operational_cost). "
-            "음수면 정산 단가가 실제 운영비를 못 덮는다. 순이익에서 빼지 않은 참고 항목"
+            "음수면 정산 단가가 실제 운영비를 못 덮어 플랫폼(혼적 주선자)이 진다. "
+            "각 line 의 settlement_gap 으로 들어가 platform_net_with_settlement·"
+            "annual_net_with_settlement 에 더한다. "
+            "platform_net·annual_net 은 이 차이를 반영하지 않은 값"
         ),
         lines=lines,
     )

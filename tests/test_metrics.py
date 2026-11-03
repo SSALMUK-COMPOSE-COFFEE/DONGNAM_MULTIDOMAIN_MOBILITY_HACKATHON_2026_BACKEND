@@ -1,20 +1,27 @@
 from fastapi.testclient import TestClient
 from saas_fixtures import (
+    FORWARDER_ORG_ID,
     PLATFORM_ORG_ID,
     REAL_PLATFORM_EMAIL,
     REAL_PLATFORM_PASSWORD,
     create_real_platform,
     password_client,
 )
+from sqlalchemy import select
 
 from freshswitch_backend.analysis.emissions import AIR_G_PER_TKM, SEA_G_PER_TKM
+from freshswitch_backend.api.saas_metrics import region_of
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.main import app
+from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.seed import shipper_org_id
+from freshswitch_backend.persistence.tables import PlanForwarderRow, PlanRow
 from freshswitch_backend.planning.store import store
 
 MONTH = "2026-11"
 GRAPE = "grape_so2"
+REDUCE = {"type": "reduce", "lot_id": "lot-jinju-sb-1", "new_pallets": 2}
+REDUCE_AGAIN = {"type": "reduce", "lot_id": "lot-jinju-sb-1", "new_pallets": 1}
 
 
 def _scenario():
@@ -147,3 +154,142 @@ def test_metrics_month_validation(platform_client: TestClient) -> None:
     default = platform_client.get("/api/saas/platform/metrics")
     assert default.status_code == 200
     assert default.json()["month"] == MONTH
+
+
+def _apply(platform_client: TestClient, plan_id: str, event: dict) -> dict:
+    computed = platform_client.post(f"/api/plans/{plan_id}/events", json={"event": event})
+    assert computed.status_code == 200, computed.text
+    alternative = next(a["id"] for a in computed.json()["alternatives"] if a["feasible"])
+    applied = platform_client.post(
+        f"/api/plans/{plan_id}/apply",
+        json={"alternative_id": alternative, "replan_id": computed.json()["replan_id"]},
+    )
+    assert applied.status_code == 200, applied.text
+    return applied.json()
+
+
+def _commit(
+    platform_client: TestClient,
+    saas_login,
+    forwarder_client: TestClient,
+    plan_id: str,
+    order_id: str,
+) -> None:
+    order = platform_client.get(f"/api/plans/{plan_id}/orders/{order_id}").json()
+    for confirmation in order["shipper_confirmations"]:
+        if confirmation["status"] != "pending":
+            continue
+        shipper_id = confirmation["shipper_id"]
+        answered = saas_login(shipper_org_id(shipper_id)).post(
+            f"/api/saas/shipper/plans/{plan_id}/orders/{order_id}/confirm",
+            json={"accept": True, "shipper_id": shipper_id},
+        )
+        assert answered.status_code == 200, answered.text
+    done = forwarder_client.post(
+        f"/api/saas/forwarder/plans/{plan_id}/orders/{order_id}/confirm",
+        json={"accept": True},
+    )
+    assert done.status_code == 200, done.text
+
+
+def test_metrics_orders_and_replan_time(
+    platform_client: TestClient, saas_login, forwarder_client: TestClient
+) -> None:
+    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
+    with database.begin() as db:
+        db.add(PlanForwarderRow(plan_id=plan_id, forwarder_org_id=FORWARDER_ORG_ID))
+    first = _apply(platform_client, plan_id, REDUCE)["active_order_id"]
+    _commit(platform_client, saas_login, forwarder_client, plan_id, first)
+    _apply(platform_client, plan_id, REDUCE_AGAIN)
+    orders = platform_client.get(f"/api/plans/{plan_id}/orders").json()
+    statuses = [o["status"] for o in orders]
+    confirmed = sum(1 for s in statuses if s in ("forwarder_confirmed", "executed"))
+    assert confirmed >= 1
+    assert confirmed < len(statuses)
+    body = _metrics(platform_client)
+    rate = body["order_confirmation_rate"]
+    assert rate["numerator"] == confirmed
+    assert rate["denominator"] == len(statuses)
+    assert rate["value"] == round(confirmed / len(statuses), 4)
+    assert rate["reason"] is None
+    history = platform_client.get(f"/api/plans/{plan_id}/history").json()
+    applied = [h["solve_ms"] for h in history if h["kind"] == "apply"]
+    assert len(applied) == 2
+    replan = body["average_replan_ms"]
+    assert replan["denominator"] == len(applied)
+    assert replan["value"] == round(sum(applied) / len(applied), 1)
+    assert replan["reason"] is None
+
+
+def test_metrics_arrival_loss_gap(platform_client: TestClient, saas_login) -> None:
+    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
+    gaps = []
+    for lot_id, pct in (("lot-sancheong-sb-1", 9), ("lot-jinju-sb-1", 12)):
+        response = platform_client.post(
+            f"/api/plans/{plan_id}/settlement/arrival",
+            json={"lot_id": lot_id, "inspected_loss_pct": pct},
+        )
+        assert response.status_code == 200, response.text
+        record = response.json()
+        assert record["inspected_loss_rate"] > record["planned_loss_rate"]
+        gaps.append(record["inspected_loss_rate"] - record["planned_loss_rate"])
+    gap = _metrics(platform_client)["average_arrival_loss_gap"]
+    assert gap["denominator"] == len(gaps)
+    assert gap["value"] > 0
+    assert gap["value"] == round(sum(gaps) / len(gaps), 4)
+    assert gap["reason"] is None
+
+
+def test_metrics_skip_unknown_destination(platform_client: TestClient, saas_login) -> None:
+    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
+    before = _metrics(platform_client)["co2"]
+    assert before["skipped_pallets"] == 0
+    with database.begin() as db:
+        row = db.scalars(select(PlanRow).where(PlanRow.plan_id == plan_id)).one()
+        payload = dict(row.payload)
+        sea = {
+            a["lot_id"]: a["pallets"]
+            for a in payload["plan"]["assignments"]
+            if a["mode"] == "sea" and a["product_id"] != GRAPE
+        }
+        moved = next(iter(sea))
+        payload["scenario"] = {
+            **payload["scenario"],
+            "lots": [
+                {**lot, "destination": "SGSIN"} if lot["id"] == moved else lot
+                for lot in payload["scenario"]["lots"]
+            ],
+        }
+        row.payload = payload
+    co2 = _metrics(platform_client)["co2"]
+    assert co2["skipped_pallets"] == sea[moved] > 0
+    assert co2["skipped_reason"]
+    assert co2["air_avoided_pallets"] == before["air_avoided_pallets"]
+    assert sum(line["pallets"] for line in co2["lines"]) == (
+        co2["air_avoided_pallets"] - co2["skipped_pallets"]
+    )
+
+
+def test_region_full_province_names(platform_client: TestClient) -> None:
+    assert region_of("경상남도 하동") == "부울경"
+    assert region_of(" 경상북도 성주") == "경북"
+    assert region_of("부산광역시 강서구") == "부울경"
+    assert region_of("대구광역시 달성군") == "경북"
+    assert region_of("전남 순천") == "기타"
+    scenario = _scenario()
+    full = {"부울경": "경상남도 하동", "경북": "경상북도 성주"}
+    packhouses = [
+        p.model_copy(update={"region": full[region_of(p.region)]}) for p in scenario.packhouses
+    ]
+    store.create(scenario.model_copy(update={"packhouses": packhouses}), org_id=PLATFORM_ORG_ID)
+    regions = {r["region"]: r for r in _metrics(platform_client)["regions"]}
+    assert set(regions) == {"부울경", "경북"}
+    shipper_regions = {
+        s.id: region_of(next(p.region for p in scenario.packhouses if p.id == s.packhouse_id))
+        for s in scenario.shippers
+    }
+    participants = {lot.shipper_id for lot in scenario.lots}
+    for name, row in regions.items():
+        assert row["shipper_count"] == sum(
+            1 for s in participants if shipper_regions.get(s) == name
+        )

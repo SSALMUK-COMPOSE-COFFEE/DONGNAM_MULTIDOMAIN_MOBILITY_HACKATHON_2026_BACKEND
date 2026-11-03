@@ -138,3 +138,66 @@ def test_platform_business_uses_org_plans(platform_client: TestClient, saas_logi
     empty = platform_client.get("/api/saas/platform/business", params={"month": "2026-01"})
     assert empty.json()["plan_count"] == 0
     assert empty.json()["lines"][0]["annual_net"] is None
+
+
+def _business(client: TestClient, **params) -> dict:
+    response = client.get("/api/saas/platform/business", params={"month": "2026-11", **params})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_platform_business_settlement_gap(platform_client: TestClient, saas_login) -> None:
+    _platform_plan(platform_client, saas_login)
+    body = _business(platform_client)
+    for line in body["lines"]:
+        gap = sum(p["tariff_operational_gap"] for p in line["plans"])
+        assert line["settlement_gap"] == gap == body["tariff_operational_gap"]
+        assert line["platform_net_with_settlement"] == line["platform_net"] + gap
+        count = line["voyage_count"]
+        assert line["annual_settlement_gap"] == round(gap / count * 52)
+        assert line["annual_net_with_settlement"] == (
+            line["annual_net"] + line["annual_settlement_gap"]
+        )
+    empty = _business(platform_client, month="2026-01")["lines"][0]
+    assert empty["settlement_gap"] == 0
+    assert empty["annual_settlement_gap"] is None
+    assert empty["annual_net_with_settlement"] is None
+
+
+def test_platform_business_applies_quality_refund(platform_client: TestClient, saas_login) -> None:
+    session = _platform_plan(platform_client, saas_login)
+    plan_id = session["plan_id"]
+    before = _business(platform_client)["lines"][0]
+    arrival = platform_client.post(
+        f"/api/plans/{plan_id}/settlement/arrival",
+        json={"lot_id": "lot-sancheong-sb-1", "inspected_loss_pct": 9},
+    )
+    assert arrival.status_code == 200, arrival.text
+    metrics = platform_client.get("/api/saas/platform/metrics", params={"month": "2026-11"})
+    refund = metrics.json()["quality_refund_krw"]
+    assert refund > 0
+    after = _business(platform_client)["lines"][0]
+    stored = store.get(plan_id, org_id=PLATFORM_ORG_ID)
+    assert stored is not None
+    shipper = next(lot.shipper_id for lot in stored.scenario.lots if lot.id == "lot-sancheong-sb-1")
+    assert all(a.mode == "sea" for a in stored.plan.assignments if a.shipper_id == shipper)
+    assert after["fee_revenue"] == before["fee_revenue"] - refund
+    assert after["contribution_margin"] == before["contribution_margin"] - refund
+    assert after["platform_net"] == before["platform_net"] - refund
+    sea_fee = sum(
+        s.fee
+        for s in stored.plan.settlements
+        if any(a.shipper_id == s.shipper_id and a.mode == "sea" for a in stored.plan.assignments)
+    )
+    assert before["fee_revenue"] == sea_fee
+    assert after["fee_revenue"] == sea_fee - refund
+
+
+def test_platform_business_override_source(platform_client: TestClient) -> None:
+    default = {a["key"]: a["source"] for a in _business(platform_client)["assumptions"]}
+    assert "8-1" in default["ops_cost_per_voyage"]
+    assert default["variable_cost_per_pallet"].startswith("가정")
+    body = _business(platform_client, ops_cost_per_voyage=1, variable_cost_per_pallet=5)
+    sources = {a["key"]: a["source"] for a in body["assumptions"]}
+    assert sources["ops_cost_per_voyage"] == "쿼리로 넣은 가정"
+    assert sources["variable_cost_per_pallet"] == "쿼리로 넣은 가정"
