@@ -81,6 +81,7 @@ class Voyage(Sourced):
     cy_cutoff: KstDatetime
     transit_days: float
     original_etd: KstDatetime | None = None
+    call_sign: str | None = None
 
 
 class Container(Sourced):

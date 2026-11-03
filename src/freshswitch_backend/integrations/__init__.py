@@ -13,12 +13,15 @@ from freshswitch_backend.integrations.mof_snapshot import (
 from freshswitch_backend.integrations.mof_vessel import (
     BUSAN_PORT_CODE,
     MAX_GAP_HOURS,
+    DepartureMatch,
     MofVesselApiError,
     MofVesselClient,
     PlannedVoyage,
     ScheduleChange,
     VesselMovement,
     detect_schedule_changes,
+    match_departures,
+    normalize_call_sign,
     normalize_vessel_name,
     parse_movements,
 )
@@ -26,6 +29,7 @@ from freshswitch_backend.integrations.mof_vessel import (
 __all__ = [
     "BUSAN_PORT_CODE",
     "MAX_GAP_HOURS",
+    "DepartureMatch",
     "MissingServiceKey",
     "MofVesselApiError",
     "MofVesselClient",
@@ -40,6 +44,8 @@ __all__ = [
     "VesselMovement",
     "demo_movements",
     "detect_schedule_changes",
+    "match_departures",
+    "normalize_call_sign",
     "normalize_vessel_name",
     "parse_movements",
 ]
