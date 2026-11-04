@@ -649,6 +649,7 @@ def _start_session(
     ttl = timedelta(seconds=settings.session_ttl)
     if user.is_demo:
         ttl = min(ttl, DEMO_SESSION_TTL)
+    cookie_ttl = ttl
     if user.world_id:
         world = db.get(SandboxWorldRow, user.world_id)
         if world is not None:
@@ -675,7 +676,7 @@ def _start_session(
             last_seen_at=now,
         )
     )
-    _set_cookie(response, settings, token, ttl)
+    _set_cookie(response, settings, token, cookie_ttl)
     return _me(db, user, memberships, active)
 
 
