@@ -9,7 +9,9 @@ from freshswitch_backend.api.auth import OptionalPrincipal, Principal, app_setti
 from freshswitch_backend.api.compute_limits import analysis_rate, run_analysis
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import Scenario
+from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.orgs import org_sandbox
+from freshswitch_backend.persistence.tables import SandboxWorldRow
 from freshswitch_backend.quality import (
     LearningScope,
     QualityAccessDenied,
@@ -173,6 +175,11 @@ def delete_observation(obs_id: str, target: Target) -> None:
 
 @router.post("/reset")
 def reset(target: Target, seed: Annotated[bool, Query()] = True) -> ResetResult:
+    scope = target.scope
+    if isinstance(scope, ScopeRef) and scope.kind == "sandbox" and scope.world_id:
+        with database.begin() as db:
+            if db.get(SandboxWorldRow, scope.world_id) is None:
+                raise HTTPException(status_code=404, detail="세계를 찾을 수 없습니다")
     try:
         cleared, seeded = quality_history.reset(
             seed=seed, org_type=target.org_type, scope=target.scope

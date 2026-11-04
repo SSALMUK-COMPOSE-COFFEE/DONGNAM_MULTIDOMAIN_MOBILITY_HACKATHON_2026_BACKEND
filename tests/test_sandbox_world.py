@@ -5,13 +5,14 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from fastapi.testclient import TestClient
 from saas_fixtures import SAAS_CSRF
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from freshswitch_backend.coldchain import coldchain_store
 from freshswitch_backend.config import get_settings
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.main import create_app
 from freshswitch_backend.persistence import database, sandbox_reset
+from freshswitch_backend.persistence import sandbox_world as sandbox_world_module
 from freshswitch_backend.persistence.sandbox_world import (
     SEED_ID,
     create_visitor_world,
@@ -112,7 +113,7 @@ def test_two_visitors_are_isolated(saas_app) -> None:
     deadline = time.monotonic() + 5
     while run_b.info.sent < 2 and time.monotonic() < deadline:
         time.sleep(0.01)
-    with sandbox_reset._exclusive():
+    with sandbox_reset.demo_reset_lock():
         held = run_b.info.sent
         time.sleep(INTERVAL * 4)
         assert run_b.info.sent > held
@@ -130,25 +131,18 @@ def test_two_visitors_are_isolated(saas_app) -> None:
     assert foreign.status_code == 422
     other_lot = lots_b[0]
     added = client_a.post(
-        f"/api/plans/{plan_a['plan_id']}/events",
-        json={
-            "event": {
-                "type": "add_lot",
-                "lot": {
-                    "id": other_lot["id"],
-                    "shipper_id": other_lot["shipper_id"],
-                    "product_id": other_lot["product_id"],
-                    "pallets": other_lot["pallets"],
-                    "ready_date": other_lot["ready_date"],
-                    "destination": other_lot["destination"],
-                    "sell_by_date": other_lot["sell_by_date"],
-                },
-            }
-        },
+        f"/api/saas/platform/plans/{plan_a['plan_id']}/add-lot",
+        json={"lot_id": other_lot["id"]},
     )
-    assert added.status_code != 200
+    assert added.status_code == 404
+    assert added.json()["detail"] == "등록된 출하를 찾을 수 없습니다"
     owned = {lot["id"] for lot in client_a.get(f"/api/plans/{plan_a['plan_id']}").json()["scenario"]["lots"]}
     assert other_lot["id"] not in owned
+    with database.begin() as db:
+        foreign = db.get(LotRow, other_lot["id"])
+        assert foreign is not None
+        assert foreign.status == "planned"
+        assert foreign.shipper_org_id.startswith(me_b["world"]["world_id"])
     catalog = client_a.get("/api/saas/catalog").json()
     bare = []
     for shipper_row in catalog["shippers"]:
@@ -252,6 +246,32 @@ def test_world_cap_drops_planless_then_rejects(saas_app) -> None:
     assert response.status_code == 429, response.text
     assert response.headers["retry-after"] == "60"
     assert "가득" in response.json()["detail"]
+    now = datetime.now(UTC)
+    with database.begin() as db:
+        ordered = list(
+            db.scalars(
+                select(SandboxWorldRow.id)
+                .where(SandboxWorldRow.id != SEED_ID)
+                .order_by(SandboxWorldRow.created_at, SandboxWorldRow.id)
+            )
+        )
+        oldest = ordered[0]
+        newest = ordered[-1]
+        db.execute(update(AuthSessionRow).values(last_seen_at=now - timedelta(hours=2)))
+        newest_users = select(UserRow.id).where(UserRow.world_id == newest)
+        db.execute(
+            update(AuthSessionRow)
+            .where(AuthSessionRow.user_id.in_(newest_users))
+            .values(last_seen_at=now)
+        )
+    opened = blocked.post("/api/auth/demo-login", json={"new_world": True})
+    assert opened.status_code == 200, opened.text
+    with database.begin() as db:
+        assert db.get(SandboxWorldRow, oldest) is None
+        assert db.get(SandboxWorldRow, newest) is not None
+        living = list(db.scalars(select(SandboxWorldRow.id).where(SandboxWorldRow.id != SEED_ID)))
+    assert len(living) == 40
+    assert opened.json()["world"]["world_id"] in living
 
 
 def test_role_switch_stays_in_the_world(saas_app) -> None:
@@ -324,8 +344,16 @@ def test_reset_is_per_world(saas_app, reset_admin_headers) -> None:
         assert db.get(SandboxWorldRow, SEED_ID) is not None
         assert db.get(OrganizationRow, DEMO_ORG) is not None
         assert db.get(SandboxWorldRow, me_b["world"]["world_id"]) is not None
+    missing_world = admin.post(
+        "/api/demo/reset", params={"scope": "sandbox", "world_id": "wdeadbeef0000"}
+    )
+    assert missing_world.status_code == 404
     bare = admin.post("/api/quality/reset", params={"scope": "sandbox"})
     assert bare.status_code == 422
+    missing_quality = admin.post(
+        "/api/quality/reset", params={"scope": "sandbox", "world_id": "wdeadbeef0000"}
+    )
+    assert missing_quality.status_code == 404
     quality = admin.post(
         "/api/quality/reset",
         params={"scope": "sandbox", "world_id": me_b["world"]["world_id"]},
@@ -361,3 +389,124 @@ def test_live_device_ids_stay_apart(saas_app) -> None:
     assert demo_name.status_code == 422
     world_name = live.post("/api/saas/devices", json={"device_id": f"d{token}-x"})
     assert world_name.status_code == 422
+    borrowed = live.post(
+        "/api/coldchain/bindings",
+        json={"device_id": "sim-09", "container_id": "CA-01"},
+    )
+    assert borrowed.status_code == 422
+
+
+def test_purge_continues_when_one_world_fails(saas_app, monkeypatch) -> None:
+    ids = []
+    for _ in range(2):
+        _, me = _client(saas_app)
+        ids.append(me["world"]["world_id"])
+    with database.begin() as db:
+        for world_id in ids:
+            world = db.get(SandboxWorldRow, world_id)
+            assert world is not None
+            world.expires_at = datetime.now(UTC) - timedelta(seconds=5)
+    real = sandbox_world_module.delete_world
+
+    def flaky(world_id: str, *, allow_seed: bool = False) -> bool:
+        if world_id == ids[0]:
+            raise RuntimeError("boom")
+        return real(world_id, allow_seed=allow_seed)
+
+    monkeypatch.setattr(sandbox_world_module, "delete_world", flaky)
+    assert purge_expired_worlds() == 1
+    with database.begin() as db:
+        assert db.get(SandboxWorldRow, ids[0]) is not None
+        assert db.get(SandboxWorldRow, ids[1]) is None
+
+
+def test_create_skips_a_world_that_cannot_be_evicted(saas_app, monkeypatch) -> None:
+    monkeypatch.setattr(sandbox_world_module, "MAX_WORLDS", 1)
+    _, me = _client(saas_app)
+    stuck = me["world"]["world_id"]
+    real = sandbox_world_module.delete_world
+
+    def flaky(world_id: str, *, allow_seed: bool = False) -> bool:
+        if world_id == stuck:
+            raise RuntimeError("boom")
+        return real(world_id, allow_seed=allow_seed)
+
+    monkeypatch.setattr(sandbox_world_module, "delete_world", flaky)
+    blocked = TestClient(saas_app, base_url="https://testserver", headers=CSRF)
+    response = blocked.post("/api/auth/demo-login", json={"new_world": True})
+    assert response.status_code == 429, response.text
+    with database.begin() as db:
+        assert db.get(SandboxWorldRow, stuck) is not None
+
+
+def test_visitor_registers_plans_assigns_and_simulates(saas_app) -> None:
+    client, me = _client(saas_app)
+    world_id = me["world"]["world_id"]
+    assert world_id.startswith("w") and len(world_id) == 13
+    platform = me["active_org"]["org_id"]
+    shipper = next(item["org_id"] for item in me["memberships"] if item["org_id"].endswith("shipper-jinju"))
+    forwarder = next(
+        item["org_id"] for item in me["memberships"] if item["org_id"].endswith("forwarder-dongnam")
+    )
+    switched = client.put("/api/auth/active-org", json={"org_id": shipper})
+    assert switched.status_code == 200, switched.text
+    created = client.post(
+        "/api/saas/shipper/lots",
+        json={
+            "product": "strawberry",
+            "pallets": 8,
+            "ready_date": "2026-11-16",
+            "destination": "HKHKG",
+            "sell_by_date": "2026-11-23",
+            "lot_id": "client-should-ignore",
+        },
+    )
+    assert created.status_code == 201, created.text
+    lot_id = created.json()["registered"]["id"]
+    assert lot_id.startswith(f"lot-{world_id}-")
+    assert lot_id != "client-should-ignore"
+    assert client.put("/api/auth/active-org", json={"org_id": platform}).status_code == 200
+    planned = client.post(
+        "/api/saas/platform/plans",
+        json={"lot_ids": [lot_id], "include_registered": True},
+    )
+    assert planned.status_code == 201, planned.text
+    body = planned.json()
+    plan_id = body["plan_id"]
+    assert lot_id in {lot["id"] for lot in body["scenario"]["lots"]}
+    loaded = [item for item in body["plan"]["containers"] if item["used"]]
+    assert loaded
+    assert any(lot_id in item["lot_ids"] for item in loaded)
+    container_id = next(item["container_id"] for item in loaded if lot_id in item["lot_ids"])
+    assigned = client.put(
+        f"/api/saas/platform/plans/{plan_id}/forwarder",
+        json={"forwarder_org_id": forwarder},
+    )
+    assert assigned.status_code == 200, assigned.text
+    assert assigned.json()["forwarder"]["org_id"] == forwarder
+    assert client.put("/api/auth/active-org", json={"org_id": forwarder}).status_code == 200
+    visible = client.get("/api/saas/forwarder/plans")
+    assert visible.status_code == 200, visible.text
+    assert plan_id in {item["plan_id"] for item in visible.json()}
+    assert client.put("/api/auth/active-org", json={"org_id": platform}).status_code == 200
+    simulated = client.post(
+        "/api/coldchain/simulate",
+        json={
+            "preset": "power_cut_restore",
+            "plan_id": plan_id,
+            "container_id": container_id,
+            "device_id": "sim-01",
+        },
+    )
+    assert simulated.status_code == 200, simulated.text
+    assert simulated.json()["device_id"] == f"sim-{world_id[1:]}-01"
+    assert simulated.json()["done"] is True
+    state = client.get(f"/api/coldchain/containers/{container_id}", params={"plan_id": plan_id})
+    assert state.status_code == 200, state.text
+    assert state.json()["reading_count"] > 0
+    assert client.put("/api/auth/active-org", json={"org_id": forwarder}).status_code == 200
+    forwarder_state = client.get(
+        f"/api/coldchain/containers/{container_id}", params={"plan_id": plan_id}
+    )
+    assert forwarder_state.status_code == 200, forwarder_state.text
+    assert forwarder_state.json()["reading_count"] > 0

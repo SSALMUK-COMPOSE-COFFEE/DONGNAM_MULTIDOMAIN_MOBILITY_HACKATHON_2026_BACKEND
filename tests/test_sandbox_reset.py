@@ -328,6 +328,23 @@ def _sandbox_activity(platform: TestClient, shipper: TestClient) -> tuple[str, s
     return plan_id, device_id, world_id
 
 
+def _lots_for(world_id: str) -> list:
+    prefix = f"{world_id}-"
+    return [row for row in _sandbox_snapshot()["lots"] if row[1].startswith(prefix)]
+
+
+def _lots_except(world_id: str) -> list:
+    prefix = f"{world_id}-"
+    return [row for row in _sandbox_snapshot()["lots"] if not row[1].startswith(prefix)]
+
+
+def _world_observations(world_id: str) -> list[str]:
+    with database.begin() as db:
+        return sorted(
+            db.scalars(select(ObservationRow.id).where(ObservationRow.world_id == world_id))
+        )
+
+
 def _sandbox_snapshot() -> dict:
     with database.begin() as db:
         sandbox_orgs = select(OrganizationRow.id).where(OrganizationRow.sandbox.is_(True))
@@ -395,7 +412,16 @@ def test_admin_reset_restores_baseline_and_keeps_real_data(
     real_client = password_client(saas_app, REAL_PLATFORM_EMAIL, REAL_PLATFORM_PASSWORD)
     platform = login_client(PLATFORM_ORG_ID, saas_app)
     shipper = login_client(SHIPPER_ORG_ID, saas_app)
-    _, device_id, world_id = _sandbox_activity(platform, shipper)
+    world_id = platform.get("/api/me").json()["world"]["world_id"]
+    visitor_before = _lots_for(world_id)
+    rest_before = _lots_except(world_id)
+    observations_before = _world_observations(world_id)
+    assert len(visitor_before) == 6
+    assert rest_before == seed_lots
+    assert len(observations_before) == 6
+    assert all(status == "registered" for _, _, status, _, _ in visitor_before)
+    _, device_id, activity_world = _sandbox_activity(platform, shipper)
+    assert activity_world == world_id
     real_before = _real_snapshot()
     dirty = _sandbox_snapshot()
     assert dirty["plans"] == 1 and dirty["forwarders"] == 1
@@ -418,16 +444,14 @@ def test_admin_reset_restores_baseline_and_keeps_real_data(
     assert datetime.fromisoformat(body["reset_at"]) == BASE_NOW
 
     after = _sandbox_snapshot()
-    assert len(after["lots"]) == 12
-    assert all(status == "registered" for _, _, status, _, _ in after["lots"])
-    assert set(seed_lots) <= set(after["lots"])
+    assert _lots_for(world_id) == visitor_before
+    assert _lots_except(world_id) == rest_before
+    assert _world_observations(world_id) == observations_before
     wiped = ("plans", "forwarders", "pending", "orders", "idempotency", "containers")
     for key in (*wiped, "readings", "alerts", "bindings", "runs"):
         assert after[key] == 0, key
     assert after["devices"] == []
     assert "sbx-manual" not in after["observations"]
-    visitor_seed = {f"{world_id}-{item.id}" for item in quality_history._seed}
-    assert visitor_seed <= set(after["observations"])
     assert _real_snapshot() == real_before
     assert real_client.get("/api/me").status_code == 200
     assert platform.get("/api/me").status_code == 401
@@ -592,12 +616,17 @@ def test_reset_logs_out_first_and_drops_plans_written_mid_reset(
         if not seen:
             seen.append(other.get("/api/me").status_code)
             _late_plan("plan-mid-early", [], org_id)
+            real_erase(db, world_id, org_ids, keep_structure=keep_structure)
             _late_plan("plan-mid-late", [], org_id)
+            return
         real_erase(db, world_id, org_ids, keep_structure=keep_structure)
 
     monkeypatch.setattr(sandbox_world, "erase_world", erase)
     assert platform.post("/api/saas/sandbox/reset").status_code == 200
     assert seen == [401]
+    with database.begin() as db:
+        assert db.get(PlanRow, "plan-mid-early") is None
+        assert db.get(PlanRow, "plan-mid-late") is None
     after = _sandbox_snapshot()
     assert after["plans"] == 0
     assert len(after["lots"]) == 6

@@ -1,11 +1,13 @@
+import logging
 import re
 import secrets
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, exists, func, select, text, update
+from sqlalchemy import delete, exists, func, or_, select, text, update
 from sqlalchemy.orm import Session
 
 from freshswitch_backend.coldchain import coldchain_store
@@ -32,11 +34,17 @@ from freshswitch_backend.persistence.tables import (
 )
 from freshswitch_backend.quality.store import quality_history
 
+logger = logging.getLogger(__name__)
+
 SEED_ID = "seed"
 SEED_EXPIRES = datetime(2099, 1, 1, tzinfo=UTC)
 MAX_WORLDS = 40
 INITIAL_TTL = timedelta(hours=2)
 PLAN_TTL = timedelta(hours=12)
+IDLE_EVICT_AFTER = timedelta(hours=1)
+_create_thread_lock = threading.Lock()
+_world_thread_guard = threading.Lock()
+_world_thread_locks: dict[str, threading.Lock] = {}
 
 
 class WorldCapacityError(Exception):
@@ -91,19 +99,26 @@ def _session_lock(statement: str, params: dict[str, object]) -> Iterator[None]:
             conn.close()
 
 
+def _world_thread_lock(world_id: str) -> threading.Lock:
+    with _world_thread_guard:
+        lock = _world_thread_locks.get(world_id)
+        if lock is None:
+            lock = threading.Lock()
+            _world_thread_locks[world_id] = lock
+        return lock
+
+
 @contextmanager
 def lock_world(world_id: str) -> Iterator[None]:
-    with _session_lock(
+    with _world_thread_lock(world_id), _session_lock(
         "SELECT pg_advisory_lock(:key, hashtext(:world))",
         {"key": WORLD_LOCK, "world": world_id},
     ):
         yield
 
 
-@contextmanager
-def _create_lock() -> Iterator[None]:
-    with _session_lock("SELECT pg_advisory_lock(:key)", {"key": WORLD_CREATE_LOCK}):
-        yield
+def _lock_create(db: Session) -> None:
+    db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": WORLD_CREATE_LOCK})
 
 
 def _org_ids(db: Session, world_id: str) -> list[str]:
@@ -127,21 +142,52 @@ def _live_count(db: Session, now: datetime) -> int:
     )
 
 
-def _planless_ids(db: Session, now: datetime) -> list[str]:
-    has_plan = exists(
+def _has_plan():
+    return exists(
         select(PlanRow.plan_id)
         .join(OrganizationRow, OrganizationRow.id == PlanRow.org_id)
         .where(OrganizationRow.world_id == SandboxWorldRow.id)
     )
+
+
+def _last_seen():
+    return (
+        select(func.max(AuthSessionRow.last_seen_at))
+        .select_from(AuthSessionRow)
+        .join(UserRow, UserRow.id == AuthSessionRow.user_id)
+        .where(UserRow.world_id == SandboxWorldRow.id)
+        .correlate(SandboxWorldRow)
+        .scalar_subquery()
+    )
+
+
+def _planless_ids(db: Session, now: datetime) -> list[str]:
     return list(
         db.scalars(
             select(SandboxWorldRow.id)
             .where(
                 SandboxWorldRow.expires_at >= now,
                 SandboxWorldRow.id != SEED_ID,
-                ~has_plan,
+                ~_has_plan(),
             )
             .order_by(SandboxWorldRow.created_at, SandboxWorldRow.id)
+        )
+    )
+
+
+def _idle_planned_ids(db: Session, now: datetime) -> list[str]:
+    seen = _last_seen()
+    cutoff = now - IDLE_EVICT_AFTER
+    return list(
+        db.scalars(
+            select(SandboxWorldRow.id)
+            .where(
+                SandboxWorldRow.expires_at >= now,
+                SandboxWorldRow.id != SEED_ID,
+                _has_plan(),
+                or_(seen.is_(None), seen < cutoff),
+            )
+            .order_by(seen.asc().nulls_first(), SandboxWorldRow.created_at, SandboxWorldRow.id)
         )
     )
 
@@ -373,6 +419,14 @@ def delete_world(world_id: str, *, allow_seed: bool = False) -> bool:
     return True
 
 
+def _forget(world_id: str, failed: set[str]) -> None:
+    try:
+        delete_world(world_id, allow_seed=True)
+    except Exception:
+        logger.exception("세계 %s 삭제에 실패했습니다", world_id)
+        failed.add(world_id)
+
+
 def purge_expired_worlds(now: datetime | None = None) -> int:
     moment = now or _now()
     with database.begin() as db:
@@ -381,15 +435,20 @@ def purge_expired_worlds(now: datetime | None = None) -> int:
         )
     removed = 0
     for world_id in ids:
-        if delete_world(world_id, allow_seed=True):
-            removed += 1
+        try:
+            if delete_world(world_id, allow_seed=True):
+                removed += 1
+        except Exception:
+            logger.exception("세계 %s 삭제에 실패했습니다", world_id)
     return removed
 
 
-def _victims(db: Session, now: datetime) -> list[str]:
+def _victims(db: Session, now: datetime, failed: set[str]) -> list[str]:
     projected = _live_count(db, now)
     chosen: list[str] = []
-    for world_id in _planless_ids(db, now):
+    for world_id in [*_planless_ids(db, now), *_idle_planned_ids(db, now)]:
+        if world_id in failed:
+            continue
         if projected < MAX_WORLDS:
             break
         chosen.append(world_id)
@@ -397,20 +456,30 @@ def _victims(db: Session, now: datetime) -> list[str]:
     return chosen
 
 
+def _expired_ids(db: Session, now: datetime) -> list[str]:
+    return list(db.scalars(select(SandboxWorldRow.id).where(SandboxWorldRow.expires_at < now)))
+
+
 def create_visitor_world(now: datetime | None = None) -> VisitorWorld:
     moment = now or _now()
-    with _create_lock():
-        with database.begin() as db:
-            expired = list(
-                db.scalars(select(SandboxWorldRow.id).where(SandboxWorldRow.expires_at < moment))
-            )
-            victims = _victims(db, moment)
-        for world_id in [*expired, *victims]:
-            delete_world(world_id, allow_seed=True)
-        with database.begin() as db:
-            if _live_count(db, moment) >= MAX_WORLDS:
-                raise WorldCapacityError
-            return _insert_world(db, moment)
+    failed: set[str] = set()
+    with _create_thread_lock:
+        for _ in range(MAX_WORLDS + 1):
+            with database.begin() as db:
+                _lock_create(db)
+                pending = [
+                    world_id
+                    for world_id in _expired_ids(db, moment)
+                    if world_id not in failed
+                ]
+                pending.extend(_victims(db, moment, failed))
+                if not pending:
+                    if _live_count(db, moment) >= MAX_WORLDS:
+                        raise WorldCapacityError
+                    return _insert_world(db, moment)
+            for world_id in pending:
+                _forget(world_id, failed)
+        raise WorldCapacityError
 
 
 def extend_first_plan(db: Session, org_id: str) -> None:

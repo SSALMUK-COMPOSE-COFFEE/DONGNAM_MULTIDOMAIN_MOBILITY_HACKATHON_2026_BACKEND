@@ -11,6 +11,7 @@ from freshswitch_backend.persistence.sandbox_reset import (
     SandboxResetResult,
     reset_sandbox,
 )
+from freshswitch_backend.persistence.sandbox_world import WorldNotFound
 
 router = APIRouter(prefix="/saas/sandbox", tags=["saas-sandbox"])
 
@@ -62,6 +63,8 @@ def reset_world(request: Request, principal: PlatformPrincipal) -> SandboxResetR
             cooldown=RESET_COOLDOWN,
             world_id=principal.world_id,
         )
+    except WorldNotFound as exc:
+        raise HTTPException(status_code=404, detail="세계를 찾을 수 없습니다") from exc
     except SandboxResetCooldown as exc:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
