@@ -4,11 +4,10 @@ from collections import defaultdict
 from collections.abc import Iterable
 
 from freshswitch_backend.analysis.common import (
-    PROPOSAL_EVENT,
     REPLAN_LIMIT_S,
     container_fill,
     locations,
-    proposal_event_applies,
+    proposal_event,
     route_costed,
     solve,
     solve_routed,
@@ -491,12 +490,11 @@ def settlement_fcfs_explanation(scenario: Scenario, plan: Plan, gaps: list[Metho
 def replan_benchmark(
     scenario: Scenario, plan: Plan | None = None, air_locked: Iterable[str] = ()
 ) -> ReplanBenchmark | None:
-    if not proposal_event_applies(scenario):
+    event = proposal_event(scenario)
+    if event is None:
         return None
     base = plan if plan is not None else solve(scenario)
-    result = replan(
-        scenario, base, PROPOSAL_EVENT, air_locked=air_locked, time_limit_s=REPLAN_LIMIT_S
-    )
+    result = replan(scenario, base, event, air_locked=air_locked, time_limit_s=REPLAN_LIMIT_S)
     manual = next(a for a in result.alternatives if a.id == "sail_as_is")
     rows = [
         ReplanBenchmarkRow(
@@ -519,7 +517,7 @@ def replan_benchmark(
     ]
     chosen = next((a for a in result.alternatives if a.id == result.recommended_id), manual)
     return ReplanBenchmark(
-        event=PROPOSAL_EVENT.model_dump(),
+        event=event.model_dump(),
         recommended_id=result.recommended_id,
         rows=rows,
         improvement_vs_manual=manual.total_cost - chosen.total_cost,

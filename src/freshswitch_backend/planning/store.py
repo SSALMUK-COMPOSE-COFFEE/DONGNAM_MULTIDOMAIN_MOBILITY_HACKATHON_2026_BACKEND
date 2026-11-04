@@ -671,6 +671,20 @@ def _registered_add(db: Session, row: PlanRow, event: Event) -> str | None:
     return event.lot.id
 
 
+def _same_claim_world(owner: Any, shipper: Any) -> bool:
+    if owner is None or shipper is None:
+        return False
+    if owner.world_id is not None:
+        return owner.world_id == shipper.world_id
+    return (
+        shipper.world_id is None
+        and not owner.sandbox
+        and not shipper.sandbox
+        and owner.type != "demo"
+        and shipper.type != "demo"
+    )
+
+
 def _claim_added(
     db: Session, owner_org: str, event: AddLotEvent, now: datetime, required: bool = False
 ) -> str | None:
@@ -680,14 +694,16 @@ def _claim_added(
         if required:
             raise LotTaken([lot_id])
         return None
-    worlds = dict(
-        db.execute(
-            select(OrganizationRow.id, OrganizationRow.sandbox).where(
-                OrganizationRow.id.in_((owner_org, lot.shipper_org_id))
-            )
-        ).all()
-    )
-    if worlds.get(owner_org) != worlds.get(lot.shipper_org_id):
+    rows = db.execute(
+        select(
+            OrganizationRow.id,
+            OrganizationRow.world_id,
+            OrganizationRow.sandbox,
+            OrganizationRow.type,
+        ).where(OrganizationRow.id.in_((owner_org, lot.shipper_org_id)))
+    ).all()
+    found = {row.id: row for row in rows}
+    if not _same_claim_world(found.get(owner_org), found.get(lot.shipper_org_id)):
         raise LotTaken([lot_id])
     try:
         claim_lots(db, [event.lot], now)
@@ -1068,6 +1084,9 @@ class SessionStore:
             )
             db.add(row)
             db.flush()
+            from freshswitch_backend.persistence.sandbox_world import extend_first_plan
+
+            extend_first_plan(db, org_id)
             if (
                 exclusive
                 and org_id != DEMO_ORG

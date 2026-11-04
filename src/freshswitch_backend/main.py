@@ -1,6 +1,9 @@
 import json
 import logging
 import math
+import os
+import threading
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from urllib.parse import unquote_plus
@@ -146,8 +149,22 @@ def _reject(where: str) -> JSONResponse:
 
 
 def _startup() -> None:
+    from freshswitch_backend.persistence.sandbox_world import purge_expired_worlds
+
     database.init()
     coldchain_store.finish_orphan_runs()
+    purge_expired_worlds()
+
+
+def _purge_forever(interval: int) -> None:
+    from freshswitch_backend.persistence.sandbox_world import purge_expired_worlds
+
+    while True:
+        time.sleep(interval)
+        try:
+            purge_expired_worlds()
+        except Exception:
+            logger.exception("만료된 데모 세계 정리 실패")
 
 
 @asynccontextmanager
@@ -156,6 +173,18 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await run_in_threadpool(_startup)
     except Exception:
         logger.exception("DB 초기화 실패. 첫 요청 때 다시 시도한다")
+    settings = get_settings()
+    if (
+        settings.saas_mode
+        and settings.sandbox_purge_interval_seconds > 0
+        and not os.environ.get("PYTEST_CURRENT_TEST")
+    ):
+        threading.Thread(
+            target=_purge_forever,
+            args=(settings.sandbox_purge_interval_seconds,),
+            daemon=True,
+            name="sandbox-purge",
+        ).start()
     yield
     coldchain_store.stop_all()
 

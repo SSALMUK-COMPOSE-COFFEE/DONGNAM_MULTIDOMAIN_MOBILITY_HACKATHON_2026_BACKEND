@@ -1,6 +1,6 @@
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import FORWARDER_ORG_ID, OTHER_FORWARDER_ORG_ID, PLATFORM_ORG_ID, login_client
+from saas_fixtures import FORWARDER_ORG_ID, OTHER_FORWARDER_ORG_ID, PLATFORM_ORG_ID, seed_client
 
 from freshswitch_backend.api.auth import Principal
 from freshswitch_backend.api.saas_access import PlanAccess, plan_for
@@ -35,11 +35,11 @@ def _platform_plan(saas_app) -> tuple[TestClient, str]:
     assert scenario is not None
     ids = []
     for lot in scenario.lots:
-        shipper = login_client(shipper_org_id(lot.shipper_id), saas_app)
+        shipper = seed_client(shipper_org_id(lot.shipper_id), saas_app)
         response = shipper.post("/api/saas/shipper/lots", json=_lot_body(lot))
         assert response.status_code == 201, response.text
         ids.append(response.json()["registered"]["id"])
-    platform = login_client(PLATFORM_ORG_ID, saas_app)
+    platform = seed_client(PLATFORM_ORG_ID, saas_app)
     created = platform.post("/api/saas/platform/plans", json={"lot_ids": ids})
     assert created.status_code == 201, created.text
     return platform, created.json()["plan_id"]
@@ -83,8 +83,8 @@ def test_assignment_drives_forwarder_access_across_routers(saas_app) -> None:
     )
     assert run.status_code == 200, run.text
 
-    forwarder = login_client(FORWARDER_ORG_ID, saas_app)
-    outsider = login_client(OTHER_FORWARDER_ORG_ID, saas_app)
+    forwarder = seed_client(FORWARDER_ORG_ID, saas_app)
+    outsider = seed_client(OTHER_FORWARDER_ORG_ID, saas_app)
     assert set(_forwarder_reads(forwarder, plan_id).values()) == {404}
     assert forwarder.get("/api/saas/forwarder/plans").json() == []
 

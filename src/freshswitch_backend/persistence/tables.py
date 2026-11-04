@@ -27,6 +27,10 @@ DEMO_SCOPE = "demo"
 LEARNING_SCOPES = ("demo", "sandbox", "live")
 ORG_TYPES = ("platform", "shipper", "forwarder", "demo")
 MEMBERSHIP_ROLES = ("admin", "member")
+WORLD_SCOPE_CHECK = (
+    "(scope = 'sandbox' AND world_id IS NOT NULL) OR "
+    "(scope IN ('demo', 'live') AND world_id IS NULL)"
+)
 
 
 class Base(DeclarativeBase):
@@ -61,6 +65,16 @@ class MetaRow(Base):
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
 
+class SandboxWorldRow(Base):
+    __tablename__ = "sandbox_worlds"
+
+    id: Mapped[str] = mapped_column(String(16), primary_key=True)
+    created_at: Mapped[datetime]
+    expires_at: Mapped[datetime] = mapped_column(index=True)
+    reset_at: Mapped[datetime | None]
+    quality_seeded: Mapped[bool] = mapped_column(server_default=text("false"))
+
+
 class OrganizationRow(Base):
     __tablename__ = "organizations"
     __table_args__ = (
@@ -74,6 +88,9 @@ class OrganizationRow(Base):
     type: Mapped[str] = mapped_column(String(20), index=True)
     name: Mapped[str] = mapped_column(String(200))
     sandbox: Mapped[bool] = mapped_column(server_default=text("false"))
+    world_id: Mapped[str | None] = mapped_column(
+        String(16), ForeignKey("sandbox_worlds.id", ondelete="RESTRICT"), index=True
+    )
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
@@ -86,6 +103,9 @@ class UserRow(Base):
     password_hash: Mapped[str] = mapped_column(String(255))
     name: Mapped[str] = mapped_column(String(200))
     is_demo: Mapped[bool] = mapped_column(server_default=text("false"))
+    world_id: Mapped[str | None] = mapped_column(
+        String(16), ForeignKey("sandbox_worlds.id", ondelete="RESTRICT"), index=True
+    )
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
@@ -374,11 +394,15 @@ class ObservationRow(Base):
         CheckConstraint(
             "scope IN ('demo', 'sandbox', 'live')", name="quality_observations_scope_check"
         ),
+        CheckConstraint(WORLD_SCOPE_CHECK, name="quality_observations_world_check"),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     seq: Mapped[int] = mapped_column(BigInteger, Identity(), unique=True)
     scope: Mapped[str] = mapped_column(String(20), server_default=DEMO_SCOPE)
+    world_id: Mapped[str | None] = mapped_column(
+        String(16), ForeignKey("sandbox_worlds.id", ondelete="CASCADE"), index=True
+    )
     origin: Mapped[str] = mapped_column(String(20), index=True)
     product_id: Mapped[str] = mapped_column(String(100), index=True)
     plan_id: Mapped[str | None] = mapped_column(String(64))
@@ -469,6 +493,7 @@ class DelayObservationRow(Base):
         CheckConstraint(
             "scope IN ('demo', 'sandbox', 'live')", name="delay_observations_scope_check"
         ),
+        CheckConstraint(WORLD_SCOPE_CHECK, name="delay_observations_world_check"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
@@ -476,6 +501,9 @@ class DelayObservationRow(Base):
         String(64), _org_fk("CASCADE"), index=True, server_default=DEMO_ORG
     )
     scope: Mapped[str] = mapped_column(String(20), server_default=DEMO_SCOPE)
+    world_id: Mapped[str | None] = mapped_column(
+        String(16), ForeignKey("sandbox_worlds.id", ondelete="CASCADE"), index=True
+    )
     plan_id: Mapped[str | None] = mapped_column(String(64))
     voyage_id: Mapped[str] = mapped_column(String(64))
     vessel_key: Mapped[str] = mapped_column(String(200))

@@ -1,4 +1,5 @@
 import hashlib
+import re
 import secrets
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
@@ -15,14 +16,41 @@ from freshswitch_backend.persistence.tables import DEMO_ORG, BindingRow, DeviceR
 
 SIMULATOR_PREFIX = "sim-"
 SANDBOX_DEVICE_PREFIX = "demo-"
+DEVICE_ID_MAX = 64
+DEVICE_SLUG_MAX = 50
+TOO_LONG = "기기 id가 너무 깁니다"
+OTHER_WORLD_DEVICE = "다른 데모 세계의 기기 id입니다"
+LIVE_WORLD_DEVICE = "데모 세계 기기 id는 등록할 수 없습니다"
+_VISITOR_WORLD = re.compile(r"^w[0-9a-f]{12}$")
+_OTHER_SIM = re.compile(r"^sim-([0-9a-f]{12})-")
+_OTHER_DEVICE = re.compile(r"^d([0-9a-f]{12})-")
+_LIVE_WORLD_DEVICE = re.compile(r"^d[0-9a-f]{12}-", re.IGNORECASE)
 
 
 class DeviceConflict(ValueError):
     pass
 
 
+class DeviceIdError(ValueError):
+    pass
+
+
 def is_simulator_device(device_id: str) -> bool:
     return device_id.startswith(SIMULATOR_PREFIX)
+
+
+def is_visitor_world(world_id: str | None) -> bool:
+    return bool(world_id and _VISITOR_WORLD.fullmatch(world_id))
+
+
+def own_simulator(device_id: str, world_id: str | None) -> bool:
+    return is_visitor_world(world_id) and device_id.startswith(f"sim-{world_id[1:]}-")
+
+
+def _limit(device_id: str) -> str:
+    if len(device_id) > DEVICE_ID_MAX:
+        raise DeviceIdError(TOO_LONG)
+    return device_id
 
 
 def device_prefix_error(device_id: str, sandbox: bool) -> str | None:
@@ -33,7 +61,46 @@ def device_prefix_error(device_id: str, sandbox: bool) -> str | None:
         return f"'{SANDBOX_DEVICE_PREFIX}'로 시작하는 id는 데모 조직용이라 등록할 수 없습니다"
     if not sandbox and lowered.startswith(SIMULATOR_PREFIX):
         return f"'{SIMULATOR_PREFIX}'로 시작하는 id는 시뮬레이터용이라 등록할 수 없습니다"
+    if not sandbox and _LIVE_WORLD_DEVICE.match(device_id):
+        return LIVE_WORLD_DEVICE
     return None
+
+
+def rewrite_simulator_id(device_id: str, world_id: str | None) -> str:
+    if not is_visitor_world(world_id):
+        return device_id
+    token = world_id[1:]
+    own = f"sim-{token}-"
+    if device_id.startswith(own):
+        return _limit(device_id)
+    matched = _OTHER_SIM.match(device_id)
+    if matched is not None and matched.group(1) != token:
+        raise DeviceIdError(OTHER_WORLD_DEVICE)
+    if device_id.startswith(SIMULATOR_PREFIX):
+        rest = device_id[len(SIMULATOR_PREFIX) :]
+        return _limit(f"sim-{token}-{rest}")
+    return device_id
+
+
+def rewrite_registered_id(device_id: str, world_id: str | None) -> str:
+    if not is_visitor_world(world_id):
+        return device_id
+    token = world_id[1:]
+    own = f"d{token}-"
+    if device_id.startswith(own):
+        return _limit(device_id)
+    sim = _OTHER_SIM.match(device_id)
+    dev = _OTHER_DEVICE.match(device_id)
+    if (sim is not None and sim.group(1) != token) or (
+        dev is not None and dev.group(1) != token
+    ):
+        raise DeviceIdError(OTHER_WORLD_DEVICE)
+    slug = device_id
+    if slug.lower().startswith(SANDBOX_DEVICE_PREFIX):
+        slug = slug[len(SANDBOX_DEVICE_PREFIX) :]
+    if len(slug) > DEVICE_SLUG_MAX:
+        raise DeviceIdError(TOO_LONG)
+    return _limit(f"d{token}-{slug}")
 
 
 class DeviceRequest(BaseModel):
@@ -96,7 +163,7 @@ class DeviceStore:
                 binding = db.get(BindingRow, body.device_id)
                 if binding is not None and binding.org_id not in (DEMO_ORG, org_id):
                     raise DeviceConflict(f"다른 조직에 연결된 장치입니다: {body.device_id}")
-                if binding is not None and binding.org_id == DEMO_ORG:
+                if binding is not None and binding.org_id == DEMO_ORG and org_id != DEMO_ORG:
                     db.execute(delete(BindingRow).where(BindingRow.device_id == body.device_id))
                 row = DeviceRow(
                     device_id=body.device_id,

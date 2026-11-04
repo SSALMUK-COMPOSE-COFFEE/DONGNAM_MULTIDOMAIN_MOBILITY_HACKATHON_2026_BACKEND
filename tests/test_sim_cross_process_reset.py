@@ -8,6 +8,7 @@ from freshswitch_backend.coldchain import coldchain_store
 from freshswitch_backend.coldchain.models import SimulationRequest
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence import sandbox_reset as sandbox_reset_module
+from freshswitch_backend.persistence.sandbox_world import SEED_ID, lock_world
 from freshswitch_backend.persistence.tables import (
     AlertRow,
     ContainerRow,
@@ -73,7 +74,7 @@ def test_reset_waits_for_tick_in_progress(demo_tenants, monkeypatch) -> None:
     _, run = _start(PLATFORM_ORG_ID)
     _wait_sent(run, 2)
     monkeypatch.setattr(sandbox_reset_module.coldchain_store, "clear", lambda org_id: 0)
-    with sandbox_reset_module._exclusive():
+    with lock_world(SEED_ID):
         held = run.info.sent
         time.sleep(INTERVAL * 6)
         assert run.info.sent == held
@@ -138,7 +139,7 @@ def test_streams_waiting_on_reset_do_not_hold_connections(demo_tenants, monkeypa
     for run in runs:
         _wait_sent(run, 1)
     monkeypatch.setattr(sandbox_reset_module.coldchain_store, "clear", lambda org_id: 0)
-    with sandbox_reset_module._exclusive():
+    with lock_world(SEED_ID):
         held = [run.info.sent for run in runs]
         time.sleep(1)
         assert database.engine.pool.checkedout() <= 4

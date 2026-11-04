@@ -43,7 +43,7 @@ def test_health_reports_deploy_and_migration_state(client: TestClient, monkeypat
     assert body["migration_head"] is not None
     assert isinstance(body["offline_mode"], bool)
     assert isinstance(body["explain_use_llm"], bool)
-    assert body["seed_completed"] is False
+    assert body["seed_completed"] is True
 
 
 def test_health_seed_flag_and_missing_commit(client: TestClient, demo_tenants, monkeypatch):

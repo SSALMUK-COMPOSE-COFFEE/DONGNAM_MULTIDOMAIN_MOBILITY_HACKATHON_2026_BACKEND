@@ -7,13 +7,13 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from freshswitch_backend.api.access import require_demo_reset
-from freshswitch_backend.data.loader import load_scenarios
+from freshswitch_backend.data.loader import get_scenario, load_scenarios
 from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.sandbox_world import expected_world_lots
 from freshswitch_backend.persistence.seed import (
     SCENARIO_ID,
     DemoOrg,
     demo_orgs,
-    seed_lot_baseline,
 )
 from freshswitch_backend.persistence.tables import (
     DEMO_ORG,
@@ -28,6 +28,7 @@ from freshswitch_backend.persistence.tables import (
     PackhouseRow,
     PlanForwarderRow,
     PlanRow,
+    SandboxWorldRow,
     ShipperProfileRow,
     UserRow,
 )
@@ -84,6 +85,7 @@ class OrgDrift(BaseModel):
 
 class QualityDrift(BaseModel):
     scope: str
+    world_id: str | None = None
     seed_rows: int
     added_rows: int
 
@@ -98,20 +100,7 @@ class Contamination(BaseModel):
 
 
 def seed_completed(db: Session) -> bool:
-    expected = {(org.id, org.user_id) for org in demo_orgs()}
-    present = set(
-        db.execute(
-            select(MembershipRow.org_id, MembershipRow.user_id)
-            .join(OrganizationRow, OrganizationRow.id == MembershipRow.org_id)
-            .join(UserRow, UserRow.id == MembershipRow.user_id)
-            .where(
-                MembershipRow.org_id.in_([org_id for org_id, _ in expected]),
-                OrganizationRow.sandbox.is_(True),
-                UserRow.is_demo.is_(True),
-            )
-        ).all()
-    )
-    return expected <= present and db.get(OrganizationRow, DEMO_ORG) is not None
+    return db.get(OrganizationRow, DEMO_ORG) is not None and get_scenario("default") is not None
 
 
 def _baseline(seed: DemoOrg | None) -> dict[str, int]:
@@ -142,10 +131,22 @@ def _seeded_scenario(rows: list[Any]) -> str:
     return present.most_common(1)[0][0] if present else SCENARIO_ID
 
 
+def _slug(org_id: str, world_id: str | None) -> str:
+    prefix = f"{world_id}-" if world_id and world_id != "seed" else ""
+    if prefix and org_id.startswith(prefix):
+        return org_id[len(prefix) :]
+    return org_id
+
+
 def _lot_counts(db: Session, ids: list[str]) -> tuple[Counter, Counter]:
     columns = [getattr(LotRow, name) for name in ("id", *SEED_LOT_FIELDS)]
     rows = db.execute(select(*columns).where(LotRow.shipper_org_id.in_(ids))).all()
-    seed = {value["id"]: value for value in seed_lot_baseline(db, _seeded_scenario(rows))}
+    wanted = set(ids)
+    seed = {
+        value["id"]: value
+        for value in expected_world_lots(db)
+        if value["shipper_org_id"] in wanted
+    }
     changed: Counter = Counter()
     for row in rows:
         expected = seed.get(row.id)
@@ -179,37 +180,52 @@ def _counts(db: Session, ids: list[str]) -> dict[str, Counter]:
 
 def _quality(db: Session) -> list[QualityDrift]:
     rows = db.execute(
-        select(ObservationRow.scope, ObservationRow.origin, func.count())
+        select(
+            ObservationRow.scope,
+            ObservationRow.world_id,
+            ObservationRow.origin,
+            func.count(),
+        )
         .where(ObservationRow.scope.in_(SEEDED_SCOPES))
-        .group_by(ObservationRow.scope, ObservationRow.origin)
+        .group_by(ObservationRow.scope, ObservationRow.world_id, ObservationRow.origin)
     ).all()
     tally: Counter = Counter()
-    for scope, origin, count in rows:
-        tally[(scope, origin == SEED_ORIGIN)] += count
-    return [
+    for scope, world_id, origin, count in rows:
+        tally[(scope, world_id, origin == SEED_ORIGIN)] += count
+    worlds = list(db.scalars(select(SandboxWorldRow.id).order_by(SandboxWorldRow.id)))
+    report = [
         QualityDrift(
-            scope=scope,
-            seed_rows=tally.get((scope, True), 0),
-            added_rows=tally.get((scope, False), 0),
+            scope="demo",
+            world_id=None,
+            seed_rows=tally.get(("demo", None, True), 0),
+            added_rows=tally.get(("demo", None, False), 0),
         )
-        for scope in SEEDED_SCOPES
     ]
+    report.extend(
+        QualityDrift(
+            scope="sandbox",
+            world_id=world_id,
+            seed_rows=tally.get(("sandbox", world_id, True), 0),
+            added_rows=tally.get(("sandbox", world_id, False), 0),
+        )
+        for world_id in worlds
+    )
+    return report
 
 
 def contamination_report(db: Session) -> Contamination:
     seeds = {org.id: org for org in demo_orgs()}
     orgs = db.execute(
-        select(OrganizationRow.id, OrganizationRow.type, OrganizationRow.sandbox)
-        .where(
-            or_(
-                OrganizationRow.sandbox.is_(True),
-                OrganizationRow.id == DEMO_ORG,
-                OrganizationRow.id.in_(seeds),
-            )
+        select(
+            OrganizationRow.id,
+            OrganizationRow.type,
+            OrganizationRow.sandbox,
+            OrganizationRow.world_id,
         )
+        .where(or_(OrganizationRow.sandbox.is_(True), OrganizationRow.id == DEMO_ORG))
         .order_by(OrganizationRow.type, OrganizationRow.id)
     ).all()
-    ids = [org_id for org_id, _, _ in orgs]
+    ids = [org_id for org_id, _, _, _ in orgs]
     counts = _counts(db, ids)
     outsiders = _grouped(
         db,
@@ -219,15 +235,16 @@ def contamination_report(db: Session) -> Contamination:
         UserRow.is_demo.is_(False),
     )
     rows = []
-    for org_id, org_type, sandbox in orgs:
-        baseline = _baseline(seeds.get(org_id))
+    for org_id, org_type, sandbox, world_id in orgs:
+        slug = _slug(org_id, world_id)
+        baseline = _baseline(seeds.get(slug))
         current = {name: counts[name][org_id] for name in baseline}
         rows.append(
             OrgDrift(
                 org_id=org_id,
                 org_type=org_type,
                 sandbox=sandbox,
-                seeded=org_id in seeds,
+                seeded=slug in seeds,
                 counts=current,
                 baseline=baseline,
                 drift={
@@ -240,7 +257,8 @@ def contamination_report(db: Session) -> Contamination:
         )
     quality = _quality(db)
     unexpected = [r.org_id for r in rows if r.sandbox and not r.seeded]
-    missing = sorted(set(seeds) - set(ids))
+    present_ids = {org_id for org_id, _, _, _ in orgs}
+    missing = sorted(set(seeds) - present_ids)
     contaminated = bool(
         unexpected
         or missing

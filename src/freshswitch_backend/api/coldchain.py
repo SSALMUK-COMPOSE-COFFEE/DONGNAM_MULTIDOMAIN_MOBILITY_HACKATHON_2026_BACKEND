@@ -28,7 +28,14 @@ from freshswitch_backend.coldchain import (
     NotFound,
     coldchain_store,
 )
-from freshswitch_backend.coldchain.devices import device_store, is_simulator_device
+from freshswitch_backend.coldchain.devices import (
+    DeviceIdError,
+    device_store,
+    is_simulator_device,
+    is_visitor_world,
+    own_simulator,
+    rewrite_simulator_id,
+)
 from freshswitch_backend.coldchain.models import (
     ActionHandler,
     ActionUpdateBody,
@@ -239,7 +246,24 @@ def _ingest_org(
     return orgs.pop()
 
 
-def _ingest_device(items: list[ReadingIn], org_id: str) -> IngestResult:
+def _world_for(principal: Principal | None, saas: bool) -> str | None:
+    if principal is None or not saas:
+        return None
+    return principal.world_id
+
+
+def _rewrite_device(device_id: str, principal: Principal | None, saas: bool) -> str:
+    return rewrite_simulator_id(device_id, _world_for(principal, saas))
+
+
+def _skip_owner(device_id: str, principal: Principal | None, saas: bool) -> bool:
+    world_id = _world_for(principal, saas)
+    if saas and is_visitor_world(world_id):
+        return own_simulator(device_id, world_id)
+    return is_simulator_device(device_id)
+
+
+def _ingest_device(items: list[ReadingIn], org_id: str, bound_only: bool = True) -> IngestResult:
     now = coldchain_store.clock()
     sandbox = org_sandbox(org_id)
     kept: list[int] = []
@@ -254,7 +278,7 @@ def _ingest_device(items: list[ReadingIn], org_id: str) -> IngestResult:
         return IngestResult(
             accepted=0, duplicates=0, rejected=rejected, containers=[], new_alerts=[]
         )
-    result = coldchain_store.ingest([items[i] for i in kept], org_id, bound_only=True)
+    result = coldchain_store.ingest([items[i] for i in kept], org_id, bound_only=bound_only)
     if not rejected:
         return result
     moved = [r.model_copy(update={"index": kept[r.index]}) for r in result.rejected]
@@ -268,8 +292,18 @@ def read_params() -> dict[str, Quantity]:
 
 
 @router.post("/bindings", status_code=status.HTTP_201_CREATED)
-def bind(body: BindingRequest, org_id: OrgId, principal: OptionalPrincipal) -> Binding:
-    _device_org(body.device_id, org_id, principal)
+def bind(
+    body: BindingRequest, org_id: OrgId, principal: OptionalPrincipal, request: Request
+) -> Binding:
+    saas = app_settings(request).saas_mode
+    try:
+        device_id = _rewrite_device(body.device_id, principal, saas)
+    except DeviceIdError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if device_id != body.device_id:
+        body = body.model_copy(update={"device_id": device_id})
+    if not _skip_owner(body.device_id, principal, saas):
+        _device_org(body.device_id, org_id, principal)
     try:
         return coldchain_store.bind(body, org_id, plan_required=True)
     except (NotFound, ColdchainError) as exc:
@@ -293,12 +327,30 @@ def ingest(
         raise HTTPException(status_code=422, detail="측정값이 없습니다")
     if len(items) > 2000:
         raise HTTPException(status_code=422, detail="한 번에 2,000건까지 보낼 수 있습니다")
-    org_id = _ingest_org(items, device_token, principal, app_settings(request).saas_mode)
-    if org_id == DEMO_ORG:
-        result = coldchain_store.ingest(items, org_id)
+    saas = app_settings(request).saas_mode
+    try:
+        items = [
+            item.model_copy(update={"device_id": _rewrite_device(item.device_id, principal, saas)})
+            if _rewrite_device(item.device_id, principal, saas) != item.device_id
+            else item
+            for item in items
+        ]
+    except DeviceIdError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    world_id = _world_for(principal, saas)
+    if (
+        principal is not None
+        and is_visitor_world(world_id)
+        and all(own_simulator(item.device_id, world_id) for item in items)
+    ):
+        result = _ingest_device(items, principal.org_id, bound_only=False)
     else:
-        result = _ingest_device(items, org_id)
-        device_store.touch({item.device_id for item in items})
+        org_id = _ingest_org(items, device_token, principal, saas)
+        if org_id == DEMO_ORG:
+            result = coldchain_store.ingest(items, org_id)
+        else:
+            result = _ingest_device(items, org_id)
+            device_store.touch({item.device_id for item in items})
     if result.accepted == 0 and result.duplicates == 0:
         reason = result.rejected[0].reason
         if all(item.reason == STALE_BINDING for item in result.rejected):
@@ -590,10 +642,19 @@ def list_presets() -> list[PresetInfo]:
 
 
 @router.post("/simulate")
-def simulate(body: SimulationRequest, org_id: OrgId, principal: OptionalPrincipal) -> SimulationRun:
+def simulate(
+    body: SimulationRequest, org_id: OrgId, principal: OptionalPrincipal, request: Request
+) -> SimulationRun:
     if principal is not None and not org_sandbox(principal.org_id):
         raise HTTPException(status_code=403, detail=SIMULATOR_SANDBOX_ONLY)
-    if not is_simulator_device(body.device_id):
+    saas = app_settings(request).saas_mode
+    try:
+        device_id = _rewrite_device(body.device_id, principal, saas)
+    except DeviceIdError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if device_id != body.device_id:
+        body = body.model_copy(update={"device_id": device_id})
+    if not _skip_owner(body.device_id, principal, saas):
         _device_org(body.device_id, org_id, principal)
     try:
         return coldchain_store.simulate(body, org_id)

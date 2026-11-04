@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import demo_org_type
+from saas_fixtures import seed_client
 
 from freshswitch_backend.coldchain.devices import token_hash
 from freshswitch_backend.config import get_settings
@@ -38,10 +38,7 @@ def saas(demo_tenants):
 
 
 def _platform(app) -> TestClient:
-    client = TestClient(app, base_url="https://testserver")
-    body = {"org_type": demo_org_type("freshswitch"), "org_id": "freshswitch"}
-    assert client.post("/api/auth/demo-login", json=body).status_code == 200
-    return client
+    return seed_client("freshswitch", app)
 
 
 def test_existing_scenario_and_generated_ids_pass_rule() -> None:

@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
-from saas_fixtures import PLATFORM_ORG_ID, login_client
+from saas_fixtures import PLATFORM_ORG_ID, login_client, seed_client
 from sqlalchemy import func, select
 from test_add_lot import _plan_with_spare
 from test_change_requests import PLATFORM, POHANG_LOT, REDUCE, _open_rows, _plan, _request
@@ -103,8 +103,8 @@ def test_add_lot_needs_compute_slot(platform_client, saas_login, gate) -> None:
 
 def test_replan_rate_limit_per_visitor(saas_app, monkeypatch) -> None:
     monkeypatch.setattr(compute_limits, "REPLAN_RATE", RateRule(per_client=2, window_seconds=60))
-    platform = login_client(PLATFORM_ORG_ID, saas_app)
-    plan_id = _plan(platform, lambda org_id: login_client(org_id, saas_app))
+    platform = seed_client(PLATFORM_ORG_ID, saas_app)
+    plan_id = _plan(platform, lambda org_id: seed_client(org_id, saas_app))
     path = f"/api/plans/{plan_id}/events"
     assert [platform.post(path, json=EVENT).status_code for _ in range(2)] == [200, 200]
     limited = platform.post(path, json=EVENT)
@@ -117,9 +117,9 @@ def test_replan_rate_limit_per_visitor(saas_app, monkeypatch) -> None:
 
 def test_shipper_change_requests_share_replan_rate(saas_app, monkeypatch) -> None:
     monkeypatch.setattr(compute_limits, "REPLAN_RATE", RateRule(per_client=1, window_seconds=60))
-    platform = login_client(PLATFORM_ORG_ID, saas_app)
-    plan_id = _plan(platform, lambda org_id: login_client(org_id, saas_app))
-    shipper = login_client("shipper-pohang", saas_app)
+    platform = seed_client(PLATFORM_ORG_ID, saas_app)
+    plan_id = _plan(platform, lambda org_id: seed_client(org_id, saas_app))
+    shipper = seed_client("shipper-pohang", saas_app)
     assert _request(shipper, plan_id).status_code == 201
     limited = _request(shipper, plan_id)
     assert limited.status_code == 429
@@ -221,14 +221,18 @@ def test_analysis_gate_does_not_block_replans(client, analysis_gate) -> None:
 
 def test_analysis_rate_limit_per_visitor(saas_app, monkeypatch) -> None:
     monkeypatch.setattr(compute_limits, "ANALYSIS_RATE", RateRule(per_client=1, window_seconds=60))
-    platform = login_client(PLATFORM_ORG_ID, saas_app)
-    assert platform.get("/api/analysis/business").status_code == 200
-    limited = platform.get("/api/analysis/business/matrix")
+    platform = seed_client(PLATFORM_ORG_ID, saas_app)
+    plan_id = _plan(platform, lambda org_id: seed_client(org_id, saas_app))
+    detail = platform.get(f"/api/plans/{plan_id}")
+    assert detail.status_code == 200, detail.text
+    lot_id = detail.json()["scenario"]["lots"][0]["id"]
+    assert platform.get("/api/analysis/business", params={"plan_id": plan_id}).status_code == 200
+    limited = platform.get("/api/analysis/business/matrix", params={"plan_id": plan_id})
     assert limited.status_code == 429
     assert int(limited.headers["Retry-After"]) >= 1
     assert platform.get("/api/quality/impact").status_code == 429
     assert platform.get("/api/saas/platform/business/years").status_code == 429
-    lot = {"lot_id": "lot-jinju-sb-1"}
+    lot = {"lot_id": lot_id, "plan_id": plan_id}
     assert platform.post("/api/compare/air-vs-sea", json=lot).status_code == 429
 
 

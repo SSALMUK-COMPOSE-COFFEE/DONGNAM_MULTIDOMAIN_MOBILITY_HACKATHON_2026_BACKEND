@@ -52,7 +52,7 @@ from freshswitch_backend.execution.quality import (
     arrival_settlement,
 )
 from freshswitch_backend.persistence import Database, database
-from freshswitch_backend.persistence.database import RESET_LOCK
+from freshswitch_backend.persistence.database import RESET_LOCK, WORLD_LOCK
 from freshswitch_backend.persistence.tables import (
     ALERT_SEQ,
     DEMO_ORG,
@@ -60,6 +60,7 @@ from freshswitch_backend.persistence.tables import (
     BindingRow,
     ContainerRow,
     DeviceRow,
+    OrganizationRow,
     ReadingRow,
     RunRow,
 )
@@ -271,6 +272,8 @@ class _Run:
     stop: threading.Event
     thread: threading.Thread | None = None
     org_id: str = DEMO_ORG
+    world_id: str | None = None
+    watches_reset: bool = False
     cancelled: bool = False
 
 
@@ -278,8 +281,32 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _device_owner(db: Session, device_id: str) -> str:
-    return db.scalar(select(DeviceRow.org_id).where(DeviceRow.device_id == device_id)) or DEMO_ORG
+def _device_owner(db: Session, device_id: str) -> str | None:
+    return db.scalar(select(DeviceRow.org_id).where(DeviceRow.device_id == device_id))
+
+
+def _device_allowed(owner: str | None, org_id: str) -> bool:
+    return owner is None or owner in (DEMO_ORG, org_id)
+
+
+def _tick_lock(db: Session, run: _Run) -> bool:
+    if run.world_id:
+        locked = db.scalar(
+            select(
+                func.pg_try_advisory_xact_lock_shared(WORLD_LOCK, func.hashtext(run.world_id))
+            )
+        )
+        return bool(locked)
+    if run.watches_reset:
+        return bool(db.scalar(select(func.pg_try_advisory_xact_lock_shared(RESET_LOCK))))
+    return True
+
+
+def _run_scope(db: Session, org_id: str) -> tuple[str | None, bool]:
+    org = db.get(OrganizationRow, org_id)
+    world_id = org.world_id if org is not None else None
+    watches_reset = org_id == DEMO_ORG or (org is not None and org.type == "demo")
+    return world_id, watches_reset
 
 
 def _foreign_device(device_id: str) -> str:
@@ -349,9 +376,16 @@ class ColdchainStore:
                 run.thread.join(timeout=5)
 
     def _stop_runs(self, org_id: str) -> None:
+        self.stop_orgs([org_id])
+
+    def stop_orgs(self, org_ids: list[str]) -> None:
+        wanted = set(org_ids)
+        if not wanted:
+            return
         with self._lock:
-            runs = [run for run in self._runs.values() if run.org_id == org_id]
+            runs = [run for run in self._runs.values() if run.org_id in wanted]
             for run in runs:
+                run.cancelled = True
                 run.stop.set()
                 del self._runs[run.info.run_id]
         for run in runs:
@@ -560,7 +594,7 @@ class ColdchainStore:
         self, body: BindingRequest, org_id: str = DEMO_ORG, *, plan_required: bool = False
     ) -> Binding:
         with self._lock, self._db.begin() as db:
-            if _device_owner(db, body.device_id) not in (DEMO_ORG, org_id):
+            if not _device_allowed(_device_owner(db, body.device_id), org_id):
                 raise DeviceDenied(_foreign_device(body.device_id))
             plan_id = self._resolve_plan(db, body.container_id, body.plan_id, org_id)
             if plan_id is None and plan_required and org_id != DEMO_ORG:
@@ -707,11 +741,11 @@ class ColdchainStore:
         bindings: dict[str, Binding | None] = {}
         checked: dict[tuple[str | None, str], tuple[str | None, str | None]] = {}
         live: dict[str, bool] = {}
-        owners: dict[str, str] = {}
+        owners: dict[str, str | None] = {}
         for index, item in enumerate(items):
             if item.device_id not in owners:
                 owners[item.device_id] = _device_owner(db, item.device_id)
-            if owners[item.device_id] not in (DEMO_ORG, org_id):
+            if not _device_allowed(owners[item.device_id], org_id):
                 rejected.append(
                     IngestRejected(
                         index=index,
@@ -1090,8 +1124,9 @@ class ColdchainStore:
         preset = PRESETS[body.preset]
         with self._lock:
             with self._db.begin() as db:
-                if _device_owner(db, body.device_id) not in (DEMO_ORG, org_id):
+                if not _device_allowed(_device_owner(db, body.device_id), org_id):
                     raise DeviceDenied(_foreign_device(body.device_id))
+                world_id, watches_reset = _run_scope(db, org_id)
                 self._make_run_room(db, org_id)
                 plan_id = self._resolve_plan(db, body.container_id, body.plan_id, org_id)
                 self.require_plan(plan_id, body.container_id, org_id)
@@ -1136,7 +1171,14 @@ class ColdchainStore:
                 info.state = result.containers[0] if result.containers else None
                 self._insert_run(info, org_id)
             return info
-        run = _Run(info=info, readings=readings, stop=threading.Event(), org_id=org_id)
+        run = _Run(
+            info=info,
+            readings=readings,
+            stop=threading.Event(),
+            org_id=org_id,
+            world_id=world_id,
+            watches_reset=watches_reset,
+        )
         run.thread = threading.Thread(target=self._stream, args=(run,), daemon=True)
         with self._lock:
             with self._db.begin() as db:
@@ -1166,7 +1208,7 @@ class ColdchainStore:
                     return False
                 self._db.init()
                 with Session(self._db.engine, expire_on_commit=False) as db:
-                    if db.scalar(select(func.pg_try_advisory_xact_lock_shared(RESET_LOCK))):
+                    if _tick_lock(db, run):
                         if db.get(RunRow, run.info.run_id) is None:
                             run.cancelled = True
                             return False

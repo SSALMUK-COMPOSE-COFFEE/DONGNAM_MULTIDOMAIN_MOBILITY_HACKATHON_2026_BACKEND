@@ -84,16 +84,37 @@ def _upsert(db: Session, row: type, values: list[dict]) -> None:
 
 
 def seed_demo_tenants(db: Session, password: str | None = None) -> None:
+    from freshswitch_backend.persistence.sandbox_world import (
+        SEED_ID,
+        ensure_seed_quality,
+        ensure_seed_world,
+        mark_seed_members,
+    )
+
     scenario = get_scenario(SCENARIO_ID)
     if scenario is None:
         raise RuntimeError(f"시나리오 {SCENARIO_ID}를 찾을 수 없습니다")
     secret = password or os.environ.get(DEMO_PASSWORD_ENV) or DEFAULT_DEMO_PASSWORD
     orgs = demo_orgs()
+    ensure_seed_world(db)
     insert_demo_org(db)
     db.execute(
         insert(OrganizationRow)
-        .values([{"id": o.id, "type": o.type, "name": o.name, "sandbox": True} for o in orgs])
-        .on_conflict_do_update(index_elements=[OrganizationRow.id], set_={"sandbox": True})
+        .values(
+            [
+                {
+                    "id": o.id,
+                    "type": o.type,
+                    "name": o.name,
+                    "sandbox": True,
+                    "world_id": SEED_ID,
+                }
+                for o in orgs
+            ]
+        )
+        .on_conflict_do_update(
+            index_elements=[OrganizationRow.id], set_={"sandbox": True, "world_id": SEED_ID}
+        )
     )
 
     existing = db.execute(
@@ -115,6 +136,7 @@ def seed_demo_tenants(db: Session, password: str | None = None) -> None:
                 "password_hash": hash_password(secret),
                 "name": o.user_name,
                 "is_demo": True,
+                "world_id": SEED_ID,
             }
             for o in orgs
             if o.user_id not in taken and o.email not in taken
@@ -177,6 +199,8 @@ def seed_demo_tenants(db: Session, password: str | None = None) -> None:
             for org_id, shipper in owned
         ],
     )
+    mark_seed_members(db, [o.id for o in orgs], [o.user_id for o in orgs])
+    ensure_seed_quality(db)
 
 
 def org_counts(db: Session) -> dict[str, int]:
@@ -200,7 +224,11 @@ def _sandbox_profile_orgs(db: Session) -> dict[str, str]:
     rows = db.execute(
         select(ShipperProfileRow.id, ShipperProfileRow.org_id)
         .join(OrganizationRow, OrganizationRow.id == ShipperProfileRow.org_id)
-        .where(OrganizationRow.type == "shipper", OrganizationRow.sandbox.is_(True))
+        .where(
+            OrganizationRow.type == "shipper",
+            OrganizationRow.sandbox.is_(True),
+            OrganizationRow.world_id == "seed",
+        )
     ).all()
     return {profile_id: org_id for profile_id, org_id in rows}
 
@@ -364,6 +392,8 @@ def _parser() -> argparse.ArgumentParser:
     lots.add_argument("--scenario", default=SCENARIO_ID, choices=scenarios)
     reset = commands.add_parser("reset-sandbox", help="sandbox 조직 데이터를 지우고 기준 상태로")
     reset.add_argument("--scenario", default=SCENARIO_ID, choices=scenarios)
+    reset.add_argument("--world", default=None)
+    reset.add_argument("--all", action="store_true")
     return parser
 
 
@@ -392,8 +422,15 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "reset-sandbox":
         from freshswitch_backend.persistence.sandbox_reset import reset_sandbox
 
-        result = reset_sandbox(scenario_id=args.scenario)
-        print(f"scope=sandbox orgs={result.orgs} reset_at={result.reset_at.isoformat()}")
+        if not args.world and not args.all:
+            parser.exit(2, "world_id 또는 --all 이 필요합니다\n")
+        result = reset_sandbox(
+            world_id=args.world, all_worlds=args.all, scenario_id=args.scenario
+        )
+        print(
+            f"scope=sandbox orgs={result.orgs} reset_at={result.reset_at.isoformat()} "
+            f"world_id={result.world_id or ''}"
+        )
         return
     with database.begin() as db:
         seed_demo_tenants(db, args.password)

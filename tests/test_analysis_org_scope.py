@@ -19,7 +19,6 @@ from freshswitch_backend.api import analysis as analysis_api
 from freshswitch_backend.config import get_settings
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.main import create_app
-from freshswitch_backend.persistence.seed import shipper_org_id
 from freshswitch_backend.persistence.tables import DEMO_ORG
 from freshswitch_backend.planning.compare import compare_air_sea
 from freshswitch_backend.planning.service import build_plan
@@ -43,27 +42,22 @@ def _lot(lot_id: str):
     return next(lot for lot in scenario.lots if lot.id == lot_id)
 
 
-def _register(client_app, lot_id: str) -> str:
-    lot = _lot(lot_id)
-    shipper = login_client(shipper_org_id(lot.shipper_id), client_app)
-    body = {
-        "product": lot.product_id,
-        "pallets": lot.pallets,
-        "ready_date": lot.ready_date.isoformat(),
-        "destination": lot.destination,
-        "sell_by_date": lot.sell_by_date.isoformat(),
-        "sell_window": lot.sell_window,
-        "shipper": lot.shipper_id,
-        "lot_id": f"scope-{lot.id}",
-    }
-    response = shipper.post("/api/saas/shipper/lots", json=body)
-    assert response.status_code == 201, response.text
-    return response.json()["registered"]["id"]
+def _member(client: TestClient, slug: str) -> str:
+    me = client.get("/api/me").json()
+    return next(
+        item["org_id"]
+        for item in me["memberships"]
+        if item["org_id"] == slug or item["org_id"].endswith(f"-{slug}")
+    )
 
 
 def _plan(client_app, *lot_ids: str) -> tuple[TestClient, str, list[str]]:
-    ids = [_register(client_app, lot_id) for lot_id in lot_ids]
     platform = login_client(PLATFORM_ORG_ID, client_app)
+    rows = platform.get("/api/saas/platform/lots").json()
+    ids = []
+    for lot_id in lot_ids:
+        shipper = _lot(lot_id).shipper_id
+        ids.append(next(row["id"] for row in rows if str(row["shipper_id"]).endswith(shipper)))
     created = platform.post("/api/saas/platform/plans", json={"lot_ids": ids})
     assert created.status_code == 201, created.text
     return platform, created.json()["plan_id"], ids
@@ -180,12 +174,11 @@ def test_sandbox_platform_cannot_reach_demo_plans(saas_app, client: TestClient) 
 
 @pytest.mark.parametrize("org_id", [SHIPPER_ORG_ID, FORWARDER_ORG_ID])
 def test_shipper_and_forwarder_cannot_run_money_analyses(saas_app, org_id: str) -> None:
-    _, plan_id, _ = _plan(saas_app, JINJU_LOT)
+    platform, plan_id, _ = _plan(saas_app, JINJU_LOT)
     if org_id == FORWARDER_ORG_ID:
-        platform = login_client(PLATFORM_ORG_ID, saas_app)
         assigned = platform.put(
             f"/api/saas/platform/plans/{plan_id}/forwarder",
-            json={"forwarder_org_id": FORWARDER_ORG_ID},
+            json={"forwarder_org_id": _member(platform, FORWARDER_ORG_ID)},
         )
         assert assigned.status_code == 200, assigned.text
     viewer = login_client(org_id, saas_app)
@@ -199,11 +192,10 @@ def test_shipper_and_forwarder_cannot_run_money_analyses(saas_app, org_id: str) 
 
 
 def test_forwarder_cannot_compare_air_vs_sea(saas_app) -> None:
-    _, plan_id, ids = _plan(saas_app, JINJU_LOT)
-    platform = login_client(PLATFORM_ORG_ID, saas_app)
+    platform, plan_id, ids = _plan(saas_app, JINJU_LOT)
     assigned = platform.put(
         f"/api/saas/platform/plans/{plan_id}/forwarder",
-        json={"forwarder_org_id": FORWARDER_ORG_ID},
+        json={"forwarder_org_id": _member(platform, FORWARDER_ORG_ID)},
     )
     assert assigned.status_code == 200, assigned.text
     forwarder = login_client(FORWARDER_ORG_ID, saas_app)
@@ -221,7 +213,7 @@ def test_shipper_compares_only_own_lots_in_own_plans(saas_app) -> None:
     assert own.status_code == 200, own.text
     body = own.json()
     assert body["lot_id"] == jinju
-    assert body["shipper_id"] == "sh-jinju"
+    assert body["shipper_id"].endswith("sh-jinju")
     expected = platform.post(
         "/api/compare/air-vs-sea", json={"plan_id": plan_id, "lot_id": jinju}
     ).json()
@@ -243,7 +235,7 @@ def test_shipper_compares_only_own_lots_in_own_plans(saas_app) -> None:
         "/api/compare/air-vs-sea", json={"plan_id": plan_id, "lot_id": sancheong}
     )
     assert theirs.status_code == 200
-    assert theirs.json()["shipper_id"] == "sh-sancheong"
+    assert theirs.json()["shipper_id"].endswith("sh-sancheong")
 
 
 def test_anonymous_demo_responses_unchanged(client: TestClient) -> None:

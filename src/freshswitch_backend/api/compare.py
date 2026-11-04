@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from freshswitch_backend.api.analysis import plan_session
-from freshswitch_backend.api.auth import OptionalPrincipal, Principal
+from freshswitch_backend.api.analysis import PLAN_REQUIRED, plan_session
+from freshswitch_backend.api.auth import OptionalPrincipal, Principal, app_settings
 from freshswitch_backend.api.compute_limits import analysis_rate, analysis_slot
 from freshswitch_backend.api.saas_access import plan_for
 from freshswitch_backend.data.loader import get_scenario
@@ -35,11 +35,17 @@ def _shipper_source(body: AirSeaRequest, principal: Principal) -> tuple[Scenario
     return scenario, access.session.plan
 
 
-def _source(body: AirSeaRequest, principal: Principal | None) -> tuple[Scenario, Plan]:
+def _source(
+    body: AirSeaRequest, principal: Principal | None, saas: bool
+) -> tuple[Scenario, Plan]:
+    if saas and principal is None:
+        raise HTTPException(status_code=403, detail="금액 분석은 플랫폼 조직만 사용할 수 있습니다")
     if principal is not None and principal.org_type == "shipper":
         return _shipper_source(body, principal)
     if principal is not None and principal.org_type != "platform":
         raise HTTPException(status_code=403, detail=FORWARDER_FORBIDDEN)
+    if saas and body.plan_id is None:
+        raise HTTPException(status_code=422, detail=PLAN_REQUIRED)
     if body.plan_id is not None:
         session = plan_session(body.plan_id, principal.org_id if principal else DEMO_ORG)
         return session.scenario, session.plan
@@ -51,8 +57,10 @@ def _source(body: AirSeaRequest, principal: Principal | None) -> tuple[Scenario,
 
 
 @router.post("/air-vs-sea", dependencies=[Depends(analysis_rate)])
-def air_vs_sea(body: AirSeaRequest, principal: OptionalPrincipal) -> AirSeaComparison:
-    scenario, plan = _source(body, principal)
+def air_vs_sea(
+    body: AirSeaRequest, request: Request, principal: OptionalPrincipal
+) -> AirSeaComparison:
+    scenario, plan = _source(body, principal, app_settings(request).saas_mode)
     try:
         return compare_air_sea(scenario, plan, body.lot_id)
     except KeyError as exc:

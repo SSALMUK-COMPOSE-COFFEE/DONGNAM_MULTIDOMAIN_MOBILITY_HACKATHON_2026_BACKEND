@@ -3,9 +3,9 @@ import threading
 import uuid
 from datetime import datetime, time
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
-from sqlalchemy import delete, exists, func, or_, select
+from sqlalchemy import and_, delete, exists, func, or_, select
 from sqlalchemy.orm import Session
 
 from freshswitch_backend.coldchain import ColdchainError, NotFound, coldchain_store
@@ -14,8 +14,14 @@ from freshswitch_backend.domain.models import KST, Scenario
 from freshswitch_backend.execution.quality import ArrivalSettlementResult
 from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.persistence import Database, database, get_meta, set_meta
-from freshswitch_backend.persistence.orgs import org_sandbox
-from freshswitch_backend.persistence.tables import DEMO_ORG, DEMO_SCOPE, ObservationRow, PlanRow
+from freshswitch_backend.persistence.tables import (
+    DEMO_ORG,
+    DEMO_SCOPE,
+    ObservationRow,
+    OrganizationRow,
+    PlanRow,
+    SandboxWorldRow,
+)
 from freshswitch_backend.planning.store import PlanSession
 from freshswitch_backend.planning.store import store as plan_store
 from freshswitch_backend.quality.learning import condition_uplift, outage_bucket, prior_model_rate
@@ -36,18 +42,50 @@ SEEDED_SCOPES = frozenset({"demo", "sandbox"})
 LIVE_LABEL = "실측: 이 범위의 도착 검수·수동 관측만 학습한다(시드 관측 없음)"
 
 
-def learning_scope(org_id: str | None) -> LearningScope:
+class ScopeRef(NamedTuple):
+    kind: str
+    world_id: str | None
+
+
+def scope_ref(scope: ScopeRef | str, world_id: str | None = None) -> ScopeRef:
+    if isinstance(scope, ScopeRef):
+        if world_id is not None and scope.world_id is None:
+            return ScopeRef(scope.kind, world_id)
+        return scope
+    return ScopeRef(scope, world_id)
+
+
+def _kind(scope: ScopeRef | str) -> str:
+    return scope.kind if isinstance(scope, ScopeRef) else scope
+
+
+def learning_scope(org_id: str | None) -> ScopeRef:
     if org_id is None or org_id == DEMO_ORG:
-        return "demo"
-    return "sandbox" if org_sandbox(org_id) else "live"
+        return ScopeRef(DEMO_SCOPE, None)
+    with database.begin() as db:
+        org = db.get(OrganizationRow, org_id)
+    if org is None or org.type == "demo":
+        return ScopeRef(DEMO_SCOPE, None)
+    if org.world_id and org.sandbox:
+        return ScopeRef("sandbox", org.world_id)
+    if org.world_id is None and not org.sandbox:
+        return ScopeRef("live", None)
+    return ScopeRef(DEMO_SCOPE, None)
 
 
-def _seeded_key(scope: LearningScope) -> str:
+def _seeded_key(scope: str) -> str:
     return SEEDED_KEY if scope == DEMO_SCOPE else f"{SEEDED_KEY}:{scope}"
 
 
-def _seed_id(item_id: str, scope: LearningScope) -> str:
+def _seed_id(item_id: str, scope: str) -> str:
     return item_id if scope == DEMO_SCOPE else f"{scope}-{item_id}"
+
+
+def _in_scope(scope: ScopeRef):
+    kind = ObservationRow.scope == scope.kind
+    if scope.world_id is None:
+        return and_(kind, ObservationRow.world_id.is_(None))
+    return and_(kind, ObservationRow.world_id == scope.world_id)
 
 
 class QualityInputError(ValueError):
@@ -98,11 +136,13 @@ def _counted():
 
 
 def _row(
-    observation: Observation, scope: LearningScope, inspection_revision: int | None = None
+    observation: Observation, scope: ScopeRef | str, inspection_revision: int | None = None
 ) -> ObservationRow:
+    ref = scope_ref(scope)
     return ObservationRow(
         id=observation.id,
-        scope=scope,
+        scope=ref.kind,
+        world_id=ref.world_id,
         origin=observation.origin,
         product_id=observation.product_id,
         plan_id=observation.plan_id,
@@ -120,8 +160,24 @@ class QualityHistory:
         self._lock = threading.RLock()
         self.seed_label, self._seed = _load_seed()
 
-    def seed_label_for(self, scope: LearningScope = "demo") -> str:
-        return self.seed_label if scope in SEEDED_SCOPES else LIVE_LABEL
+    def seed_label_for(self, scope: ScopeRef | str = "demo") -> str:
+        return self.seed_label if _kind(scope) in SEEDED_SCOPES else LIVE_LABEL
+
+    def seed_world(self, db: Session, world_id: str, *, prefixed: bool) -> int:
+        scenario = self.reference_scenario()
+        ref = ScopeRef("sandbox", world_id)
+        count = 0
+        for item in self._seed:
+            obs_id = f"{world_id}-{item.id}" if prefixed else _seed_id(item.id, "sandbox")
+            observation = self._from_input(
+                item, "seed", obs_id, scenario, _seed_recorded_at(item)
+            )
+            db.add(_row(observation, ref))
+            count += 1
+        world = db.get(SandboxWorldRow, world_id)
+        if world is not None:
+            world.quality_seeded = True
+        return count
 
     def reference_scenario(self) -> Scenario:
         scenario = get_scenario("default")
@@ -186,64 +242,81 @@ class QualityHistory:
             db.add(_row(observation, scope))
         return len(seeds)
 
-    def _ensure_seeded(self, db: Session, scope: LearningScope) -> None:
-        if get_meta(db, _seeded_key(scope)):
+    def _ensure_seeded(self, db: Session, scope: ScopeRef | str) -> None:
+        ref = scope_ref(scope)
+        if ref.kind != DEMO_SCOPE:
             return
-        self._seed_rows(db, self.reference_scenario(), scope)
+        if get_meta(db, _seeded_key(ref.kind)):
+            return
+        self._seed_rows(db, self.reference_scenario(), ref.kind)
         db.flush()
 
-    def _pending_seeds(self, db: Session, scope: LearningScope) -> list[Observation]:
-        if get_meta(db, _seeded_key(scope)):
+    def _pending_seeds(self, db: Session, scope: ScopeRef | str) -> list[Observation]:
+        ref = scope_ref(scope)
+        if ref.kind != DEMO_SCOPE or get_meta(db, _seeded_key(ref.kind)):
             return []
-        return self._seed_observations(self.reference_scenario(), scope)
+        return self._seed_observations(self.reference_scenario(), ref.kind)
 
-    def ensure_seeded(self, scopes: frozenset[LearningScope] = SEEDED_SCOPES) -> None:
+    def ensure_seeded(self, scopes: frozenset[str] = SEEDED_SCOPES) -> None:
         with self._lock, self._db.begin() as db:
             for scope in sorted(scopes):
+                if scope == "sandbox":
+                    continue
                 self._ensure_seeded(db, scope)
 
     def reset(
-        self, seed: bool = True, org_type: str | None = None, scope: LearningScope = "demo"
+        self,
+        seed: bool = True,
+        org_type: str | None = None,
+        scope: ScopeRef | str = "demo",
+        world_id: str | None = None,
     ) -> tuple[int, int]:
         _check_reset(org_type)
+        ref = scope_ref(scope, world_id)
+        if ref.kind == "sandbox" and not ref.world_id:
+            raise QualityInputError("world_id가 필요합니다")
         scenario = self.reference_scenario()
-        in_scope = ObservationRow.scope == scope
+        in_scope = _in_scope(ref)
         with self._lock, self._db.begin() as db:
             cleared = db.scalar(select(func.count()).select_from(ObservationRow).where(in_scope))
             db.execute(delete(ObservationRow).where(in_scope))
-            if seed:
-                return cleared or 0, self._seed_rows(db, scenario, scope)
-            set_meta(db, _seeded_key(scope), True)
-            return cleared or 0, 0
+            if not seed:
+                if ref.kind != "sandbox":
+                    set_meta(db, _seeded_key(ref.kind), True)
+                return cleared or 0, 0
+            if ref.kind == "sandbox" and ref.world_id is not None:
+                return cleared or 0, self.seed_world(db, ref.world_id, prefixed=ref.world_id != "seed")
+            return cleared or 0, self._seed_rows(db, scenario, ref.kind)
 
-    def observations(self, scope: LearningScope = "demo") -> list[Observation]:
+    def observations(self, scope: ScopeRef | str = "demo") -> list[Observation]:
+        ref = scope_ref(scope)
         with self._lock, self._db.begin() as db:
             rows = db.scalars(
-                select(ObservationRow)
-                .where(ObservationRow.scope == scope, _counted())
-                .order_by(ObservationRow.seq)
+                select(ObservationRow).where(_in_scope(ref), _counted()).order_by(ObservationRow.seq)
             )
             stored = [Observation.model_validate(row.payload) for row in rows]
-            return [*stored, *self._pending_seeds(db, scope)]
+            return [*stored, *self._pending_seeds(db, ref)]
 
-    def get(self, obs_id: str, scope: LearningScope = "demo") -> Observation | None:
+    def get(self, obs_id: str, scope: ScopeRef | str = "demo") -> Observation | None:
+        ref = scope_ref(scope)
         with self._lock, self._db.begin() as db:
             row = db.scalars(
                 select(ObservationRow).where(ObservationRow.id == obs_id, _counted())
             ).first()
             if row is not None:
-                return Observation.model_validate(row.payload) if row.scope == scope else None
-            return next((o for o in self._pending_seeds(db, scope) if o.id == obs_id), None)
+                if row.scope != ref.kind or row.world_id != ref.world_id:
+                    return None
+                return Observation.model_validate(row.payload)
+            return next((o for o in self._pending_seeds(db, ref) if o.id == obs_id), None)
 
     def delete(
-        self, obs_id: str, org_type: str | None = None, scope: LearningScope = "demo"
+        self, obs_id: str, org_type: str | None = None, scope: ScopeRef | str = "demo"
     ) -> bool:
         _check_reset(org_type)
+        ref = scope_ref(scope)
         with self._lock, self._db.begin() as db:
-            self._ensure_seeded(db, scope)
-            target = delete(ObservationRow).where(
-                ObservationRow.id == obs_id, ObservationRow.scope == scope
-            )
+            self._ensure_seeded(db, ref)
+            target = delete(ObservationRow).where(ObservationRow.id == obs_id, _in_scope(ref))
             return db.execute(target).rowcount > 0
 
     def prune_orphans(self) -> int:
@@ -254,12 +327,13 @@ class QualityHistory:
         self,
         db: Session,
         observation: Observation,
-        scope: LearningScope,
+        scope: ScopeRef | str,
         inspection_revision: int | None = None,
     ) -> None:
-        in_scope = ObservationRow.scope == scope
+        ref = scope_ref(scope)
+        in_scope = _in_scope(ref)
         db.execute(delete(ObservationRow).where(in_scope, _orphan_arrival()))
-        db.add(_row(observation, scope, inspection_revision))
+        db.add(_row(observation, ref, inspection_revision))
         db.flush()
         cutoff = db.scalar(
             select(ObservationRow.seq)
@@ -271,7 +345,7 @@ class QualityHistory:
         if cutoff is not None:
             db.execute(delete(ObservationRow).where(in_scope, ObservationRow.seq <= cutoff))
 
-    def add(self, body: ObservationIn, scope: LearningScope = "demo") -> Observation:
+    def add(self, body: ObservationIn, scope: ScopeRef | str = "demo") -> Observation:
         observation = self._from_input(
             body, "manual", f"obs-{uuid.uuid4().hex[:12]}", self.reference_scenario()
         )
@@ -375,7 +449,9 @@ class QualityHistory:
             if alive is None:
                 return observation
             if existing is not None:
-                existing.scope = scope
+                ref = scope_ref(scope)
+                existing.scope = ref.kind
+                existing.world_id = ref.world_id
                 existing.product_id = observation.product_id
                 existing.recorded_at = observation.recorded_at
                 existing.inspection_revision = session.inspection_revision

@@ -2,7 +2,7 @@ import json
 import re
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
@@ -769,10 +769,17 @@ def curl_script(base: str = DEFAULT_CURL_BASE) -> str:
 
 @router.post("/reset", dependencies=[Depends(require_demo_reset)])
 def reset(
-    include_lots: bool = Query(False), scope: Literal["demo", "sandbox"] = Query("demo")
+    include_lots: bool = Query(False),
+    scope: Literal["demo", "sandbox"] = Query("demo"),
+    world_id: str | None = None,
+    all_worlds: bool = Query(False, alias="all"),
 ) -> ResetResponse | SandboxResetResponse:
     if scope == "sandbox":
-        return sandbox_reset_response(reset_sandbox())
+        if not world_id and not all_worlds:
+            raise HTTPException(status_code=422, detail="world_id 또는 all=true가 필요합니다")
+        return sandbox_reset_response(
+            reset_sandbox(world_id=world_id, all_worlds=all_worlds)
+        )
     cleared_sessions = store.clear(DEMO_ORG)
     cleared_quality, _ = quality_history.reset()
     return ResetResponse(

@@ -32,7 +32,7 @@ def test_real_org_assignment_waits_for_shipper_confirmation(
         db.execute(
             update(OrganizationRow)
             .where(OrganizationRow.id.in_([PLATFORM_ORG_ID, FORWARDER_ORG_ID]))
-            .values(sandbox=False)
+            .values(sandbox=False, world_id=None)
         )
     blocked = _assign(platform_client, plan_id)
     assert blocked.status_code == 409

@@ -2,7 +2,7 @@ import hashlib
 
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import demo_org_type
+from saas_fixtures import seed_client
 from sqlalchemy import select
 
 from freshswitch_backend.coldchain import DeviceDenied, coldchain_store
@@ -41,13 +41,7 @@ def app(demo_tenants):
 
 
 def _login(app, org_id: str) -> TestClient:
-    client = TestClient(app, base_url="https://testserver")
-    response = client.post(
-        "/api/auth/demo-login", json={"org_type": demo_org_type(org_id), "org_id": org_id}
-    )
-    assert response.status_code == 200, response.text
-    assert response.json()["active_org"]["org_id"] == org_id
-    return client
+    return seed_client(org_id, app)
 
 
 def _anonymous(app) -> TestClient:
@@ -247,6 +241,7 @@ def test_devices_require_login_and_csrf(app) -> None:
     assert anonymous.get("/api/saas/devices").status_code == 401
     assert anonymous.post("/api/saas/devices", json={"device_id": "x"}).status_code == 401
     platform = _login(app, PLATFORM)
+    platform.headers.clear()
     assert platform.post("/api/saas/devices", json={"device_id": "x"}).status_code == 403
 
 

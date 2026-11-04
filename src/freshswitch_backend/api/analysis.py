@@ -1,6 +1,6 @@
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field, model_validator
 
 from freshswitch_backend.analysis import (
@@ -23,7 +23,7 @@ from freshswitch_backend.analysis.business import (
     MAX_OPS_COST_PER_VOYAGE,
     MAX_VARIABLE_COST_PER_PALLET,
 )
-from freshswitch_backend.api.auth import OptionalPrincipal
+from freshswitch_backend.api.auth import OptionalPrincipal, app_settings
 from freshswitch_backend.api.compute_limits import analysis_rate, analysis_slot
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.inputs import FiniteFloat
@@ -35,9 +35,14 @@ router = APIRouter(prefix="/analysis", tags=["analysis"])
 
 PLATFORM_ONLY = "금액 분석은 플랫폼 조직만 사용할 수 있습니다"
 PLAN_NOT_FOUND = "계획을 찾을 수 없습니다"
+PLAN_REQUIRED = "계획이 필요합니다"
 
 
-def platform_or_demo_org(principal: OptionalPrincipal) -> str:
+def platform_or_demo_org(request: Request, principal: OptionalPrincipal) -> str:
+    if app_settings(request).saas_mode:
+        if principal is None or principal.org_type != "platform":
+            raise HTTPException(status_code=403, detail=PLATFORM_ONLY)
+        return principal.org_id
     if principal is None:
         return DEMO_ORG
     if principal.org_type != "platform":
@@ -121,7 +126,9 @@ def _scenario(scenario_id: str) -> Scenario:
     return scenario
 
 
-def _source(scenario_id: str, plan_id: str | None, org_id: str) -> Scenario:
+def _source(request: Request, scenario_id: str, plan_id: str | None, org_id: str) -> Scenario:
+    if app_settings(request).saas_mode and plan_id is None:
+        raise HTTPException(status_code=422, detail=PLAN_REQUIRED)
     if plan_id is not None:
         return plan_session(plan_id, org_id).scenario
     return _scenario(scenario_id)
@@ -131,7 +138,11 @@ ANALYSIS_LIMITS = [Depends(analysis_rate)]
 
 
 @router.post("/sensitivity", dependencies=ANALYSIS_LIMITS)
-def run_sensitivity(body: SensitivityRequest, org_id: PlatformOrg) -> SensitivityResult:
+def run_sensitivity(
+    body: SensitivityRequest, request: Request, org_id: PlatformOrg
+) -> SensitivityResult:
+    if app_settings(request).saas_mode and body.plan_id is None:
+        raise HTTPException(status_code=422, detail=PLAN_REQUIRED)
     if body.plan_id is not None:
         session = plan_session(body.plan_id, org_id)
         with analysis_slot():
@@ -142,8 +153,10 @@ def run_sensitivity(body: SensitivityRequest, org_id: PlatformOrg) -> Sensitivit
 
 
 @router.post("/fuel-shock", dependencies=ANALYSIS_LIMITS)
-def run_fuel_shock(body: FuelShockRequest, org_id: PlatformOrg) -> FuelShockResult:
-    scenario = _source(body.scenario_id, body.plan_id, org_id)
+def run_fuel_shock(
+    body: FuelShockRequest, request: Request, org_id: PlatformOrg
+) -> FuelShockResult:
+    scenario = _source(request, body.scenario_id, body.plan_id, org_id)
     with analysis_slot():
         return fuel_shock(
             scenario,
@@ -156,7 +169,11 @@ def run_fuel_shock(body: FuelShockRequest, org_id: PlatformOrg) -> FuelShockResu
 
 
 @router.post("/benchmark", dependencies=ANALYSIS_LIMITS)
-def run_benchmark(body: BenchmarkRequest, org_id: PlatformOrg) -> BenchmarkResult:
+def run_benchmark(
+    body: BenchmarkRequest, request: Request, org_id: PlatformOrg
+) -> BenchmarkResult:
+    if app_settings(request).saas_mode and body.plan_id is None:
+        raise HTTPException(status_code=422, detail=PLAN_REQUIRED)
     if body.plan_id is not None:
         session = plan_session(body.plan_id, org_id)
         with analysis_slot():
@@ -168,6 +185,7 @@ def run_benchmark(body: BenchmarkRequest, org_id: PlatformOrg) -> BenchmarkResul
 
 @router.get("/business", dependencies=ANALYSIS_LIMITS)
 def run_business(
+    request: Request,
     org_id: PlatformOrg,
     scenario_id: str = "default",
     plan_id: str | None = None,
@@ -175,13 +193,14 @@ def run_business(
     ops_cost_per_voyage: int = Query(DEFAULT_OPS_COST_PER_VOYAGE, ge=0, le=MAX_OPS_COST_PER_VOYAGE),
     variable_cost_per_pallet: int = Query(0, ge=0, le=MAX_VARIABLE_COST_PER_PALLET),
 ) -> BusinessResult:
-    scenario = _source(scenario_id, plan_id, org_id)
+    scenario = _source(request, scenario_id, plan_id, org_id)
     with analysis_slot():
         return business(scenario, forwarder_share, ops_cost_per_voyage, variable_cost_per_pallet)
 
 
 @router.get("/business/matrix", dependencies=ANALYSIS_LIMITS)
 def run_business_matrix(
+    request: Request,
     org_id: PlatformOrg,
     scenario_id: str = "default",
     plan_id: str | None = None,
@@ -189,7 +208,7 @@ def run_business_matrix(
     grape_rule: Literal["usage_fee", "performance", "solo_baseline"] = "usage_fee",
     variable_cost_per_pallet: int = Query(0, ge=0, le=MAX_VARIABLE_COST_PER_PALLET),
 ) -> BusinessMatrix:
-    scenario = _source(scenario_id, plan_id, org_id)
+    scenario = _source(request, scenario_id, plan_id, org_id)
     with analysis_slot():
         result = business_matrix(scenario, base_fee_mode, grape_rule, variable_cost_per_pallet)
     if result is None:

@@ -2,7 +2,7 @@ from datetime import datetime
 
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import demo_org_type
+from saas_fixtures import seed_client
 
 from freshswitch_backend.coldchain import coldchain_store
 from freshswitch_backend.config import get_settings
@@ -24,12 +24,7 @@ def saas(demo_tenants):
 
 
 def _login(app, org_id: str) -> TestClient:
-    client = TestClient(app, base_url="https://testserver")
-    response = client.post(
-        "/api/auth/demo-login", json={"org_type": demo_org_type(org_id), "org_id": org_id}
-    )
-    assert response.status_code == 200, response.text
-    return client
+    return seed_client(org_id, app)
 
 
 def _two_plans() -> tuple[str, str]:

@@ -190,6 +190,7 @@ def preview_lot(
     *,
     check_season: bool = False,
     today: date | None = None,
+    ignore_client_lot_id: bool = False,
 ) -> IntakePreview:
     taken = {lot.id for lot in scenario.lots} | (taken_ids or set())
     resolved, errors = _resolve(scenario, body)
@@ -203,7 +204,7 @@ def preview_lot(
                 message=f"컨테이너 1대 용량({max_capacity}파렛트)을 넘습니다. 나눠서 등록하세요",
             )
         )
-    if body.lot_id and body.lot_id in taken:
+    if body.lot_id and not ignore_client_lot_id and body.lot_id in taken:
         errors.append(FieldError(field="lot_id", message=f"이미 있는 로트 ID입니다: {body.lot_id}"))
     if body.sell_by_date and body.sell_by_date < body.ready_date:
         errors.append(
@@ -229,9 +230,11 @@ def preview_lot(
             f"sell_by_date = 출하 가능일 + {product.name} 신선 유지 기간 "
             f"{product.shelf_life_days}일 = {sell_by.isoformat()} (출처: {product.source})"
         )
-    lot_id = body.lot_id or _lot_id(taken | (reserved_ids or set()), resolved)
-    if body.lot_id is None:
+    if ignore_client_lot_id or body.lot_id is None:
+        lot_id = _lot_id(taken | (reserved_ids or set()), resolved)
         defaults.append(f"lot_id 자동 생성: {lot_id}")
+    else:
+        lot_id = body.lot_id
     lot = Lot(
         id=lot_id,
         shipper_id=resolved.shipper_id,

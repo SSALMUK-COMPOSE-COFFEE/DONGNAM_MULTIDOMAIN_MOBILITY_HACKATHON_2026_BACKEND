@@ -270,17 +270,34 @@ def _count(db, row, real_plans) -> int:
     return db.scalar(select(func.count()).select_from(row).where(~row.plan_id.in_(real_plans)))
 
 
-def _sandbox_activity(platform: TestClient, shipper: TestClient) -> str:
+def _world_forwarder(platform: TestClient) -> tuple[str, str, str]:
+    me = platform.get("/api/me").json()
+    forwarder = next(
+        item["org_id"]
+        for item in me["memberships"]
+        if item["org_id"].endswith(f"-{FORWARDER_ORG_ID}")
+    )
+    return me["world"]["world_id"], me["active_org"]["org_id"], forwarder
+
+
+def _sandbox_activity(platform: TestClient, shipper: TestClient) -> tuple[str, str, str]:
+    world_id, platform_org, forwarder = _world_forwarder(platform)
     created = platform.post("/api/saas/platform/plans", json={"include_registered": True})
     assert created.status_code == 201, created.text
     plan_id = created.json()["plan_id"]
     assigned = platform.put(
         f"/api/saas/platform/plans/{plan_id}/forwarder",
-        json={"forwarder_org_id": FORWARDER_ORG_ID},
+        json={"forwarder_org_id": forwarder},
     )
     assert assigned.status_code == 200, assigned.text
     device = platform.post("/api/saas/devices", json={"device_id": "demo-sensor-9"})
     assert device.status_code == 201, device.text
+    device_id = device.json()["device_id"]
+    profile = next(
+        row["id"]
+        for row in shipper.get("/api/saas/catalog").json()["shippers"]
+        if row["id"].endswith("sh-jinju")
+    )
     lot = shipper.post(
         "/api/intake/lots",
         json={
@@ -289,25 +306,26 @@ def _sandbox_activity(platform: TestClient, shipper: TestClient) -> str:
             "ready_date": "2026-11-16",
             "destination": "HKHKG",
             "sell_by_date": "2026-11-23",
-            "shipper": "sh-jinju",
+            "shipper": profile,
             "save": True,
         },
     )
     assert lot.status_code == 200, lot.text
     with database.begin() as db:
         _plan_children(db, plan_id)
-        _coldchain(db, "sbx", PLATFORM_ORG_ID, plan_id, "demo-sensor-9")
+        _coldchain(db, "sbx", platform_org, plan_id, device_id)
         db.add(
             ObservationRow(
                 id="sbx-manual",
                 scope="sandbox",
+                world_id=world_id,
                 origin="manual",
                 product_id="strawberry",
                 recorded_at=STAMP,
                 payload={},
             )
         )
-    return plan_id
+    return plan_id, device_id, world_id
 
 
 def _sandbox_snapshot() -> dict:
@@ -370,48 +388,57 @@ def test_admin_reset_restores_baseline_and_keeps_real_data(
     saas_app, client, reset_admin_headers, reset_clock
 ) -> None:
     run_lots()
-    baseline_lots = _sandbox_snapshot()["lots"]
-    assert len(baseline_lots) == 6
+    seed_lots = _sandbox_snapshot()["lots"]
+    assert len(seed_lots) == 6
     _real_world()
     assert client.post("/api/plans", json={"scenario_id": "default"}).status_code == 201
     real_client = password_client(saas_app, REAL_PLATFORM_EMAIL, REAL_PLATFORM_PASSWORD)
     platform = login_client(PLATFORM_ORG_ID, saas_app)
     shipper = login_client(SHIPPER_ORG_ID, saas_app)
-    _sandbox_activity(platform, shipper)
+    _, device_id, world_id = _sandbox_activity(platform, shipper)
     real_before = _real_snapshot()
     dirty = _sandbox_snapshot()
     assert dirty["plans"] == 1 and dirty["forwarders"] == 1
     assert dirty["pending"] == dirty["orders"] == dirty["idempotency"] == 1
-    assert dirty["devices"] == ["demo-sensor-9"]
-    assert len(dirty["lots"]) == 7
+    assert dirty["devices"] == [device_id]
+    assert len(dirty["lots"]) == 13
     assert "sbx-manual" in dirty["observations"]
 
     response = TestClient(saas_app, base_url="https://testserver").post(
-        "/api/demo/reset", params={"scope": "sandbox"}, headers=reset_admin_headers
+        "/api/demo/reset",
+        params={"scope": "sandbox", "world_id": world_id},
+        headers=reset_admin_headers,
     )
     assert response.status_code == 200, response.text
     body = response.json()
-    assert set(body) == {"scope", "orgs", "reset_at"}
+    assert set(body) == {"scope", "orgs", "reset_at", "world_id"}
     assert body["scope"] == "sandbox"
     assert body["orgs"] == 8
+    assert body["world_id"] == world_id
     assert datetime.fromisoformat(body["reset_at"]) == BASE_NOW
 
     after = _sandbox_snapshot()
-    assert after["lots"] == baseline_lots
+    assert len(after["lots"]) == 12
     assert all(status == "registered" for _, _, status, _, _ in after["lots"])
+    assert set(seed_lots) <= set(after["lots"])
     wiped = ("plans", "forwarders", "pending", "orders", "idempotency", "containers")
     for key in (*wiped, "readings", "alerts", "bindings", "runs"):
         assert after[key] == 0, key
     assert after["devices"] == []
     assert "sbx-manual" not in after["observations"]
-    assert after["observations"] == sorted(f"sandbox-{item.id}" for item in quality_history._seed)
+    visitor_seed = {f"{world_id}-{item.id}" for item in quality_history._seed}
+    assert visitor_seed <= set(after["observations"])
     assert _real_snapshot() == real_before
     assert real_client.get("/api/me").status_code == 200
     assert platform.get("/api/me").status_code == 401
     assert shipper.get("/api/me").status_code == 401
 
     reset_clock[0] = BASE_NOW + timedelta(seconds=5)
-    again = client.post("/api/demo/reset", params={"scope": "sandbox"}, headers=reset_admin_headers)
+    again = client.post(
+        "/api/demo/reset",
+        params={"scope": "sandbox", "world_id": world_id},
+        headers=reset_admin_headers,
+    )
     assert again.status_code == 200
     assert _sandbox_snapshot() == after
     assert _real_snapshot() == real_before
@@ -456,10 +483,11 @@ def test_admin_reset_ignores_cooldown_but_starts_it(
     saas_app, client, reset_admin_headers, reset_clock
 ) -> None:
     platform = login_client(PLATFORM_ORG_ID, saas_app)
-    params = {"scope": "sandbox"}
+    world_id = platform.get("/api/me").json()["world"]["world_id"]
+    params = {"scope": "sandbox", "world_id": world_id}
     for _ in range(2):
         response = client.post("/api/demo/reset", params=params, headers=reset_admin_headers)
-        assert response.status_code == 200
+        assert response.status_code == 200, response.text
     assert platform.post("/api/saas/sandbox/reset").status_code == 401
     platform = login_client(PLATFORM_ORG_ID, saas_app)
     assert platform.post("/api/saas/sandbox/reset").status_code == 429
@@ -476,7 +504,7 @@ def test_session_reset_requires_sandbox_platform(saas_app, reset_clock) -> None:
     anonymous = TestClient(saas_app, base_url="https://testserver", headers=SAAS_CSRF)
     assert anonymous.post("/api/saas/sandbox/reset").status_code == 401
     with database.begin() as db:
-        assert db.scalar(select(func.count()).select_from(LotRow)) == 0
+        assert db.scalar(select(func.count()).select_from(LotRow)) == 6
 
 
 def test_admin_sandbox_reset_needs_token(saas_app, client, reset_admin_headers) -> None:
@@ -509,11 +537,14 @@ def test_demo_scope_reset_unchanged(client, reset_admin_headers, demo_tenants) -
 
 
 def test_reset_cli(demo_tenants, capsys, reset_clock) -> None:
-    main(["reset-sandbox"])
+    with pytest.raises(SystemExit) as bare:
+        main(["reset-sandbox"])
+    assert bare.value.code == 2
+    main(["reset-sandbox", "--world", "seed"])
     printed = capsys.readouterr().out.split()
     assert printed[:2] == ["scope=sandbox", "orgs=8"]
     assert printed[2] == f"reset_at={BASE_NOW.isoformat()}"
-    main(["reset-sandbox"])
+    main(["reset-sandbox", "--world", "seed"])
     capsys.readouterr()
     with database.begin() as db:
         assert db.scalar(select(func.count()).select_from(LotRow)) == 6
@@ -527,12 +558,12 @@ def test_reset_seeds_fresh_database(reset_clock) -> None:
         assert db.scalar(select(func.count()).select_from(LotRow)) == 6
 
 
-def _late_plan(plan_id: str, lot_ids: list[str]) -> None:
+def _late_plan(plan_id: str, lot_ids: list[str], org_id: str) -> None:
     with database.begin() as db:
         db.add(
             PlanRow(
                 plan_id=plan_id,
-                org_id=PLATFORM_ORG_ID,
+                org_id=org_id,
                 scenario_id="default",
                 version=1,
                 status="planned",
@@ -549,26 +580,22 @@ def _late_plan(plan_id: str, lot_ids: list[str]) -> None:
 def test_reset_logs_out_first_and_drops_plans_written_mid_reset(
     saas_app, monkeypatch, reset_clock
 ) -> None:
-    run_lots()
+    from freshswitch_backend.persistence import sandbox_world
+
     platform = login_client(PLATFORM_ORG_ID, saas_app)
     other = login_client(PLATFORM_ORG_ID, saas_app)
-    lot_ids = [lot_id for lot_id, *_ in _sandbox_snapshot()["lots"]]
+    org_id = platform.get("/api/me").json()["active_org"]["org_id"]
     seen: list[int] = []
-    real_clear = sandbox_reset_module.coldchain_store.clear
-    real_baseline = sandbox_reset_module.reset_to_baseline
+    real_erase = sandbox_world.erase_world
 
-    def clear(org_id: str) -> int:
+    def erase(db, world_id: str, org_ids: list[str], *, keep_structure: bool) -> None:
         if not seen:
             seen.append(other.get("/api/me").status_code)
-            _late_plan("plan-mid-early", lot_ids)
-        return real_clear(org_id)
+            _late_plan("plan-mid-early", [], org_id)
+            _late_plan("plan-mid-late", [], org_id)
+        real_erase(db, world_id, org_ids, keep_structure=keep_structure)
 
-    def baseline(db, *args, **kwargs) -> int:
-        _late_plan("plan-mid-late", lot_ids)
-        return real_baseline(db, *args, **kwargs)
-
-    monkeypatch.setattr(sandbox_reset_module.coldchain_store, "clear", clear)
-    monkeypatch.setattr(sandbox_reset_module, "reset_to_baseline", baseline)
+    monkeypatch.setattr(sandbox_world, "erase_world", erase)
     assert platform.post("/api/saas/sandbox/reset").status_code == 200
     assert seen == [401]
     after = _sandbox_snapshot()
@@ -587,7 +614,9 @@ def test_failed_reset_does_not_start_cooldown(saas_app, monkeypatch, reset_clock
     def broken(*args, **kwargs) -> int:
         raise RuntimeError("seed failed")
 
-    monkeypatch.setattr(sandbox_reset_module, "reset_to_baseline", broken)
+    monkeypatch.setattr(
+        "freshswitch_backend.persistence.sandbox_world.reseed_world", broken
+    )
     with pytest.raises(RuntimeError):
         platform.post("/api/saas/sandbox/reset")
     monkeypatch.undo()
@@ -599,7 +628,7 @@ def test_failed_reset_does_not_start_cooldown(saas_app, monkeypatch, reset_clock
 
 def test_reset_with_fuel_shock_scenario(demo_tenants, reset_clock) -> None:
     run_lots()
-    main(["reset-sandbox", "--scenario", "fuel-shock"])
+    main(["reset-sandbox", "--world", "seed", "--scenario", "fuel-shock"])
     lots = _sandbox_snapshot()["lots"]
     assert len(lots) == 8
     assert {scenario for *_, scenario in lots} == {"fuel-shock"}

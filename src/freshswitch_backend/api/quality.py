@@ -27,6 +27,7 @@ from freshswitch_backend.quality.models import (
     ObservationList,
     ResetResult,
 )
+from freshswitch_backend.quality.store import ScopeRef
 
 router = APIRouter(prefix="/quality", tags=["quality"])
 
@@ -36,27 +37,27 @@ SANDBOX_WRITE = "데모 플랫폼은 품질 관측을 추가·삭제·초기화�
 OTHER_SCOPE = "다른 학습 범위의 품질 관측은 다룰 수 없습니다"
 
 
-def _principal_scope(principal: Principal | None) -> LearningScope:
+def _principal_scope(principal: Principal | None) -> ScopeRef:
     return learning_scope(principal.org_id if principal is not None else None)
 
 
-def caller_scope(principal: OptionalPrincipal) -> LearningScope:
+def caller_scope(principal: OptionalPrincipal) -> ScopeRef:
     return _principal_scope(principal)
 
 
-Scope = Annotated[LearningScope, Depends(caller_scope)]
+Scope = Annotated[ScopeRef, Depends(caller_scope)]
 
 
-def impact_viewer(principal: OptionalPrincipal) -> LearningScope:
+def impact_viewer(principal: OptionalPrincipal) -> ScopeRef:
     if principal is not None and principal.org_type != "platform":
         raise HTTPException(status_code=403, detail=IMPACT_PLATFORM_ONLY)
     return _principal_scope(principal)
 
 
-ImpactScope = Annotated[LearningScope, Depends(impact_viewer)]
+ImpactScope = Annotated[ScopeRef, Depends(impact_viewer)]
 
 
-def observation_viewer(request: Request, principal: OptionalPrincipal) -> LearningScope:
+def observation_viewer(request: Request, principal: OptionalPrincipal) -> ScopeRef:
     if not app_settings(request).saas_mode:
         return _principal_scope(principal)
     if principal is None:
@@ -66,10 +67,10 @@ def observation_viewer(request: Request, principal: OptionalPrincipal) -> Learni
     return _principal_scope(principal)
 
 
-ViewerScope = Annotated[LearningScope, Depends(observation_viewer)]
+ViewerScope = Annotated[ScopeRef, Depends(observation_viewer)]
 
 
-def observation_writer(request: Request, principal: OptionalPrincipal) -> LearningScope:
+def observation_writer(request: Request, principal: OptionalPrincipal) -> ScopeRef:
     if not app_settings(request).saas_mode:
         return _principal_scope(principal)
     if principal is None:
@@ -81,11 +82,11 @@ def observation_writer(request: Request, principal: OptionalPrincipal) -> Learni
     return _principal_scope(principal)
 
 
-WriterScope = Annotated[LearningScope, Depends(observation_writer)]
+WriterScope = Annotated[ScopeRef, Depends(observation_writer)]
 
 
 class ResetTarget:
-    def __init__(self, org_type: str | None, scope: LearningScope) -> None:
+    def __init__(self, org_type: str | None, scope: ScopeRef | str) -> None:
         self.org_type = org_type
         self.scope = scope
 
@@ -95,10 +96,16 @@ def reset_target(
     principal: OptionalPrincipal,
     credential: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
     scope: Annotated[LearningScope | None, Query()] = None,
+    world_id: str | None = None,
 ) -> ResetTarget:
     if credential is not None:
         require_demo_reset(credential)
-        return ResetTarget(None, scope or "demo")
+        chosen = scope or "demo"
+        if chosen == "sandbox" and not world_id:
+            raise HTTPException(status_code=422, detail="world_id가 필요합니다")
+        if chosen == "sandbox":
+            return ResetTarget(None, ScopeRef("sandbox", world_id))
+        return ResetTarget(None, chosen)
     if principal is None and not app_settings(request).saas_mode:
         if scope not in (None, "demo"):
             raise HTTPException(status_code=403, detail=OTHER_SCOPE)
@@ -108,7 +115,7 @@ def reset_target(
     if app_settings(request).saas_mode and org_sandbox(principal.org_id):
         raise HTTPException(status_code=403, detail=SANDBOX_WRITE)
     own = _principal_scope(principal)
-    if scope is not None and scope != own:
+    if scope is not None and scope != own.kind:
         raise HTTPException(status_code=403, detail=OTHER_SCOPE)
     return ResetTarget(principal.org_type, own)
 
@@ -172,6 +179,8 @@ def reset(target: Target, seed: Annotated[bool, Query()] = True) -> ResetResult:
         )
     except QualityAccessDenied as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except QualityInputError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return ResetResult(cleared=cleared, seeded=seeded)
 
 
