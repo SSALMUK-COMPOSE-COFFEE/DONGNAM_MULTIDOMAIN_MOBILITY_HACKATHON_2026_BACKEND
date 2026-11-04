@@ -23,19 +23,22 @@ def _register(client: TestClient, device_id: str):
     return client.post("/api/saas/devices", json={"device_id": device_id})
 
 
-@pytest.mark.parametrize("device_id", ["arduino-01", "dev-1", "sim-01"])
-def test_sandbox_org_needs_demo_prefix(saas_app, device_id: str) -> None:
+@pytest.mark.parametrize("device_id", ["arduino-01", "dev-1", "demo-sensor-1"])
+def test_visitor_world_rewrites_device_ids(saas_app, device_id: str) -> None:
     sandbox = login_client(PLATFORM_ORG_ID, saas_app)
-    rejected = _register(sandbox, device_id)
+    token = sandbox.get("/api/me").json()["world"]["world_id"][1:]
+    created = _register(sandbox, device_id)
+    assert created.status_code == 201, created.text
+    slug = device_id[5:] if device_id.lower().startswith("demo-") else device_id
+    assert created.json()["device_id"] == f"d{token}-{slug}"
+    assert created.json()["device_token"]
+
+
+def test_visitor_register_rejects_simulator_ids(saas_app) -> None:
+    sandbox = login_client(PLATFORM_ORG_ID, saas_app)
+    rejected = _register(sandbox, "sim-01")
     assert rejected.status_code == 422
     assert sandbox.get("/api/saas/devices").json() == []
-
-
-def test_sandbox_org_registers_demo_device(saas_app) -> None:
-    sandbox = login_client(PLATFORM_ORG_ID, saas_app)
-    created = _register(sandbox, "demo-sensor-1")
-    assert created.status_code == 201, created.text
-    assert created.json()["device_token"]
 
 
 @pytest.mark.parametrize(

@@ -2,15 +2,19 @@ import time
 
 import pytest
 from saas_fixtures import PLATFORM_ORG_ID
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from freshswitch_backend.coldchain import coldchain_store
 from freshswitch_backend.coldchain.models import SimulationRequest
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence import sandbox_reset as sandbox_reset_module
+from freshswitch_backend.persistence.sandbox_world import SEED_ID, lock_world
 from freshswitch_backend.persistence.tables import (
+    DEMO_ORG,
     AlertRow,
+    BindingRow,
     ContainerRow,
+    OrganizationRow,
     ReadingRow,
     RunRow,
 )
@@ -50,7 +54,8 @@ def _wait_sent(run, count: int) -> None:
 
 def test_reset_from_other_process_stops_running_simulation(demo_tenants, monkeypatch) -> None:
     with database.begin() as db:
-        assert PLATFORM_ORG_ID in sandbox_reset_module.sandbox_org_ids(db)
+        org = db.get(OrganizationRow, PLATFORM_ORG_ID)
+        assert org is not None and org.sandbox and org.world_id == SEED_ID
     info, run = _start(PLATFORM_ORG_ID)
     _wait_sent(run, 3)
     monkeypatch.setattr(sandbox_reset_module.coldchain_store, "clear", lambda org_id: 0)
@@ -73,13 +78,16 @@ def test_reset_waits_for_tick_in_progress(demo_tenants, monkeypatch) -> None:
     _, run = _start(PLATFORM_ORG_ID)
     _wait_sent(run, 2)
     monkeypatch.setattr(sandbox_reset_module.coldchain_store, "clear", lambda org_id: 0)
-    with sandbox_reset_module._exclusive():
+    with lock_world(SEED_ID):
         held = run.info.sent
         time.sleep(INTERVAL * 6)
         assert run.info.sent == held
         assert run.thread.is_alive()
         with database.begin() as db:
-            sandbox_reset_module._wipe(db, [PLATFORM_ORG_ID])
+            db.execute(delete(AlertRow).where(AlertRow.org_id == PLATFORM_ORG_ID))
+            db.execute(delete(BindingRow).where(BindingRow.org_id == PLATFORM_ORG_ID))
+            db.execute(delete(ContainerRow).where(ContainerRow.org_id == PLATFORM_ORG_ID))
+            db.execute(delete(RunRow).where(RunRow.org_id == PLATFORM_ORG_ID))
     run.thread.join(timeout=5)
     assert not run.thread.is_alive()
     assert run.cancelled
@@ -95,6 +103,17 @@ def test_in_process_reset_still_stops_runs_quickly(demo_tenants) -> None:
     assert not run.thread.is_alive()
     with database.begin() as db:
         assert db.get(RunRow, info.run_id) is None
+
+
+def test_demo_reset_lock_pauses_only_the_demo_run(demo_tenants) -> None:
+    _, run = _start(DEMO_ORG)
+    _wait_sent(run, 2)
+    with sandbox_reset_module.demo_reset_lock():
+        held = run.info.sent
+        time.sleep(INTERVAL * 6)
+        assert run.info.sent == held
+        assert run.thread.is_alive()
+    _wait_sent(run, held + 1)
 
 
 def test_normal_stream_run_completes_and_persists_done(demo_tenants) -> None:
@@ -138,7 +157,7 @@ def test_streams_waiting_on_reset_do_not_hold_connections(demo_tenants, monkeypa
     for run in runs:
         _wait_sent(run, 1)
     monkeypatch.setattr(sandbox_reset_module.coldchain_store, "clear", lambda org_id: 0)
-    with sandbox_reset_module._exclusive():
+    with lock_world(SEED_ID):
         held = [run.info.sent for run in runs]
         time.sleep(1)
         assert database.engine.pool.checkedout() <= 4

@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     session_ttl: int = Field(default=14 * 24 * 3600, gt=0)
     session_cookie_secure: bool = True
     saas_mode: bool = False
+    sandbox_purge_interval_seconds: int = Field(default=600, ge=0)
 
     @field_validator("api_prefix", "session_cookie_path")
     @classmethod

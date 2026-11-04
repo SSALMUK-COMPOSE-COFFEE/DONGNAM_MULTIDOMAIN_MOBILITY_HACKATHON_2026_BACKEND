@@ -1,6 +1,6 @@
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import PLATFORM_ORG_ID, login_client
+from saas_fixtures import PLATFORM_ORG_ID, seed_client
 from sqlalchemy import select
 
 from freshswitch_backend.config import get_settings
@@ -13,6 +13,7 @@ from freshswitch_backend.persistence.seed import shipper_org_id
 from freshswitch_backend.persistence.tables import ObservationRow
 from freshswitch_backend.planning.store import store
 from freshswitch_backend.quality import quality_history
+from freshswitch_backend.quality.store import ScopeRef
 
 LOT = "lot-sancheong-sb-1"
 CELL = ("strawberry", "HKHKG", "sea")
@@ -49,9 +50,10 @@ def _arrival(client: TestClient, plan_id: str, lot: str = LOT, pct: float = 40) 
 
 
 def _arrival_ids(scope: str, plan_id: str) -> set[str]:
+    ref = ScopeRef(scope, "seed") if scope == "sandbox" else scope
     return {
         o.id
-        for o in quality_history.observations(scope)
+        for o in quality_history.observations(ref)
         if o.origin == "arrival" and o.plan_id == plan_id
     }
 
@@ -85,11 +87,11 @@ def _sandbox_plan(saas_app) -> tuple[TestClient, str]:
     assert scenario is not None
     ids = []
     for lot in scenario.lots:
-        shipper = login_client(shipper_org_id(lot.shipper_id), saas_app)
+        shipper = seed_client(shipper_org_id(lot.shipper_id), saas_app)
         response = shipper.post("/api/saas/shipper/lots", json=_lot_body(lot))
         assert response.status_code == 201, response.text
         ids.append(response.json()["registered"]["id"])
-    platform = login_client(PLATFORM_ORG_ID, saas_app)
+    platform = seed_client(PLATFORM_ORG_ID, saas_app)
     created = platform.post("/api/saas/platform/plans", json={"lot_ids": ids})
     assert created.status_code == 201, created.text
     return platform, created.json()["plan_id"]
@@ -236,10 +238,10 @@ def test_sandbox_reset_drops_arrival_observations(saas_app) -> None:
     assert _cell_n(platform) == n_before + 1
 
     reset_sandbox()
-    platform = login_client(PLATFORM_ORG_ID, saas_app)
+    platform = seed_client(PLATFORM_ORG_ID, saas_app)
     assert _cell_n(platform) == n_before
     assert _arrival_ids("sandbox", plan_id) == set()
-    sandbox = quality_history.observations("sandbox")
+    sandbox = quality_history.observations(ScopeRef("sandbox", "seed"))
     assert sorted(o.id for o in sandbox) == sorted(
         f"sandbox-{item.id}" for item in quality_history._seed
     )

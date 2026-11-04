@@ -89,20 +89,22 @@ def test_preview_does_not_save_and_matches_create(saas_app) -> None:
 def test_preview_validates_lots(saas_app) -> None:
     shipper = login_client(SHIPPER_ORG_ID, saas_app)
     lot = next(lot for lot in get_scenario("default").lots if lot.shipper_id == "sh-jinju")
-    assert shipper.post("/api/saas/shipper/lots", json=_lot_body(lot)).status_code == 201
+    registered = shipper.post("/api/saas/shipper/lots", json=_lot_body(lot))
+    assert registered.status_code == 201, registered.text
+    lot_id = registered.json()["registered"]["id"]
     platform = login_client(PLATFORM_ORG_ID, saas_app)
 
     assert platform.post(PREVIEW, json={"lot_ids": []}).status_code == 422
     assert platform.post(PREVIEW, json={"lot_ids": ["lot-missing"]}).status_code in (404, 422)
-    assert shipper.post(PREVIEW, json={"lot_ids": [lot.id]}).status_code == 403
+    assert shipper.post(PREVIEW, json={"lot_ids": [lot_id]}).status_code == 403
 
     create_real_platform()
     real = password_client(saas_app, REAL_PLATFORM_EMAIL, REAL_PLATFORM_PASSWORD)
     assert real.post(PREVIEW, json={"lot_ids": [lot.id]}).status_code == 422
 
-    created = platform.post("/api/saas/platform/plans", json={"lot_ids": [lot.id]})
+    created = platform.post("/api/saas/platform/plans", json={"lot_ids": [lot_id]})
     assert created.status_code == 201
-    assert platform.post(PREVIEW, json={"lot_ids": [lot.id]}).status_code == 409
+    assert platform.post(PREVIEW, json={"lot_ids": [lot_id]}).status_code == 409
 
 
 def test_preview_requires_login_in_saas_mode(saas_app) -> None:

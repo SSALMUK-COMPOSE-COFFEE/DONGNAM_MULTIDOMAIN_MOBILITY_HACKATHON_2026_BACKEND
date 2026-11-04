@@ -2,7 +2,7 @@ import hashlib
 
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import demo_org_type
+from saas_fixtures import seed_client
 from sqlalchemy import select
 
 from freshswitch_backend.coldchain import DeviceDenied, coldchain_store
@@ -41,13 +41,7 @@ def app(demo_tenants):
 
 
 def _login(app, org_id: str) -> TestClient:
-    client = TestClient(app, base_url="https://testserver")
-    response = client.post(
-        "/api/auth/demo-login", json={"org_type": demo_org_type(org_id), "org_id": org_id}
-    )
-    assert response.status_code == 200, response.text
-    assert response.json()["active_org"]["org_id"] == org_id
-    return client
+    return seed_client(org_id, app)
 
 
 def _anonymous(app) -> TestClient:
@@ -71,9 +65,18 @@ def plan_id(demo_tenants) -> str:
 @pytest.fixture
 def simulated(app, plan_id: str) -> str:
     platform = _login(app, PLATFORM)
+    registered = platform.post(
+        "/api/saas/devices", json={"device_id": "demo-sensor-01"}, headers=CSRF
+    )
+    assert registered.status_code == 201, registered.text
     run = platform.post(
         "/api/coldchain/simulate",
-        json={"preset": "power_cut_restore", "plan_id": plan_id, "container_id": "CA-01"},
+        json={
+            "preset": "power_cut_restore",
+            "plan_id": plan_id,
+            "container_id": "CA-01",
+            "device_id": "demo-sensor-01",
+        },
         headers=CSRF,
     )
     assert run.status_code == 200, run.text
@@ -183,7 +186,7 @@ def test_simulator_ids_cannot_be_registered(app, plan_id: str) -> None:
         json={"plan_id": plan_id, "container_id": "CA-01", "device_id": "sim-01"},
         headers=CSRF,
     )
-    assert run.status_code == 200, run.text
+    assert run.status_code == 422, run.text
 
 
 def test_logged_in_simulation_needs_registered_device(app, plan_id: str) -> None:
@@ -247,10 +250,11 @@ def test_devices_require_login_and_csrf(app) -> None:
     assert anonymous.get("/api/saas/devices").status_code == 401
     assert anonymous.post("/api/saas/devices", json={"device_id": "x"}).status_code == 401
     platform = _login(app, PLATFORM)
+    platform.headers.clear()
     assert platform.post("/api/saas/devices", json={"device_id": "x"}).status_code == 403
 
 
-def test_registration_replaces_demo_binding(demo_tenants) -> None:
+def test_registration_keeps_another_org_binding(demo_tenants) -> None:
     app = create_app()
     anonymous = _anonymous(app)
     bound = anonymous.post(
@@ -259,22 +263,13 @@ def test_registration_replaces_demo_binding(demo_tenants) -> None:
     assert bound.status_code == 201
     platform = _login(app, PLATFORM)
     created = platform.post("/api/saas/devices", json={"device_id": "arduino-01"}, headers=CSRF)
-    assert created.status_code == 201
-    assert created.json()["binding"] is None
+    assert created.status_code == 409
     with database.begin() as db:
-        assert db.get(BindingRow, "arduino-01") is None
-    assert anonymous.get("/api/coldchain/bindings").json() == []
-    rebind = anonymous.post(
-        "/api/coldchain/bindings", json={"device_id": "arduino-01", "container_id": "CA-01"}
-    )
-    assert rebind.status_code == 403
-    sent = anonymous.post(
-        "/api/coldchain/readings",
-        json={"device_id": "arduino-01", "container_id": "CA-01", "temp_c": 1.0, "power_on": True},
-    )
-    assert sent.status_code == 401
-    simulated = anonymous.post("/api/coldchain/simulate", json={"device_id": "arduino-01"})
-    assert simulated.status_code == 403
+        binding = db.get(BindingRow, "arduino-01")
+        assert binding is not None and binding.org_id == DEMO_ORG
+        assert db.get(DeviceRow, "arduino-01") is None
+    listed = anonymous.get("/api/coldchain/bindings").json()
+    assert [item["device_id"] for item in listed] == ["arduino-01"]
 
 
 def test_registered_device_readings_need_token(app, plan_id: str) -> None:

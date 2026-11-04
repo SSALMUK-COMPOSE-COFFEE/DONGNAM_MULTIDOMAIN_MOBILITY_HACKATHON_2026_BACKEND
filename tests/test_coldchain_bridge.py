@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import demo_org_type
+from saas_fixtures import seed_client
 
 from freshswitch_backend.config import get_settings
 from freshswitch_backend.data.loader import get_scenario
@@ -65,12 +65,7 @@ def saas_app(demo_tenants):
 
 
 def _login(app, org_id: str) -> TestClient:
-    client = TestClient(app, base_url="https://testserver", headers=CSRF)
-    response = client.post(
-        "/api/auth/demo-login", json={"org_type": demo_org_type(org_id), "org_id": org_id}
-    )
-    assert response.status_code == 200, response.text
-    return client
+    return seed_client(org_id, app)
 
 
 def test_fake_reading_with_device_token_reaches_platform_monitor(saas_app) -> None:

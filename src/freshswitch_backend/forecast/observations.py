@@ -2,7 +2,7 @@ from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 
 from freshswitch_backend.domain.models import Voyage
@@ -26,6 +26,7 @@ from freshswitch_backend.integrations.mof_vessel import (
 from freshswitch_backend.persistence import Database, database
 from freshswitch_backend.persistence.tables import DelayObservationRow
 from freshswitch_backend.quality import LearningScope, learning_scope
+from freshswitch_backend.quality.store import ScopeRef, scope_ref
 
 OWN_SOURCE = "자체 관측: schedule-check로 매칭된 실제 출항(계획 ETD 대비 해수부 출항일시)"
 DEMO_SCOPE: LearningScope = "demo"
@@ -91,19 +92,33 @@ def _unique(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(best.values())
 
 
+def _ref(org_id: str) -> ScopeRef:
+    return scope_ref(learning_scope(org_id))
+
+
+def _delay_scope(scope: ScopeRef):
+    kind = DelayObservationRow.scope == scope.kind
+    if scope.world_id is None:
+        return and_(kind, DelayObservationRow.world_id.is_(None))
+    return and_(kind, DelayObservationRow.world_id == scope.world_id)
+
+
 def record_matches(
     org_id: str,
     matches: Iterable[DepartureMatch],
     plan_id: str | None = None,
     target: Database | None = None,
 ) -> int:
-    scope = learning_scope(org_id)
-    if scope == DEMO_SCOPE:
+    scope = _ref(org_id)
+    if scope.kind == DEMO_SCOPE:
         return 0
     rows = _unique([r for m in matches if (r := _row(m)) is not None])
     if not rows:
         return 0
-    values = [{**r, "org_id": org_id, "scope": scope, "plan_id": plan_id} for r in rows]
+    values = [
+        {**r, "org_id": org_id, "scope": scope.kind, "world_id": scope.world_id, "plan_id": plan_id}
+        for r in rows
+    ]
     statement = insert(DelayObservationRow).values(values)
     statement = statement.on_conflict_do_update(
         constraint="uq_delay_observations_org_vessel_planned",
@@ -118,6 +133,7 @@ def record_matches(
                 "vessel_kind",
                 "departure_at",
                 "delay_hours",
+                "world_id",
             )
         }
         | {"recorded_at": func.now()},
@@ -137,15 +153,22 @@ def record_schedule_check(
     max_gap_hours: float = MAX_GAP_HOURS,
     target: Database | None = None,
 ) -> int:
-    if not trusted or learning_scope(org_id) == DEMO_SCOPE:
+    if not trusted or _ref(org_id).kind == DEMO_SCOPE:
         return 0
     matches = match_departures(planned_voyages(voyages), real_movements(movements), max_gap_hours)
     return record_matches(org_id, matches, plan_id, target)
 
 
-def clear_observations(scope: LearningScope, target: Database | None = None) -> int:
+def clear_observations(
+    scope: LearningScope | ScopeRef,
+    target: Database | None = None,
+    world_id: str | None = None,
+) -> int:
+    ref = scope_ref(scope, world_id)
+    if ref.kind == "sandbox" and ref.world_id is None:
+        raise ValueError("world_id가 필요합니다")
     with (target or database).begin() as db:
-        result = db.execute(delete(DelayObservationRow).where(DelayObservationRow.scope == scope))
+        result = db.execute(delete(DelayObservationRow).where(_delay_scope(ref)))
     return result.rowcount or 0
 
 
@@ -156,12 +179,10 @@ def clear_org_observations(org_id: str, target: Database | None = None) -> int:
 
 
 def own_records(org_id: str, target: Database | None = None) -> list[DepartureRecord]:
-    scope = learning_scope(org_id)
+    scope = _ref(org_id)
     with (target or database).begin() as db:
         rows = db.scalars(
-            select(DelayObservationRow)
-            .where(DelayObservationRow.scope == scope)
-            .order_by(DelayObservationRow.id)
+            select(DelayObservationRow).where(_delay_scope(scope)).order_by(DelayObservationRow.id)
         ).all()
     latest = {(r.vessel_key, r.planned_departure_at): r for r in rows}
     return [

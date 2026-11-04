@@ -2,7 +2,7 @@ from datetime import datetime
 
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import demo_org_type
+from saas_fixtures import seed_client
 
 from freshswitch_backend.coldchain import coldchain_store
 from freshswitch_backend.config import get_settings
@@ -24,12 +24,7 @@ def saas(demo_tenants):
 
 
 def _login(app, org_id: str) -> TestClient:
-    client = TestClient(app, base_url="https://testserver")
-    response = client.post(
-        "/api/auth/demo-login", json={"org_type": demo_org_type(org_id), "org_id": org_id}
-    )
-    assert response.status_code == 200, response.text
-    return client
+    return seed_client(org_id, app)
 
 
 def _two_plans() -> tuple[str, str]:
@@ -52,9 +47,16 @@ def test_coldchain1_token_reading_of_deleted_plan_binding_is_rejected(saas, monk
     monkeypatch.setattr(coldchain_store, "clock", lambda: datetime(2026, 11, 17, 12, tzinfo=KST))
     first, second = _two_plans()
     platform = _login(saas, PLATFORM)
+    registered = platform.post("/api/saas/devices", json={"device_id": "demo-sensor-01"}, headers=CSRF)
+    assert registered.status_code == 201, registered.text
     run = platform.post(
         "/api/coldchain/simulate",
-        json={"preset": "power_cut_restore", "plan_id": second, "container_id": "CA-01"},
+        json={
+            "preset": "power_cut_restore",
+            "plan_id": second,
+            "container_id": "CA-01",
+            "device_id": "demo-sensor-01",
+        },
         headers=CSRF,
     )
     assert run.status_code == 200, run.text

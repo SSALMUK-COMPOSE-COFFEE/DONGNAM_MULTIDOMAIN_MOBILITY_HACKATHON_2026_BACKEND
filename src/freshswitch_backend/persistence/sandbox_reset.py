@@ -5,33 +5,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, func, select
-from sqlalchemy.orm import Session
+from sqlalchemy import func, select
 
 from freshswitch_backend.coldchain import coldchain_store
-from freshswitch_backend.lots import lot_store
-from freshswitch_backend.lots.store import release_lots
-from freshswitch_backend.persistence.database import RESET_LOCK, database, get_meta, set_meta
-from freshswitch_backend.persistence.seed import SCENARIO_ID, reset_to_baseline
-from freshswitch_backend.persistence.tables import (
-    AlertRow,
-    AuthSessionRow,
-    BindingRow,
-    ContainerRow,
-    DeviceRow,
-    LotRow,
-    MembershipRow,
-    OrganizationRow,
-    PlanRow,
-    RunRow,
-    UserRow,
-)
-from freshswitch_backend.quality import quality_history
+from freshswitch_backend.persistence.database import RESET_LOCK, database
+from freshswitch_backend.persistence.seed import SCENARIO_ID
 
 SANDBOX_SCOPE = "sandbox"
 RESET_COOLDOWN = timedelta(seconds=60)
-RESET_META_KEY = "sandbox_reset_at"
-DEMO_DEVICE_PREFIX = "demo-"
 
 
 class SandboxResetCooldown(Exception):
@@ -44,6 +25,7 @@ class SandboxResetCooldown(Exception):
 class SandboxResetResult:
     orgs: int
     reset_at: datetime
+    world_id: str | None = None
 
 
 def _now() -> datetime:
@@ -51,104 +33,111 @@ def _now() -> datetime:
 
 
 clock: Callable[[], datetime] = _now
-_lock = threading.Lock()
-
-
-def sandbox_org_ids(db: Session) -> list[str]:
-    return list(
-        db.scalars(
-            select(OrganizationRow.id)
-            .where(OrganizationRow.sandbox.is_(True))
-            .order_by(OrganizationRow.id)
-        )
-    )
+_demo_lock = threading.Lock()
 
 
 @contextmanager
-def _exclusive() -> Iterator[None]:
-    with _lock, database.engine.connect() as conn:
+def demo_reset_lock() -> Iterator[None]:
+    database.init()
+    with _demo_lock:
+        conn = database.engine.connect()
         conn.execute(select(func.pg_advisory_lock(RESET_LOCK)))
         conn.commit()
         try:
             yield
         finally:
-            conn.execute(select(func.pg_advisory_unlock(RESET_LOCK)))
-            conn.commit()
+            try:
+                conn.execute(select(func.pg_advisory_unlock(RESET_LOCK)))
+                conn.commit()
+            finally:
+                conn.close()
 
 
-def _check_cooldown(db: Session, now: datetime, cooldown: timedelta | None) -> None:
-    last = get_meta(db, RESET_META_KEY)
-    if cooldown is None or last is None:
+def _world_cooldown(reset_at: datetime | None, now: datetime, cooldown: timedelta | None) -> None:
+    if cooldown is None or reset_at is None:
         return
-    remaining = cooldown - (now - datetime.fromisoformat(last))
+    remaining = cooldown - (now - reset_at)
     if remaining > timedelta(0):
         raise SandboxResetCooldown(max(1, math.ceil(remaining.total_seconds())))
 
 
-def _logout(db: Session, keep_token_hash: str | None) -> None:
-    demo_users = (
-        select(MembershipRow.user_id)
-        .join(OrganizationRow, OrganizationRow.id == MembershipRow.org_id)
-        .join(UserRow, UserRow.id == MembershipRow.user_id)
-        .where(OrganizationRow.sandbox.is_(True), UserRow.is_demo.is_(True))
+def _reset_one(
+    world_id: str,
+    keep_token_hash: str | None,
+    cooldown: timedelta | None,
+    scenario_id: str,
+) -> SandboxResetResult:
+    from freshswitch_backend.persistence.sandbox_world import (
+        SEED_ID,
+        WorldNotFound,
+        drop_world_sessions,
+        erase_world,
+        lock_world,
+        reseed_world,
     )
-    sessions = delete(AuthSessionRow).where(AuthSessionRow.user_id.in_(demo_users))
-    if keep_token_hash is not None:
-        sessions = sessions.where(AuthSessionRow.token_hash != keep_token_hash)
-    db.execute(sessions)
+    from freshswitch_backend.persistence.sandbox_world import _org_ids as world_org_ids
+    from freshswitch_backend.persistence.tables import SandboxWorldRow
+
+    now = clock()
+    with database.begin() as db:
+        world = db.get(SandboxWorldRow, world_id)
+        if world is None:
+            if world_id != SEED_ID:
+                raise WorldNotFound(world_id)
+            from freshswitch_backend.persistence.seed import seed_demo_tenants, seed_lots
+
+            seed_demo_tenants(db)
+            seed_lots(db, scenario_id, now)
+            world = db.get(SandboxWorldRow, world_id)
+        if world is None:
+            raise WorldNotFound(world_id)
+        _world_cooldown(world.reset_at, now, cooldown)
+        org_ids = world_org_ids(db, world_id)
+    with lock_world(world_id):
+        coldchain_store.stop_orgs(org_ids)
+        with database.begin() as db:
+            world = db.get(SandboxWorldRow, world_id)
+            if world is None:
+                raise WorldNotFound(world_id)
+            _world_cooldown(world.reset_at, now, cooldown)
+            drop_world_sessions(db, world_id, keep_token_hash)
+        with database.begin() as db:
+            if db.get(SandboxWorldRow, world_id) is None:
+                raise WorldNotFound(world_id)
+            erase_world(db, world_id, world_org_ids(db, world_id), keep_structure=True)
+        with database.begin() as db:
+            if db.get(SandboxWorldRow, world_id) is None:
+                raise WorldNotFound(world_id)
+            erase_world(db, world_id, world_org_ids(db, world_id), keep_structure=True)
+            orgs = reseed_world(db, world_id, now, scenario_id)
+    return SandboxResetResult(orgs=orgs, reset_at=now, world_id=world_id)
 
 
-def _wipe(db: Session, org_ids: list[str]) -> None:
-    db.execute(select(LotRow.id).where(LotRow.shipper_org_id.in_(org_ids)).with_for_update())
-    db.execute(delete(AlertRow).where(AlertRow.org_id.in_(org_ids)))
-    db.execute(delete(ContainerRow).where(ContainerRow.org_id.in_(org_ids)))
-    db.execute(delete(BindingRow).where(BindingRow.org_id.in_(org_ids)))
-    db.execute(delete(RunRow).where(RunRow.org_id.in_(org_ids)))
-    db.execute(
-        delete(DeviceRow).where(
-            DeviceRow.org_id.in_(org_ids), DeviceRow.device_id.istartswith(DEMO_DEVICE_PREFIX)
+def _reset_all(scenario_id: str) -> SandboxResetResult:
+    from freshswitch_backend.persistence.sandbox_world import SEED_ID
+    from freshswitch_backend.persistence.tables import SandboxWorldRow
+
+    now = clock()
+    with database.begin() as db:
+        ids = list(
+            db.scalars(select(SandboxWorldRow.id).where(SandboxWorldRow.id != SEED_ID))
         )
-    )
-    db.execute(delete(LotRow).where(LotRow.shipper_org_id.in_(org_ids)))
-
-
-def _drop_plans(db: Session, org_ids: list[str], now: datetime) -> None:
-    rows = db.execute(
-        delete(PlanRow)
-        .where(PlanRow.org_id.in_(org_ids))
-        .returning(PlanRow.plan_id, PlanRow.payload["registered_lot_ids"])
-    ).all()
-    plan_ids = [row[0] for row in rows]
-    if not plan_ids:
-        return
-    for binding in db.scalars(select(BindingRow).where(BindingRow.plan_id.in_(plan_ids))):
-        binding.plan_id = None
-        binding.payload = {**binding.payload, "plan_id": None}
-    db.execute(delete(ContainerRow).where(ContainerRow.plan_id.in_(plan_ids)))
-    release_lots(db, {lot_id for row in rows for lot_id in row[1] or []}, now)
+    total = 0
+    for world_id in ids:
+        total += _reset_one(world_id, None, None, scenario_id).orgs
+    return SandboxResetResult(orgs=total, reset_at=now, world_id=None)
 
 
 def reset_sandbox(
     keep_token_hash: str | None = None,
     cooldown: timedelta | None = None,
     scenario_id: str = SCENARIO_ID,
+    *,
+    world_id: str | None = None,
+    all_worlds: bool = False,
 ) -> SandboxResetResult:
-    with _exclusive():
-        now = clock()
-        with database.begin() as db:
-            _check_cooldown(db, now, cooldown)
-            org_ids = sandbox_org_ids(db)
-            _logout(db, keep_token_hash)
-        for org_id in org_ids:
-            coldchain_store.clear(org_id)
-        with database.begin() as db:
-            stamp = lot_store.clock()
-            if org_ids:
-                _wipe(db, org_ids)
-            reset_to_baseline(db, scenario_id, now=stamp)
-            org_ids = sandbox_org_ids(db)
-            _drop_plans(db, org_ids, stamp)
-        quality_history.reset(scope=SANDBOX_SCOPE)
-        with database.begin() as db:
-            set_meta(db, RESET_META_KEY, now.isoformat())
-        return SandboxResetResult(orgs=len(org_ids), reset_at=now)
+    if all_worlds:
+        return _reset_all(scenario_id)
+    from freshswitch_backend.persistence.sandbox_world import SEED_ID
+
+    return _reset_one(world_id or SEED_ID, keep_token_hash, cooldown, scenario_id)

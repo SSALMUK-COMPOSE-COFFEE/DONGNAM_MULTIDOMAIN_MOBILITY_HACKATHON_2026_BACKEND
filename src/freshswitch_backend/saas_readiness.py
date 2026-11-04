@@ -76,6 +76,8 @@ class Readiness:
         params: dict[str, Any] | None = None,
     ) -> Any:
         client = self.clients[role] if role else self.anonymous
+        if role and f"{role}_org" in self.state:
+            self._activate(client, self.state[f"{role}_org"])
         response = client.request(method, self.url(path), json=body, params=params)
         if response.status_code != expect:
             raise StepFailed(f"{method} {path} -> {response.status_code} {response.text[:200]}")
@@ -95,27 +97,38 @@ class Readiness:
         self.out(f"[{mark}] {name:<28} {ms:>9.1f} ms  {detail}".rstrip())
         return passed
 
-    def login(self, role: str) -> str:
-        client = self.make_client()
-        client.headers.update(CSRF)
-        response = client.post(self.url("/auth/demo-login"), json={"org_type": role})
+    def _activate(self, client: httpx.Client, org_id: str) -> None:
+        response = client.request("PUT", self.url("/auth/active-org"), json={"org_id": org_id})
         if response.status_code != 200:
-            raise StepFailed(f"demo-login {role} -> {response.status_code} {response.text[:200]}")
-        active = response.json()["active_org"]
-        if active["org_type"] != role or not active["sandbox"]:
-            raise StepFailed(f"demo-login {role}: unexpected active org {active['org_id']}")
-        cookies = list(response.cookies.jar)
-        if not cookies:
-            raise StepFailed(f"demo-login {role}: no session cookie")
-        base_path = urlsplit(self.url("/")).path
-        for cookie in cookies:
-            if not base_path.startswith(cookie.path.rstrip("/") + "/"):
-                raise StepFailed(f"cookie path {cookie.path} does not cover {base_path}")
-        client.cookies.clear()
-        client.headers["Cookie"] = "; ".join(f"{c.name}={c.value}" for c in cookies)
-        self.clients[role] = client
-        self.state[f"{role}_org"] = active["org_id"]
-        return f"org={active['org_id']} cookie_path={cookies[0].path}"
+            raise StepFailed(f"active-org {org_id} -> {response.status_code} {response.text[:200]}")
+
+    def login(self, role: str) -> str:
+        if "shared" not in self.clients:
+            client = self.make_client()
+            client.headers.update(CSRF)
+            response = client.post(self.url("/auth/demo-login"), json={"new_world": True})
+            if response.status_code != 200:
+                raise StepFailed(f"demo-login -> {response.status_code} {response.text[:200]}")
+            me = response.json()
+            cookies = list(response.cookies.jar)
+            if not cookies:
+                raise StepFailed("demo-login: no session cookie")
+            base_path = urlsplit(self.url("/")).path
+            for cookie in cookies:
+                if not base_path.startswith(cookie.path.rstrip("/") + "/"):
+                    raise StepFailed(f"cookie path {cookie.path} does not cover {base_path}")
+            client.cookies.clear()
+            client.headers["Cookie"] = "; ".join(f"{c.name}={c.value}" for c in cookies)
+            for kind in ROLES:
+                match = next(item for item in me["memberships"] if item["org_type"] == kind)
+                self.state[f"{kind}_org"] = match["org_id"]
+                self.clients[kind] = client
+            self.clients["shared"] = client
+        else:
+            client = self.clients["shared"]
+        org_id = self.state[f"{role}_org"]
+        self._activate(client, org_id)
+        return f"org={org_id} cookie_path={client.headers.get('Cookie', '').split('=', 1)[0]}"
 
     def health(self) -> str:
         body = self.call(None, "GET", "/health")
@@ -136,7 +149,11 @@ class Readiness:
         self.state["shipper_ids"] = [s["id"] for s in catalog["shippers"]]
         shipper_id = self.state["shipper_ids"][0]
         scenario = get_scenario("default")
-        lot = next((x for x in scenario.lots if x.shipper_id == shipper_id), scenario.lots[0])
+        mark = shipper_id.rfind("-sh-")
+        bare = shipper_id[mark + 1 :] if mark >= 0 else shipper_id
+        lot = next(
+            (x for x in scenario.lots if x.shipper_id in {shipper_id, bare}), scenario.lots[0]
+        )
         lot_id = f"readiness-{uuid.uuid4().hex[:10]}"
         body = {
             "product": lot.product_id,
@@ -179,10 +196,24 @@ class Readiness:
 
     def change_event(self) -> str:
         plan_id = self.state["plan_id"]
+        session = self.call("platform", "GET", f"/plans/{plan_id}")
+        lots = session.get("scenario", {}).get("lots", [])
+        target = next(
+            (
+                item["id"]
+                for item in lots
+                if item["id"] == "lot-sancheong-sb-1" or str(item["id"]).endswith("-lot-sancheong-sb-1")
+            ),
+            self.state["lot_id"],
+        )
+        pallets = next(
+            (item.get("pallets", self.state["pallets"]) for item in lots if item["id"] == target),
+            self.state["pallets"],
+        )
         event = {
             "type": "reduce",
-            "lot_id": self.state["lot_id"],
-            "new_pallets": max(1, self.state["pallets"] - 1),
+            "lot_id": target,
+            "new_pallets": max(1, pallets - 1),
         }
         body = {"event": event, "idempotency_key": f"readiness-{plan_id}"}
         result = self.call("platform", "POST", f"/plans/{plan_id}/events", body)
@@ -264,20 +295,14 @@ class Readiness:
         return f"source={source} fallback={reason} sentence={sentence!r}"
 
     def cleanup(self) -> str:
-        plan_id = self.state.get("plan_id")
-        if plan_id:
-            self.call("platform", "DELETE", f"/plans/{plan_id}", expect=204)
-        lot_id = self.state.get("lot_id")
-        if lot_id:
-            self.call("shipper", "DELETE", f"/saas/shipper/lots/{lot_id}", expect=204)
-        return f"removed plan={plan_id} lot={lot_id}"
+        self.call("platform", "POST", "/saas/sandbox/reset")
+        return "reset world"
 
     def flow(self) -> bool:
         if not self.step("health", self.health):
             return False
-        for role in ROLES:
-            if not self.step(f"demo-login {role}", lambda role=role: self.login(role)):
-                return False
+        if not self.step("demo-login", lambda: self.login("platform")):
+            return False
         steps = [
             ("shipper registers lot", self.register),
             ("platform generates plan", self.create_plan),
@@ -305,7 +330,11 @@ class Readiness:
         finally:
             if not self.keep and "lot_id" in self.state:
                 ok = self.step("cleanup", self.cleanup) and ok
+            closed: set[int] = set()
             for client in [self.anonymous, *self.clients.values()]:
+                if client is None or id(client) in closed:
+                    continue
+                closed.add(id(client))
                 client.close()
         return ok
 

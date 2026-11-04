@@ -2,7 +2,7 @@ import re
 
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import PLATFORM_ORG_ID, create_real_platform, login_client
+from saas_fixtures import PLATFORM_ORG_ID, create_real_platform, seed_client
 from sqlalchemy import update
 
 from freshswitch_backend.config import get_settings
@@ -94,10 +94,10 @@ def _lot_body(lot) -> dict:
 def _sandbox_activity(app) -> None:
     lots = [lot for lot in _default().lots if lot.shipper_id in ("sh-jinju", "sh-sangju")]
     for lot in lots:
-        client = login_client(shipper_org_id(lot.shipper_id), app)
+        client = seed_client(shipper_org_id(lot.shipper_id), app)
         body = {**_lot_body(lot), "pallets": 1}
         assert client.post("/api/saas/shipper/lots", json=body).status_code == 201
-    platform = login_client(PLATFORM_ORG_ID, app)
+    platform = seed_client(PLATFORM_ORG_ID, app)
     created = platform.post("/api/saas/platform/plans", json={"lot_ids": [lot.id for lot in lots]})
     assert created.status_code == 201, created.text
     with database.begin() as db:

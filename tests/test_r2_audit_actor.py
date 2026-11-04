@@ -277,9 +277,10 @@ def test_purge_expired_sessions(saas_app, capsys) -> None:
 
 def test_demo_user_sessions_are_capped(saas_app, monkeypatch) -> None:
     monkeypatch.setattr(auth, "DEMO_SESSION_CAP", 3)
+    app = create_app(get_settings().model_copy(update={"saas_mode": False}))
     clients = []
     for _ in range(5):
-        client = TestClient(saas_app, base_url="https://testserver", headers=SAAS_CSRF)
+        client = TestClient(app, base_url="https://testserver", headers=SAAS_CSRF)
         body = {"org_type": "platform", "org_id": PLATFORM_ORG_ID}
         assert client.post("/api/auth/demo-login", json=body).status_code == 200
         clients.append(client)
@@ -293,10 +294,11 @@ def test_demo_user_sessions_are_capped(saas_app, monkeypatch) -> None:
 def test_recently_used_demo_session_survives_the_cap(saas_app, monkeypatch) -> None:
     monkeypatch.setattr(auth, "DEMO_SESSION_CAP", 3)
     monkeypatch.setattr(auth, "LAST_SEEN_INTERVAL", timedelta(0))
+    app = create_app(get_settings().model_copy(update={"saas_mode": False}))
     body = {"org_type": "platform", "org_id": PLATFORM_ORG_ID}
 
     def login() -> TestClient:
-        client = TestClient(saas_app, base_url="https://testserver", headers=SAAS_CSRF)
+        client = TestClient(app, base_url="https://testserver", headers=SAAS_CSRF)
         assert client.post("/api/auth/demo-login", json=body).status_code == 200
         return client
 
@@ -310,17 +312,29 @@ def test_recently_used_demo_session_survives_the_cap(saas_app, monkeypatch) -> N
     assert middle.get("/api/me").status_code == 401
 
 
-def test_demo_sessions_use_short_ttl(saas_app) -> None:
+def test_demo_cookie_outlives_the_initial_world_after_a_plan(saas_app, monkeypatch) -> None:
+    from freshswitch_backend.persistence.sandbox_world import INITIAL_TTL
+
     client = TestClient(saas_app, base_url="https://testserver", headers=SAAS_CSRF)
-    body = {"org_type": "platform", "org_id": PLATFORM_ORG_ID}
-    response = client.post("/api/auth/demo-login", json=body)
-    assert response.status_code == 200
-    ttl = int(auth.DEMO_SESSION_TTL.total_seconds())
-    assert f"Max-Age={ttl}" in response.headers["set-cookie"]
+    response = client.post("/api/auth/demo-login", json={"new_world": True})
+    assert response.status_code == 200, response.text
+    max_age = int(response.headers["set-cookie"].split("Max-Age=")[1].split(";")[0])
+    assert max_age == int(auth.DEMO_SESSION_TTL.total_seconds())
+    user_id = response.json()["user"]["id"]
     with database.begin() as db:
-        session = db.scalars(select(AuthSessionRow)).one()
+        session = db.scalar(select(AuthSessionRow).where(AuthSessionRow.user_id == user_id))
+    assert session is not None
     lifetime = session.expires_at - session.created_at
-    assert abs(lifetime - auth.DEMO_SESSION_TTL) < timedelta(minutes=1)
+    assert abs(lifetime - INITIAL_TTL) < timedelta(minutes=1)
+    created = client.post("/api/saas/platform/plans", json={"include_registered": True})
+    assert created.status_code == 201, created.text
+    later = datetime.now(UTC) + INITIAL_TTL + timedelta(minutes=5)
+    monkeypatch.setattr(auth, "_now", lambda: later)
+    assert client.get("/api/me").status_code == 200
+    with database.begin() as db:
+        extended = db.scalar(select(AuthSessionRow).where(AuthSessionRow.user_id == user_id))
+    assert extended is not None
+    assert extended.expires_at > later
 
 
 def test_org_header_does_not_change_stored_active_org(saas_app) -> None:
@@ -373,12 +387,16 @@ def test_active_org_switch_requires_login(saas_app) -> None:
 
 
 def test_0004_downgrade_drops_non_demo_observations() -> None:
+    from freshswitch_backend.persistence.sandbox_world import ensure_seed_world
+
     with database.begin() as db:
+        ensure_seed_world(db)
         for scope in ("demo", "sandbox", "live"):
             db.add(
                 ObservationRow(
                     id=f"obs-{scope}",
                     scope=scope,
+                    world_id="seed" if scope == "sandbox" else None,
                     origin="inspection",
                     product_id="strawberry",
                     recorded_at=datetime.now(UTC),

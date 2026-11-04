@@ -205,7 +205,15 @@ class LotStore:
     ) -> RegisteredLot:
         try:
             with self._lock, self._db.begin() as db:
-                db.execute(select(func.pg_advisory_xact_lock(LOT_ID_LOCK)))
+                world_id = db.scalar(
+                    select(OrganizationRow.world_id).where(OrganizationRow.id == org_id)
+                )
+                if world_id:
+                    db.execute(
+                        select(func.pg_advisory_xact_lock(LOT_ID_LOCK, func.hashtext(world_id)))
+                    )
+                else:
+                    db.execute(select(func.pg_advisory_xact_lock(LOT_ID_LOCK)))
                 lot, scenario_id, packhouse = build(self._reservation(db))
                 row = self._row(lot, scenario_id, packhouse, org_id)
                 db.add(row)

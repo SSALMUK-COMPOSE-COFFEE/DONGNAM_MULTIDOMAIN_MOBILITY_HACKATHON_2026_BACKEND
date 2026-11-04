@@ -85,6 +85,19 @@ def _lock_own_plan(db: Session, plan_id: str, org_id: str) -> PlanRow:
     return found
 
 
+def _same_forwarder_world(platform: OrganizationRow, forwarder: OrganizationRow) -> bool:
+    if platform.world_id and forwarder.world_id:
+        return (
+            platform.world_id == forwarder.world_id and platform.sandbox and forwarder.sandbox
+        )
+    return (
+        platform.world_id is None
+        and forwarder.world_id is None
+        and not platform.sandbox
+        and not forwarder.sandbox
+    )
+
+
 @router.put("/platform/plans/{plan_id}/forwarder")
 def assign_forwarder(
     plan_id: str, body: ForwarderAssignRequest, principal: PlatformPrincipal
@@ -97,7 +110,7 @@ def assign_forwarder(
             forwarder is None
             or forwarder.type != "forwarder"
             or platform is None
-            or forwarder.sandbox != platform.sandbox
+            or not _same_forwarder_world(platform, forwarder)
         ):
             raise HTTPException(status_code=422, detail="포워더 조직이 아닙니다")
         awaiting = bool(awaiting_shippers(db, plan))

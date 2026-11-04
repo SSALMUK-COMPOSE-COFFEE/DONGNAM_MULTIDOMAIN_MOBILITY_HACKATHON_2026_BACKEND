@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import demo_org_type
+from saas_fixtures import seed_client
 
 from freshswitch_backend.coldchain import ColdchainParams
 from freshswitch_backend.coldchain.models import ReadingIn, TimelinePoint
@@ -122,12 +122,7 @@ def saas_app(demo_tenants):
 
 
 def _login(app, org_id: str) -> TestClient:
-    client = TestClient(app, base_url="https://testserver", headers=CSRF)
-    response = client.post(
-        "/api/auth/demo-login", json={"org_type": demo_org_type(org_id), "org_id": org_id}
-    )
-    assert response.status_code == 200, response.text
-    return client
+    return seed_client(org_id, app)
 
 
 @pytest.fixture
@@ -142,6 +137,8 @@ def saas_plan(saas_app) -> str:
     with database.begin() as db:
         db.add(PlanForwarderRow(plan_id=session.plan_id, forwarder_org_id=FORWARDER))
     platform = _login(saas_app, PLATFORM)
+    registered = platform.post("/api/saas/devices", json={"device_id": "demo-sensor-01"})
+    assert registered.status_code == 201, registered.text
     for container_id in ("CA-01", "CA-02"):
         run = platform.post(
             "/api/coldchain/simulate",
@@ -149,6 +146,7 @@ def saas_plan(saas_app) -> str:
                 "preset": "short_outage",
                 "plan_id": session.plan_id,
                 "container_id": container_id,
+                "device_id": "demo-sensor-01",
             },
         )
         assert run.status_code == 200, run.text

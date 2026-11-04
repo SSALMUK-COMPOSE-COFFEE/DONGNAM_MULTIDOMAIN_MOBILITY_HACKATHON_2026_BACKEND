@@ -134,21 +134,31 @@ def _register(client: TestClient, lot_id: str, shipper: str, source: str) -> str
     return response.json()["registered"]["id"]
 
 
+def _world_org(client: TestClient, slug: str) -> str:
+    me = client.get("/api/me").json()
+    return next(
+        item["org_id"]
+        for item in me["memberships"]
+        if item["org_id"] == slug or item["org_id"].endswith(f"-{slug}")
+    )
+
+
 @pytest.fixture
 def worlds(saas_app) -> dict:
     real_shipper = _real_shipper(saas_app)
     real_lot = _register(real_shipper, REAL_LOT_ID, REAL_SHIPPER_ID, "lot-jinju-sb-1")
-    demo_shipper = login_client(SHIPPER_ORG_ID, saas_app)
-    demo_lot = _register(demo_shipper, "lot-jinju-sb-1", "sh-jinju", "lot-jinju-sb-1")
+    demo_platform = login_client(PLATFORM_ORG_ID, saas_app)
+    demo_lots = [row["id"] for row in demo_platform.get("/api/saas/platform/lots").json()]
     real_platform_org = create_real_platform()
     return {
         "app": saas_app,
         "real_lot": real_lot,
-        "demo_lot": demo_lot,
+        "demo_lots": demo_lots,
         "real_shipper": real_shipper,
         "real_platform_org": real_platform_org,
         "real_platform": password_client(saas_app, REAL_PLATFORM_EMAIL, REAL_PLATFORM_PASSWORD),
-        "demo_platform": login_client(PLATFORM_ORG_ID, saas_app),
+        "demo_platform": demo_platform,
+        "demo_forwarder": _world_org(demo_platform, FORWARDER_ORG_ID),
         "real_forwarder": _real_forwarder(saas_app),
     }
 
@@ -177,27 +187,25 @@ def test_me_reports_sandbox(saas_app) -> None:
     demo = login_client(SHIPPER_ORG_ID, saas_app)
     me = demo.get("/api/me").json()
     assert me["active_org"]["sandbox"] is True
-    assert [m["sandbox"] for m in me["memberships"]] == [True]
+    assert me["memberships"] and all(item["sandbox"] for item in me["memberships"])
+    assert me["world"]["world_id"].startswith("w")
 
 
-def test_demo_login_only_issues_sandbox_demo_accounts(saas_app) -> None:
+def test_demo_login_opens_a_visitor_world_and_ignores_foreign_org(saas_app) -> None:
     client = TestClient(saas_app, base_url="https://testserver", headers=SAAS_CSRF)
     chosen = client.post(
         "/api/auth/demo-login", json={"org_type": "shipper", "org_id": "shipper-sancheong"}
     )
-    assert chosen.status_code == 200
-    assert chosen.json()["active_org"]["org_id"] == "shipper-sancheong"
-    wrong_type = client.post(
-        "/api/auth/demo-login", json={"org_type": "forwarder", "org_id": "shipper-sancheong"}
-    )
-    assert wrong_type.status_code == 404
-    with database.begin() as db:
-        db.execute(
-            update(OrganizationRow)
-            .where(OrganizationRow.id == PLATFORM_ORG_ID)
-            .values(sandbox=False)
-        )
-    assert client.post("/api/auth/demo-login", json={"org_type": "platform"}).status_code == 404
+    assert chosen.status_code == 200, chosen.text
+    body = chosen.json()
+    assert body["active_org"]["org_id"].endswith("-shipper-jinju")
+    assert body["world"]["world_id"].startswith("w")
+    foreign = client.post("/api/auth/demo-login", json={"org_id": "shipper-sancheong"})
+    assert foreign.status_code == 403
+    switched = client.post("/api/auth/demo-login", json={"org_type": "forwarder"})
+    assert switched.status_code == 200, switched.text
+    assert switched.json()["active_org"]["org_id"].endswith("-forwarder-dongnam")
+    assert switched.json()["world"]["world_id"] == body["world"]["world_id"]
 
 
 def test_demo_login_ignores_real_org_ids(worlds) -> None:
@@ -205,12 +213,14 @@ def test_demo_login_ignores_real_org_ids(worlds) -> None:
     real = client.post(
         "/api/auth/demo-login", json={"org_type": "shipper", "org_id": REAL_SHIPPER_ORG}
     )
-    assert real.status_code == 404
+    assert real.status_code == 200, real.text
+    assert real.json()["active_org"]["org_id"] != REAL_SHIPPER_ORG
+    assert real.json()["active_org"]["sandbox"] is True
     platform = client.post(
         "/api/auth/demo-login",
-        json={"org_type": "platform", "org_id": worlds["real_platform_org"]},
+        json={"org_id": worlds["real_platform_org"]},
     )
-    assert platform.status_code == 404
+    assert platform.status_code == 403
 
 
 def test_saas_password_login_rejects_demo_accounts(saas_app) -> None:
@@ -230,7 +240,8 @@ def test_saas_password_login_rejects_demo_accounts(saas_app) -> None:
 
 def test_demo_platform_cannot_see_real_lots(worlds) -> None:
     demo_rows = worlds["demo_platform"].get("/api/saas/platform/lots").json()
-    assert [r["id"] for r in demo_rows] == [worlds["demo_lot"]]
+    assert [r["id"] for r in demo_rows] == worlds["demo_lots"]
+    assert worlds["real_lot"] not in worlds["demo_lots"]
     real_rows = worlds["real_platform"].get("/api/saas/platform/lots").json()
     assert [r["id"] for r in real_rows] == [worlds["real_lot"]]
 
@@ -253,13 +264,13 @@ def test_demo_platform_cannot_plan_real_lots(worlds) -> None:
     included = demo.post("/api/saas/platform/plans", json={"include_registered": True})
     assert included.status_code == 201, included.text
     lot_ids = {lot["id"] for lot in included.json()["scenario"]["lots"]}
-    assert lot_ids == {worlds["demo_lot"]}
+    assert lot_ids == set(worlds["demo_lots"])
     assert worlds["real_shipper"].get("/api/saas/shipper/lots").json()[0]["status"] == "registered"
 
 
 def test_real_platform_cannot_plan_demo_lots(worlds) -> None:
     real = worlds["real_platform"]
-    pulled = real.post("/api/saas/platform/plans", json={"lot_ids": [worlds["demo_lot"]]})
+    pulled = real.post("/api/saas/platform/plans", json={"lot_ids": [worlds["demo_lots"][0]]})
     assert pulled.status_code == 422
     included = real.post("/api/saas/platform/plans", json={"include_registered": True})
     assert included.status_code == 201, included.text
@@ -276,14 +287,15 @@ def test_org_list_stays_within_sandbox(worlds) -> None:
     demo = {o["org_id"] for o in worlds["demo_platform"].get("/api/saas/orgs").json()}
     assert REAL_SHIPPER_ORG not in demo
     assert worlds["real_forwarder"] not in demo
-    assert FORWARDER_ORG_ID in demo
+    assert worlds["demo_forwarder"] in demo
+    assert FORWARDER_ORG_ID not in demo
     real = {o["org_id"] for o in worlds["real_platform"].get("/api/saas/orgs").json()}
     assert real == {REAL_SHIPPER_ORG, worlds["real_forwarder"]}
 
 
 def test_forwarder_assignment_stays_within_sandbox(worlds) -> None:
     demo = worlds["demo_platform"]
-    demo_plan = demo.post("/api/saas/platform/plans", json={"lot_ids": [worlds["demo_lot"]]})
+    demo_plan = demo.post("/api/saas/platform/plans", json={"lot_ids": [worlds["demo_lots"][0]]})
     demo_plan_id = demo_plan.json()["plan_id"]
     cross = demo.put(
         f"/api/saas/platform/plans/{demo_plan_id}/forwarder",
@@ -295,7 +307,7 @@ def test_forwarder_assignment_stays_within_sandbox(worlds) -> None:
     real_plan_id = real_plan.json()["plan_id"]
     reverse = real.put(
         f"/api/saas/platform/plans/{real_plan_id}/forwarder",
-        json={"forwarder_org_id": FORWARDER_ORG_ID},
+        json={"forwarder_org_id": worlds["demo_forwarder"]},
     )
     assert reverse.status_code == 422
     assign = {"forwarder_org_id": worlds["real_forwarder"]}
@@ -418,6 +430,7 @@ def test_every_route_rejects_anonymous_in_saas_mode(saas_app) -> None:
     assert len(routes) > 60
     checked = 0
     for method, path, route in routes:
+        client.cookies.clear()
         response = client.request(method, path, json={})
         detail = response.json().get("detail") if response.content else None
         if route.endpoint in PUBLIC_ENDPOINTS:

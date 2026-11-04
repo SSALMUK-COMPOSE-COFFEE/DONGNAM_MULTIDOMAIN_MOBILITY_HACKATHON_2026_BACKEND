@@ -37,6 +37,15 @@ class TenantCatalog:
         return {s.shipper.id: s.org_name for s in self.shippers}
 
 
+def _profile_rank_id(profile_id: str) -> str:
+    if profile_id.startswith("sh-"):
+        return profile_id
+    mark = profile_id.rfind("-sh-")
+    if mark < 0:
+        return profile_id
+    return profile_id[mark + 1 :]
+
+
 def load_catalog(
     org_id: str, base: Scenario | None = None, peer_of: str | None = None
 ) -> TenantCatalog:
@@ -54,7 +63,7 @@ def load_catalog(
     with database.begin() as db:
         rows = db.execute(query).all()
     order = {s.id: i for i, s in enumerate(base.shippers)} if base is not None else {}
-    rows = sorted(rows, key=lambda row: order.get(row[0].id, len(order)))
+    rows = sorted(rows, key=lambda row: order.get(_profile_rank_id(row[0].id), len(order)))
     shippers: list[TenantShipper] = []
     packhouses: dict[str, Packhouse] = {}
     for profile, packhouse, org_name in rows:

@@ -2,7 +2,7 @@ import json
 import re
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
@@ -14,7 +14,8 @@ from freshswitch_backend.data.loader import load_scenarios
 from freshswitch_backend.integrations import SnapshotDate, SnapshotStore
 from freshswitch_backend.integrations.mof_snapshot import load_demo_fixture
 from freshswitch_backend.lots import lot_store
-from freshswitch_backend.persistence.sandbox_reset import reset_sandbox
+from freshswitch_backend.persistence.sandbox_reset import demo_reset_lock, reset_sandbox
+from freshswitch_backend.persistence.sandbox_world import WorldNotFound
 from freshswitch_backend.persistence.tables import DEMO_ORG
 from freshswitch_backend.planning.store import store
 from freshswitch_backend.quality import quality_history
@@ -769,17 +770,29 @@ def curl_script(base: str = DEFAULT_CURL_BASE) -> str:
 
 @router.post("/reset", dependencies=[Depends(require_demo_reset)])
 def reset(
-    include_lots: bool = Query(False), scope: Literal["demo", "sandbox"] = Query("demo")
+    include_lots: bool = Query(False),
+    scope: Literal["demo", "sandbox"] = Query("demo"),
+    world_id: str | None = None,
+    all_worlds: bool = Query(False, alias="all"),
 ) -> ResetResponse | SandboxResetResponse:
     if scope == "sandbox":
-        return sandbox_reset_response(reset_sandbox())
-    cleared_sessions = store.clear(DEMO_ORG)
-    cleared_quality, _ = quality_history.reset()
+        if not world_id and not all_worlds:
+            raise HTTPException(status_code=422, detail="world_id 또는 all=true가 필요합니다")
+        try:
+            result = reset_sandbox(world_id=world_id, all_worlds=all_worlds)
+        except WorldNotFound as exc:
+            raise HTTPException(status_code=404, detail="세계를 찾을 수 없습니다") from exc
+        return sandbox_reset_response(result)
+    with demo_reset_lock():
+        cleared_sessions = store.clear(DEMO_ORG)
+        cleared_quality, _ = quality_history.reset()
+        cleared_coldchain = coldchain_store.clear(DEMO_ORG)
+        cleared_lots = lot_store.clear(DEMO_ORG) if include_lots else 0
     return ResetResponse(
         cleared_sessions=cleared_sessions,
-        cleared_coldchain_containers=coldchain_store.clear(DEMO_ORG),
+        cleared_coldchain_containers=cleared_coldchain,
         cleared_quality_observations=cleared_quality,
-        cleared_lots=lot_store.clear(DEMO_ORG) if include_lots else 0,
+        cleared_lots=cleared_lots,
     )
 
 

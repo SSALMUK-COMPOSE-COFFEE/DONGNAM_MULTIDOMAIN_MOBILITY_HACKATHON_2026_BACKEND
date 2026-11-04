@@ -250,6 +250,19 @@ def test_downgrade_0012_converts_shipper_confirmation_status(
                 ),
                 {"id": plan_id},
             )
+            conn.execute(
+                text(
+                    "UPDATE users SET world_id = NULL WHERE id IN ("
+                    "SELECT user_id FROM memberships WHERE org_id IN ("
+                    "SELECT org_id FROM plan_sessions))"
+                )
+            )
+            conn.execute(
+                text(
+                    "UPDATE organizations SET world_id = NULL "
+                    "WHERE id IN (SELECT org_id FROM plan_sessions)"
+                )
+            )
             config.attributes["connection"] = conn
             command.downgrade(config, "0011")
             assert MigrationContext.configure(conn).get_current_revision() == "0011"

@@ -31,7 +31,7 @@ def _go_real(saas_login):
     orgs = {shipper_org_id(s.id) for s in scenario.shippers} | {FORWARDER_ORG_ID}
     clients = {org: saas_login(org) for org in sorted(orgs)}
     with database.begin() as db:
-        db.execute(update(OrganizationRow).values(sandbox=False))
+        db.execute(update(OrganizationRow).values(sandbox=False, world_id=None))
     return clients.__getitem__
 
 

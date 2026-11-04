@@ -1,7 +1,7 @@
 import json
 
 from fastapi.testclient import TestClient
-from saas_fixtures import FORWARDER_ORG_ID, PLATFORM_ORG_ID, login_client
+from saas_fixtures import FORWARDER_ORG_ID, PLATFORM_ORG_ID, seed_client
 from test_saas_api import REDUCE, _assign, _platform_plan
 
 from freshswitch_backend.config import get_settings
@@ -59,7 +59,7 @@ def test_saas_plan_orders_use_gross_weight_wording(
 
 def test_saas_mode_app_rebuilds_plan_orders(saas_login) -> None:
     saas_app = create_app(get_settings().model_copy(update={"saas_mode": True}))
-    platform = login_client(PLATFORM_ORG_ID, saas_app)
+    platform = seed_client(PLATFORM_ORG_ID, saas_app)
     plan_id = _platform_plan(platform, saas_login)["plan_id"]
     _applied(platform, plan_id)
     order = platform.get(f"/api/plans/{plan_id}/orders").json()[-1]

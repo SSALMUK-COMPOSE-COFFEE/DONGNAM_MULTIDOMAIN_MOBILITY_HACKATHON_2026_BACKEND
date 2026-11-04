@@ -232,10 +232,11 @@ def _check_rate(
     request: Request,
     principal: Principal,
 ) -> None:
-    visitor = f"{principal.org_id}:{principal.user_id}:{client_address(request)}"
+    subject = principal.world_id or principal.org_id
+    visitor = f"{subject}:{principal.user_id}:{client_address(request)}"
     retry = limiter.hit(routes[0], visitor)
     if retry is None:
-        retry = limiter.hit(routes[1], principal.org_id)
+        retry = limiter.hit(routes[1], subject)
     if retry is not None:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,

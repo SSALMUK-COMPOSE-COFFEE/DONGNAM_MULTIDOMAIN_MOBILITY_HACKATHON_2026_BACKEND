@@ -242,7 +242,11 @@ def test_single_voyage_event_api_shape_is_unchanged(client: TestClient) -> None:
     assert explicit["event"] == old["event"]
     assert [a["id"] for a in old["alternatives"]] == [a["id"] for a in explicit["alternatives"]]
     assert old["recommended_id"] == explicit["recommended_id"] == "pull_forward"
-    assert old["alternatives"][0]["plan"] == explicit["alternatives"][0]["plan"]
+    old_plan = {key: value for key, value in old["alternatives"][0]["plan"].items() if key != "solve_ms"}
+    explicit_plan = {
+        key: value for key, value in explicit["alternatives"][0]["plan"].items() if key != "solve_ms"
+    }
+    assert old_plan == explicit_plan
     duplicate = client.post(
         url,
         json={

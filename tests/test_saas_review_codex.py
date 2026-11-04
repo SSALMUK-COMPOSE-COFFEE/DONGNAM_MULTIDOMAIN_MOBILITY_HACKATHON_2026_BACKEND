@@ -6,7 +6,7 @@ from saas_fixtures import (
     FORWARDER_ORG_ID,
     PLATFORM_ORG_ID,
     SHIPPER_ORG_ID,
-    login_client,
+    seed_client,
 )
 from sqlalchemy import delete
 
@@ -19,6 +19,7 @@ from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.seed import shipper_org_id
 from freshswitch_backend.persistence.tables import AuthSessionRow, PlanForwarderRow
 from freshswitch_backend.quality import quality_history
+from freshswitch_backend.quality.store import ScopeRef
 
 OTHER_EXCESS_NOTE = "비공개 메모 1234567원"
 OWN_NOTE = "자기 검수 메모"
@@ -48,11 +49,11 @@ def _world_plan(client_app) -> tuple[TestClient, str]:
     assert scenario is not None
     ids = []
     for lot in scenario.lots:
-        shipper = login_client(shipper_org_id(lot.shipper_id), client_app)
+        shipper = seed_client(shipper_org_id(lot.shipper_id), client_app)
         response = shipper.post("/api/saas/shipper/lots", json=_lot_body(lot))
         assert response.status_code == 201, response.text
         ids.append(response.json()["registered"]["id"])
-    platform = login_client(PLATFORM_ORG_ID, client_app)
+    platform = seed_client(PLATFORM_ORG_ID, client_app)
     created = platform.post("/api/saas/platform/plans", json={"lot_ids": ids})
     assert created.status_code == 201, created.text
     plan_id = created.json()["plan_id"]
@@ -82,11 +83,11 @@ def test_codex2_anonymous_cannot_read_raw_observations(saas_app) -> None:
 
 @pytest.mark.parametrize("org_id", [SHIPPER_ORG_ID, FORWARDER_ORG_ID])
 def test_codex2_only_platform_reads_raw_observations(saas_app, org_id: str) -> None:
-    client = login_client(org_id, saas_app)
-    target = quality_history.observations("sandbox")[0].id
+    client = seed_client(org_id, saas_app)
+    target = quality_history.observations(ScopeRef("sandbox", "seed"))[0].id
     assert client.get("/api/quality/observations").status_code == 403
     assert client.get(f"/api/quality/observations/{target}").status_code == 403
-    platform = login_client(PLATFORM_ORG_ID, saas_app)
+    platform = seed_client(PLATFORM_ORG_ID, saas_app)
     assert platform.get("/api/quality/observations").status_code == 200
     assert platform.get(f"/api/quality/observations/{target}").status_code == 200
 
@@ -96,7 +97,7 @@ def test_codex3_anonymous_and_non_platform_cannot_add_observation(saas_app) -> N
     anonymous = TestClient(saas_app, base_url="https://testserver")
     assert anonymous.post("/api/quality/observations", json=OBSERVATION).status_code == 401
     for org_id in (SHIPPER_ORG_ID, FORWARDER_ORG_ID, PLATFORM_ORG_ID):
-        client = login_client(org_id, saas_app)
+        client = seed_client(org_id, saas_app)
         assert client.post("/api/quality/observations", json=OBSERVATION).status_code == 403
     assert len(quality_history.observations()) == before
 
@@ -112,7 +113,7 @@ def test_codex4_shipper_plan_hides_other_inspections(saas_app) -> None:
     platform, plan_id = _world_plan(saas_app)
     _inspect(platform, plan_id)
     full = platform.get(f"/api/plans/{plan_id}").json()
-    shipper = login_client(SHIPPER_ORG_ID, saas_app)
+    shipper = seed_client(SHIPPER_ORG_ID, saas_app)
     response = shipper.get(f"/api/saas/shipper/plans/{plan_id}")
     assert response.status_code == 200
     body = response.json()
@@ -134,10 +135,10 @@ def test_codex4_shipper_plan_keeps_only_own_product_tariffs(saas_app) -> None:
     platform, plan_id = _world_plan(saas_app)
     full = platform.get(f"/api/plans/{plan_id}").json()
     assert {t["product_id"] for t in full["plan"]["settlement_tariffs"]} == {"strawberry"}
-    strawberry = login_client(SHIPPER_ORG_ID, saas_app)
+    strawberry = seed_client(SHIPPER_ORG_ID, saas_app)
     own = strawberry.get(f"/api/saas/shipper/plans/{plan_id}").json()
     assert {t["product_id"] for t in own["plan"]["settlement_tariffs"]} == {"strawberry"}
-    grape = login_client(shipper_org_id("sh-sangju"), saas_app)
+    grape = seed_client(shipper_org_id("sh-sangju"), saas_app)
     other = grape.get(f"/api/saas/shipper/plans/{plan_id}").json()
     assert other["plan"]["settlement_tariffs"] == []
 
@@ -145,7 +146,7 @@ def test_codex4_shipper_plan_keeps_only_own_product_tariffs(saas_app) -> None:
 def test_codex5_forwarder_plan_hides_inspection_money_and_notes(saas_app) -> None:
     platform, plan_id = _world_plan(saas_app)
     _inspect(platform, plan_id)
-    forwarder = login_client(FORWARDER_ORG_ID, saas_app)
+    forwarder = seed_client(FORWARDER_ORG_ID, saas_app)
     response = forwarder.get(f"/api/saas/forwarder/plans/{plan_id}")
     assert response.status_code == 200
     inspections = response.json()["arrival_inspections"]
@@ -254,7 +255,7 @@ def _stream_until_revoked(
 
 def test_codex7_stream_closes_after_unassignment(saas_app, monkeypatch) -> None:
     _, plan_id = _world_plan(saas_app)
-    forwarder = login_client(FORWARDER_ORG_ID, saas_app)
+    forwarder = seed_client(FORWARDER_ORG_ID, saas_app)
 
     def unassign() -> None:
         with database.begin() as db:
@@ -265,7 +266,7 @@ def test_codex7_stream_closes_after_unassignment(saas_app, monkeypatch) -> None:
 
 def test_codex7_stream_closes_after_logout(saas_app, monkeypatch) -> None:
     _, plan_id = _world_plan(saas_app)
-    forwarder = login_client(FORWARDER_ORG_ID, saas_app)
+    forwarder = seed_client(FORWARDER_ORG_ID, saas_app)
 
     def logout() -> None:
         with database.begin() as db:
@@ -276,6 +277,6 @@ def test_codex7_stream_closes_after_logout(saas_app, monkeypatch) -> None:
 
 def test_stream_keeps_running_while_allowed(saas_app, monkeypatch) -> None:
     _, plan_id = _world_plan(saas_app)
-    forwarder = login_client(FORWARDER_ORG_ID, saas_app)
+    forwarder = seed_client(FORWARDER_ORG_ID, saas_app)
     elapsed = _stream_until_revoked(monkeypatch, forwarder, plan_id, lambda: None, timeout=2)
     assert elapsed >= 2

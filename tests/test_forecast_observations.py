@@ -138,7 +138,7 @@ def test_clear_observations(demo_tenants):
     voyages, movements = _past_voyages()
     record_schedule_check(SANDBOX, voyages, movements, trusted=True)
     record_schedule_check(live, voyages, movements, trusted=True)
-    assert clear_observations("sandbox") == 3
+    assert clear_observations("sandbox", world_id="seed") == 3
     assert own_records(SANDBOX) == []
     assert len(own_records(live)) == 3
     assert clear_org_observations(live) == 3

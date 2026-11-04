@@ -15,6 +15,7 @@ from freshswitch_backend.persistence.seed import run_lots
 from freshswitch_backend.persistence.tables import MetaRow, ObservationRow, PlanRow
 from freshswitch_backend.planning.budget import PlanningTimeout
 from freshswitch_backend.quality import quality_history
+from freshswitch_backend.quality.store import ScopeRef
 
 PREVIEW = "/api/saas/platform/plans/preview"
 CREATE = "/api/saas/platform/plans"
@@ -108,17 +109,19 @@ def test_preview_rate_limit_per_visitor(platform, pool, saas_app, monkeypatch) -
     assert int(limited.headers["Retry-After"]) >= 1
     assert platform.post(CREATE, json=first).status_code == 201
 
-    me = platform.post(
-        "/api/auth/demo-login", json={"org_type": "platform", "org_id": PLATFORM_ORG_ID}
-    )
-    user_id = me.json()["user"]["id"]
-    same_visitor = Principal(user_id, PLATFORM_ORG_ID, "platform", "admin")
+    me = platform.get("/api/me")
+    assert me.status_code == 200, me.text
+    body = me.json()
+    user_id = body["user"]["id"]
+    world_id = body["world"]["world_id"]
+    org_id = body["active_org"]["org_id"]
+    same_visitor = Principal(user_id, org_id, "platform", "admin", world_id)
     with pytest.raises(HTTPException) as caught:
         compute_limits.check_preview_rate(_fake_request(saas_app), same_visitor)
     assert caught.value.status_code == 429
     other_org = Principal(user_id, "platform-other", "platform", "admin")
     compute_limits.check_preview_rate(_fake_request(saas_app), other_org)
-    other_host = Principal(user_id, PLATFORM_ORG_ID, "platform", "admin")
+    other_host = Principal(user_id, org_id, "platform", "admin", world_id)
     compute_limits.check_preview_rate(_fake_request(saas_app, "10.0.0.9"), other_host)
 
 
@@ -236,13 +239,17 @@ def test_learned_preview_is_read_only(platform, pool) -> None:
     adjustments = response.json()["scenario"]["cost_params"]["loss_adjustments"]
     assert adjustments
 
-    assert len(quality_history.observations("sandbox")) == len(quality_history._seed)
+    world_id = platform.get("/api/me").json()["world"]["world_id"]
+    assert len(quality_history.observations(ScopeRef("sandbox", world_id))) == len(
+        quality_history._seed
+    )
     assert _counts() == before
     quality_history.ensure_seeded()
     fresh = login_client(
         PLATFORM_ORG_ID, create_app(get_settings().model_copy(update={"saas_mode": True}))
     )
-    seeded = fresh.post(PREVIEW, json={"lot_ids": _ids(pool), "use_learned_loss": True})
+    fresh_ids = [lot["id"] for lot in fresh.get("/api/saas/platform/lots").json()[: len(pool)]]
+    seeded = fresh.post(PREVIEW, json={"lot_ids": fresh_ids, "use_learned_loss": True})
     assert seeded.status_code == 200, seeded.text
     assert seeded.json()["scenario"]["cost_params"]["loss_adjustments"] == adjustments
     assert _counts()[0] > before[0]

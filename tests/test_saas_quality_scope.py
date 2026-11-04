@@ -12,12 +12,10 @@ from saas_fixtures import (
 from freshswitch_backend.config import get_settings
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.main import create_app
-from freshswitch_backend.persistence.seed import shipper_org_id
 from freshswitch_backend.quality import learning_scope, quality_history, with_learned_loss
 from freshswitch_backend.quality import store as quality_store
 from freshswitch_backend.quality.models import ObservationIn
-
-ARRIVAL_LOT = "lot-sancheong-sb-1"
+from freshswitch_backend.quality.store import ScopeRef
 
 
 @pytest.fixture
@@ -25,38 +23,19 @@ def saas_app(demo_tenants):
     return create_app(get_settings().model_copy(update={"saas_mode": True}))
 
 
-def _lot_body(lot) -> dict:
-    return {
-        "product": lot.product_id,
-        "pallets": lot.pallets,
-        "ready_date": lot.ready_date.isoformat(),
-        "destination": lot.destination,
-        "sell_by_date": lot.sell_by_date.isoformat(),
-        "sell_window": lot.sell_window,
-        "shipper": lot.shipper_id,
-        "lot_id": lot.id,
-    }
-
-
-def _sandbox_inspected_plan(client_app) -> tuple[TestClient, str]:
-    scenario = get_scenario("default")
-    assert scenario is not None
-    ids = []
-    for lot in scenario.lots:
-        shipper = login_client(shipper_org_id(lot.shipper_id), client_app)
-        response = shipper.post("/api/saas/shipper/lots", json=_lot_body(lot))
-        assert response.status_code == 201, response.text
-        ids.append(response.json()["registered"]["id"])
+def _sandbox_inspected_plan(client_app) -> tuple[TestClient, str, str]:
     platform = login_client(PLATFORM_ORG_ID, client_app)
-    created = platform.post("/api/saas/platform/plans", json={"lot_ids": ids})
+    created = platform.post("/api/saas/platform/plans", json={"include_registered": True})
     assert created.status_code == 201, created.text
     plan_id = created.json()["plan_id"]
+    lot_id = next(lot["id"] for lot in created.json()["scenario"]["lots"] if "sancheong" in lot["id"])
     arrival = platform.post(
         f"/api/plans/{plan_id}/settlement/arrival",
-        json={"lot_id": ARRIVAL_LOT, "inspected_loss_pct": 40},
+        json={"lot_id": lot_id, "inspected_loss_pct": 40},
     )
     assert arrival.status_code == 200, arrival.text
-    return platform, plan_id
+    world_id = platform.get("/api/me").json()["world"]["world_id"]
+    return platform, plan_id, world_id
 
 
 def _real_platform(client_app) -> TestClient:
@@ -65,21 +44,22 @@ def _real_platform(client_app) -> TestClient:
 
 
 def test_learning_scope_of_orgs(demo_tenants) -> None:
-    assert learning_scope(None) == "demo"
-    assert learning_scope("demo") == "demo"
-    assert learning_scope(PLATFORM_ORG_ID) == "sandbox"
-    assert learning_scope(create_real_platform()) == "live"
+    assert learning_scope(None) == ScopeRef("demo", None)
+    assert learning_scope("demo") == ScopeRef("demo", None)
+    assert learning_scope(PLATFORM_ORG_ID) == ScopeRef("sandbox", "seed")
+    assert learning_scope(create_real_platform()) == ScopeRef("live", None)
 
 
 def test_sandbox_arrival_stays_in_sandbox_scope(saas_app, client: TestClient) -> None:
     demo_before = client.get("/api/quality/loss-rates").json()
-    platform, plan_id = _sandbox_inspected_plan(saas_app)
-    assert any(o.plan_id == plan_id for o in quality_history.observations("sandbox"))
+    platform, plan_id, world_id = _sandbox_inspected_plan(saas_app)
+    scope = ScopeRef("sandbox", world_id)
+    assert any(o.plan_id == plan_id for o in quality_history.observations(scope))
     assert all(o.plan_id != plan_id for o in quality_history.observations())
     assert quality_history.observations("live") == []
     assert client.get("/api/quality/loss-rates").json() == demo_before
     sandbox_table = platform.get("/api/quality/loss-rates").json()
-    assert sandbox_table["total_observations"] == len(quality_history.observations("sandbox"))
+    assert sandbox_table["total_observations"] == len(quality_history.observations(scope))
     real = _real_platform(saas_app)
     live_table = real.get("/api/quality/loss-rates").json()
     assert live_table["total_observations"] == 0
@@ -88,16 +68,17 @@ def test_sandbox_arrival_stays_in_sandbox_scope(saas_app, client: TestClient) ->
     assert real.get("/api/quality/observations").json()["count"] == 0
     listed = platform.get("/api/quality/observations").json()["observations"]
     assert any(o["plan_id"] == plan_id for o in listed)
-    assert all(o["id"].startswith("sandbox-") for o in listed if o["origin"] == "seed")
+    world_id = platform.get("/api/me").json()["world"]["world_id"]
+    assert all(o["id"].startswith(f"{world_id}-") for o in listed if o["origin"] == "seed")
 
 
 def test_live_plan_learned_loss_ignores_sandbox_arrivals(saas_app) -> None:
-    _sandbox_inspected_plan(saas_app)
+    _, _, world_id = _sandbox_inspected_plan(saas_app)
     scenario = get_scenario("default")
     assert scenario is not None
     live = with_learned_loss(scenario, scope="live")
     assert live.cost_params.loss_adjustments == []
-    sandbox = with_learned_loss(scenario, scope="sandbox")
+    sandbox = with_learned_loss(scenario, scope=ScopeRef("sandbox", world_id))
     demo = with_learned_loss(scenario)
     assert sandbox.cost_params.loss_adjustments != demo.cost_params.loss_adjustments
 
@@ -118,20 +99,29 @@ def test_live_observation_is_invisible_to_sandbox_and_demo(saas_app, client: Tes
 
 
 def test_admin_reset_targets_one_scope(saas_app, reset_admin_headers) -> None:
-    _sandbox_inspected_plan(saas_app)
+    _, _, world_id = _sandbox_inspected_plan(saas_app)
+    scope = ScopeRef("sandbox", world_id)
     demo_count = len(quality_history.observations())
     admin = TestClient(saas_app, base_url="https://testserver")
-    reset = admin.post(
+    missing = admin.post(
         "/api/quality/reset",
         params={"seed": False, "scope": "sandbox"},
         headers=reset_admin_headers,
     )
+    assert missing.status_code == 422
+    reset = admin.post(
+        "/api/quality/reset",
+        params={"seed": False, "scope": "sandbox", "world_id": world_id},
+        headers=reset_admin_headers,
+    )
     assert reset.status_code == 200, reset.text
     assert reset.json()["cleared"] > 0
-    assert quality_history.observations("sandbox") == []
+    assert quality_history.observations(scope) == []
     assert len(quality_history.observations()) == demo_count
     reseeded = admin.post(
-        "/api/quality/reset", params={"scope": "sandbox"}, headers=reset_admin_headers
+        "/api/quality/reset",
+        params={"scope": "sandbox", "world_id": world_id},
+        headers=reset_admin_headers,
     )
     assert reseeded.json()["seeded"] == len(quality_store._load_seed()[1])
     live = admin.post("/api/quality/reset", params={"scope": "live"}, headers=reset_admin_headers)

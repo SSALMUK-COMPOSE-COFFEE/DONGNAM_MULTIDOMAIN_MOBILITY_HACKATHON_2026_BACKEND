@@ -13,6 +13,7 @@ from freshswitch_backend.intake.savings import estimate_savings
 from freshswitch_backend.intake.service import IntakeError, preview_lot
 from freshswitch_backend.intake.tenants import load_catalog, tenant_scenario
 from freshswitch_backend.lots import ANY_ORG, LotConflict, Reservation, lot_store
+from freshswitch_backend.persistence.sandbox_world import ignores_client_lot_id
 from freshswitch_backend.persistence.tables import DEMO_ORG
 from freshswitch_backend.planning.store import store
 from freshswitch_backend.quality import learning_scope
@@ -125,6 +126,7 @@ def build_preview(
             reserved_ids=reservation.reserved,
             check_season=scope.org_id != DEMO_ORG,
             today=intake_today(),
+            ignore_client_lot_id=ignores_client_lot_id(scope.org_id),
         )
     except IntakeError as exc:
         raise intake_error(exc) from exc

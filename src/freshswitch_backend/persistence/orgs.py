@@ -4,7 +4,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, case, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -48,7 +48,15 @@ def sandbox_of(org_id: str) -> Any:
 
 
 def same_sandbox(column: Any, org_id: str) -> Any:
-    return column == sandbox_of(org_id)
+    world_id = column.table.c.world_id
+    org_type = column.table.c.type
+    viewer_world = (
+        select(OrganizationRow.world_id).where(OrganizationRow.id == org_id).scalar_subquery()
+    )
+    return case(
+        (viewer_world.is_not(None), world_id == viewer_world),
+        else_=and_(world_id.is_(None), column.is_(False), org_type != "demo"),
+    )
 
 
 def org_sandbox(org_id: str, target: Database | None = None) -> bool:
