@@ -1018,6 +1018,22 @@ def genset_instructions(
     return out
 
 
+def _trips(
+    routes: list[VoyagePickup],
+) -> dict[tuple[str, datetime], list[tuple[str, TruckRoute]]]:
+    trips: dict[tuple[str, datetime], list[tuple[str, TruckRoute]]] = {}
+    for voyage_pickup in routes:
+        for route in voyage_pickup.pickup.routes:
+            trips.setdefault((route.truck_id, route.earliest_departure), []).append(
+                (voyage_pickup.voyage_id, route)
+            )
+    return trips
+
+
+def _trip_key(truck_id: str, parts: list[tuple[str, TruckRoute]]) -> tuple[str, str]:
+    return "·".join(dict.fromkeys(voyage_id for voyage_id, _ in parts)), truck_id
+
+
 def _automatic_actions(
     ctx: _Ctx, changed: list[tuple[str, dict[str, int], dict[str, int]]]
 ) -> list[AutomaticAction]:
@@ -1060,17 +1076,27 @@ def _automatic_actions(
     packhouses = {
         p.id: p.name for p in [*ctx.scenario_before.packhouses, *ctx.scenario_after.packhouses]
     }
-    trips: dict[tuple[str, datetime], list[tuple[str, TruckRoute]]] = {}
-    for voyage_pickup in ctx.alternative.routes:
-        for route in voyage_pickup.pickup.routes:
-            key = (voyage_pickup.voyage_id, route.truck_id)
-            if before_sig.get(key) == after_sig.get(key):
-                continue
-            trips.setdefault((route.truck_id, route.earliest_departure), []).append(
-                (voyage_pickup.voyage_id, route)
-            )
-    for (truck_id, earliest), parts in trips.items():
-        voyage_ids = list(dict.fromkeys(voyage_id for voyage_id, _ in parts))
+    trips_before = _trips(ctx.routes_before)
+    trips_after = _trips(ctx.alternative.routes)
+    keys_before = {_trip_key(truck_id, parts) for (truck_id, _), parts in trips_before.items()}
+    keys_after = {_trip_key(truck_id, parts) for (truck_id, _), parts in trips_after.items()}
+    cancelled = sorted(keys_before - keys_after)
+    released = {
+        (voyage_id, truck_id) for voyages, truck_id in cancelled for voyage_id in voyages.split("·")
+    }
+    emit = {
+        _trip_key(truck_id, parts)
+        for (truck_id, _), parts in trips_after.items()
+        if _trip_key(truck_id, parts) not in keys_before
+        or any(
+            before_sig.get(key) != after_sig.get(key) or key in released
+            for key in ((voyage_id, truck_id) for voyage_id, _ in parts)
+        )
+    }
+    for (truck_id, earliest), parts in trips_after.items():
+        voyages, _ = _trip_key(truck_id, parts)
+        if (voyages, truck_id) not in emit:
+            continue
         visits = [stop for _, route in parts for stop in route.stops]
         if len(parts) > 1:
             unique = {stop.stop_id: stop for stop in reversed(visits)}
@@ -1086,7 +1112,7 @@ def _automatic_actions(
             AutomaticAction(
                 kind="truck_dispatch",
                 description=(
-                    f"{truck_id} {'·'.join(voyage_ids)}: {' → '.join(stops)} → 부산신항, "
+                    f"{truck_id} {voyages}: {' → '.join(stops)} → 부산신항, "
                     f"{pallets}파렛트, 출발 {fmt(earliest)}~"
                     f"{fmt(latest)}, 항만 도착 예정 {fmt(port_eta)}"
                 ),
@@ -1094,12 +1120,12 @@ def _automatic_actions(
                 truck_id=truck_id,
             )
         )
-    for key in sorted(set(before_sig) - set(after_sig)):
+    for voyages, truck_id in cancelled:
         actions.append(
             AutomaticAction(
                 kind="truck_dispatch",
-                description=f"{key[1]} {key[0]} 배차 취소",
-                truck_id=key[1],
+                description=f"{truck_id} {voyages} 배차 취소",
+                truck_id=truck_id,
             )
         )
     plan_before, plan_after = ctx.plan_before, ctx.alternative.plan
