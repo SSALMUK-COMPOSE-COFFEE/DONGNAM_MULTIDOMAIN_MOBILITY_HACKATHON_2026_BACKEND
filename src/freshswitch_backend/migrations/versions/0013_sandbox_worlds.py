@@ -49,7 +49,7 @@ def upgrade() -> None:
         "AND EXISTS (SELECT 1 FROM sandbox_worlds WHERE id = 'legacy')"
     )
     op.execute(
-        "UPDATE users u SET world_id = 'legacy' WHERE EXISTS ("
+        "UPDATE users u SET world_id = 'legacy' WHERE u.is_demo AND EXISTS ("
         "SELECT 1 FROM memberships m JOIN organizations o ON o.id = m.org_id "
         "WHERE m.user_id = u.id AND o.world_id = 'legacy')"
     )
