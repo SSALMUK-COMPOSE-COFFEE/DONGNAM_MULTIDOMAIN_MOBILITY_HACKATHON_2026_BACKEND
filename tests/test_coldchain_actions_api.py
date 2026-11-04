@@ -24,10 +24,17 @@ def _path(container_id: str, key: str, transition: str) -> str:
     return f"/api/coldchain/containers/{container_id}/actions/{quote(key, safe='')}/{transition}"
 
 
-def _simulate(client: TestClient, plan_id: str, container_id: str = "CA-01") -> None:
+def _simulate(
+    client: TestClient, plan_id: str, container_id: str = "CA-01", device_id: str = "sim-01"
+) -> None:
     run = client.post(
         "/api/coldchain/simulate",
-        json={"preset": "power_cut_restore", "plan_id": plan_id, "container_id": container_id},
+        json={
+            "preset": "power_cut_restore",
+            "plan_id": plan_id,
+            "container_id": container_id,
+            "device_id": device_id,
+        },
     )
     assert run.status_code == 200, run.text
 
@@ -111,7 +118,10 @@ def saas_plan(saas_app) -> str:
     )
     with database.begin() as db:
         db.add(PlanForwarderRow(plan_id=session.plan_id, forwarder_org_id=FORWARDER))
-    _simulate(_login(saas_app, PLATFORM), session.plan_id)
+    platform = _login(saas_app, PLATFORM)
+    registered = platform.post("/api/saas/devices", json={"device_id": "demo-sensor-01"}, headers=CSRF)
+    assert registered.status_code == 201, registered.text
+    _simulate(platform, session.plan_id, device_id="demo-sensor-01")
     return session.plan_id
 
 

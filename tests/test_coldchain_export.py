@@ -137,6 +137,8 @@ def saas_plan(saas_app) -> str:
     with database.begin() as db:
         db.add(PlanForwarderRow(plan_id=session.plan_id, forwarder_org_id=FORWARDER))
     platform = _login(saas_app, PLATFORM)
+    registered = platform.post("/api/saas/devices", json={"device_id": "demo-sensor-01"})
+    assert registered.status_code == 201, registered.text
     for container_id in ("CA-01", "CA-02"):
         run = platform.post(
             "/api/coldchain/simulate",
@@ -144,6 +146,7 @@ def saas_plan(saas_app) -> str:
                 "preset": "short_outage",
                 "plan_id": session.plan_id,
                 "container_id": container_id,
+                "device_id": "demo-sensor-01",
             },
         )
         assert run.status_code == 200, run.text

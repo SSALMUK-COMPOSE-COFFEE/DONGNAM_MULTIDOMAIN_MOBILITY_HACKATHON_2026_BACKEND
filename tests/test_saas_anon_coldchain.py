@@ -61,9 +61,16 @@ def _leaks(payload: object, raw_ids: list[str]) -> list[str]:
 @pytest.fixture
 def platform(saas_app, plan_id: str) -> TestClient:
     client = seed_client(PLATFORM_ORG_ID, saas_app)
+    registered = client.post("/api/saas/devices", json={"device_id": "demo-sensor-01"})
+    assert registered.status_code == 201, registered.text
     run = client.post(
         "/api/coldchain/simulate",
-        json={"preset": "power_cut_restore", "plan_id": plan_id, "container_id": "CA-01"},
+        json={
+            "preset": "power_cut_restore",
+            "plan_id": plan_id,
+            "container_id": "CA-01",
+            "device_id": "demo-sensor-01",
+        },
     )
     assert run.status_code == 200, run.text
     return client

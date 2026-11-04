@@ -12,7 +12,7 @@ from freshswitch_backend.coldchain.models import Binding
 from freshswitch_backend.domain.ids import check_id
 from freshswitch_backend.domain.inputs import StorableStr
 from freshswitch_backend.persistence import Database, database
-from freshswitch_backend.persistence.tables import DEMO_ORG, BindingRow, DeviceRow
+from freshswitch_backend.persistence.tables import BindingRow, DeviceRow
 
 SIMULATOR_PREFIX = "sim-"
 SANDBOX_DEVICE_PREFIX = "demo-"
@@ -161,10 +161,8 @@ class DeviceStore:
                 if db.get(DeviceRow, body.device_id) is not None:
                     raise DeviceConflict(f"이미 등록된 장치입니다: {body.device_id}")
                 binding = db.get(BindingRow, body.device_id)
-                if binding is not None and binding.org_id not in (DEMO_ORG, org_id):
+                if binding is not None and binding.org_id != org_id:
                     raise DeviceConflict(f"다른 조직에 연결된 장치입니다: {body.device_id}")
-                if binding is not None and binding.org_id == DEMO_ORG and org_id != DEMO_ORG:
-                    db.execute(delete(BindingRow).where(BindingRow.device_id == body.device_id))
                 row = DeviceRow(
                     device_id=body.device_id,
                     org_id=org_id,

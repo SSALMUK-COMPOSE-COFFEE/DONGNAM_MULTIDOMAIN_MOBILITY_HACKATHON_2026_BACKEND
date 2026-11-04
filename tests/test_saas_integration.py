@@ -77,9 +77,16 @@ def test_assignment_drives_forwarder_access_across_routers(saas_app) -> None:
     applied = platform.post(f"/api/plans/{plan_id}/apply", json={"alternative_id": "pull_forward"})
     assert applied.status_code == 200, applied.text
     order_id = applied.json()["active_order_id"]
+    registered = platform.post("/api/saas/devices", json={"device_id": "demo-sensor-01"})
+    assert registered.status_code == 201, registered.text
     run = platform.post(
         "/api/coldchain/simulate",
-        json={"preset": "power_cut_restore", "plan_id": plan_id, "container_id": "CA-01"},
+        json={
+            "preset": "power_cut_restore",
+            "plan_id": plan_id,
+            "container_id": "CA-01",
+            "device_id": "demo-sensor-01",
+        },
     )
     assert run.status_code == 200, run.text
 

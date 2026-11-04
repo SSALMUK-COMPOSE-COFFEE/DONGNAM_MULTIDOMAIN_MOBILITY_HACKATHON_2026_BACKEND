@@ -257,10 +257,12 @@ def _rewrite_device(device_id: str, principal: Principal | None, saas: bool) -> 
 
 
 def _skip_owner(device_id: str, principal: Principal | None, saas: bool) -> bool:
+    if not saas:
+        return is_simulator_device(device_id)
     world_id = _world_for(principal, saas)
-    if saas and is_visitor_world(world_id):
+    if is_visitor_world(world_id):
         return own_simulator(device_id, world_id)
-    return is_simulator_device(device_id)
+    return False
 
 
 def _ingest_device(items: list[ReadingIn], org_id: str, bound_only: bool = True) -> IngestResult:

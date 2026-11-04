@@ -47,9 +47,16 @@ def test_coldchain1_token_reading_of_deleted_plan_binding_is_rejected(saas, monk
     monkeypatch.setattr(coldchain_store, "clock", lambda: datetime(2026, 11, 17, 12, tzinfo=KST))
     first, second = _two_plans()
     platform = _login(saas, PLATFORM)
+    registered = platform.post("/api/saas/devices", json={"device_id": "demo-sensor-01"}, headers=CSRF)
+    assert registered.status_code == 201, registered.text
     run = platform.post(
         "/api/coldchain/simulate",
-        json={"preset": "power_cut_restore", "plan_id": second, "container_id": "CA-01"},
+        json={
+            "preset": "power_cut_restore",
+            "plan_id": second,
+            "container_id": "CA-01",
+            "device_id": "demo-sensor-01",
+        },
         headers=CSRF,
     )
     assert run.status_code == 200, run.text
