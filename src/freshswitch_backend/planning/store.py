@@ -53,6 +53,7 @@ from freshswitch_backend.persistence import Database, database
 from freshswitch_backend.persistence.tables import (
     DEMO_ORG,
     BindingRow,
+    ChangeRequestRow,
     ContainerRow,
     IdempotencyRow,
     LotRow,
@@ -466,6 +467,15 @@ def _shippers_of(scenario: Scenario) -> set[str]:
     return {lot.shipper_id for lot in scenario.lots}
 
 
+def _require_execution_consent(state: _State, order: ExecutionOrder | None = None) -> None:
+    if state.unconfirmed & _shippers_of(state.session.scenario):
+        raise SessionConflict(
+            "계획에 포함된 모든 화주가 배정을 수락해야 실행·회신·검수를 진행할 수 있습니다"
+        )
+    if order is not None and any(c.status != "accepted" for c in order.shipper_confirmations):
+        raise SessionConflict("변경 영향을 받는 화주의 확인이 끝나야 실행할 수 있습니다")
+
+
 def _departed(db: Session, row: PlanRow, state: _State) -> set[str]:
     if not row.confirmation_round:
         return set()
@@ -669,6 +679,38 @@ def _registered_add(db: Session, row: PlanRow, event: Event) -> str | None:
     if db.get(LotRow, event.lot.id) is None:
         return None
     return event.lot.id
+
+
+def _trusted_request_initiator(
+    db: Session,
+    row: PlanRow,
+    replan_id: str,
+    event: Event,
+    scenario: Scenario,
+) -> str | None:
+    if not isinstance(event, CancelEvent | AirSwitchEvent) and event.type != "reduce":
+        return None
+    request = db.scalar(
+        select(ChangeRequestRow)
+        .where(
+            ChangeRequestRow.plan_id == row.plan_id,
+            ChangeRequestRow.org_id == row.org_id,
+            ChangeRequestRow.replan_id == replan_id,
+            ChangeRequestRow.status == "open",
+            ChangeRequestRow.requested_by.is_not(None),
+            ChangeRequestRow.lot_id == event.lot_id,
+            ChangeRequestRow.type == event.type,
+        )
+        .limit(1)
+    )
+    if request is None:
+        return None
+    if event.type == "reduce" and request.new_pallets != event.new_pallets:
+        return None
+    lot = next((lot for lot in scenario.lots if lot.id == request.lot_id), None)
+    if lot is None or lot.shipper_id != request.shipper_id:
+        return None
+    return request.shipper_id
 
 
 def _same_claim_world(owner: Any, shipper: Any) -> bool:
@@ -1397,6 +1439,14 @@ class SessionStore:
             alternative=ordered,
             event=event,
             now=now,
+            initiator_shipper_id=_trusted_request_initiator(
+                db,
+                row,
+                pending.replan_id,
+                event,
+                before.scenario,
+            ),
+            infer_event_initiator=row.org_id == DEMO_ORG,
         )
         order.cancellation_charges = list(charges)
         if rejecting:
@@ -1671,6 +1721,8 @@ class SessionStore:
             raise SessionConflict(f"이미 종료된 실행 지시입니다: {order.status}")
         if order.status != "shipper_confirmed":
             raise SessionConflict("화주 확인이 끝나지 않아 포워더가 확정할 수 없습니다")
+        if body.accept:
+            _require_execution_consent(state, order)
         if not body.accept:
             self._transition(
                 order,
@@ -1737,6 +1789,7 @@ class SessionStore:
                 raise SessionConflict(f"이미 {request.status} 처리된 요청입니다")
             if order.status != "forwarder_confirmed":
                 raise SessionConflict("포워더 확정 뒤에만 요청 회신을 기록할 수 있습니다")
+            _require_execution_consent(state, order)
             now = self.clock()
             request.status = decision
             request.note = body.note
@@ -2006,6 +2059,7 @@ class SessionStore:
     ) -> tuple[ArrivalSettlementResult, PlanSession]:
         with self._db.begin() as db:
             state = self._require(db, plan_id, org_id)
+            _require_execution_consent(state)
             session = state.session
             now = self.clock()
             result, inspections = arrival_settlement(

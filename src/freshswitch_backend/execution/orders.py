@@ -278,6 +278,8 @@ def build_order(
     event: Event,
     now: datetime,
     params: ExecutionParams | None = None,
+    initiator_shipper_id: str | None = None,
+    infer_event_initiator: bool = True,
 ) -> ExecutionOrder:
     ctx = _Ctx(
         scenario_before,
@@ -566,8 +568,8 @@ def build_order(
         f"선사 부킹 변경 회신 = CY 마감 − {p.booking_amendment_lead_hours.value:g}시간(가정)"
     )
 
-    initiator = None
-    if event_lot:
+    initiator = initiator_shipper_id
+    if infer_event_initiator and event_lot:
         lot = ctx.lot(event_lot)
         initiator = lot.shipper_id if lot else None
     charge = alternative.diff.cancellation
@@ -598,7 +600,7 @@ def build_order(
                     pulled_dates.append(lot.ready_date - timedelta(days=pulled))
                 if "pull_forward" not in reasons:
                     reasons.append("pull_forward")
-            if move.lot_id == event_lot:
+            if move.lot_id == event_lot and sid == initiator:
                 continue
             if (
                 before_cat
