@@ -24,6 +24,7 @@ from freshswitch_backend.intake.service import (
 )
 from freshswitch_backend.lots import LotFilter, LotPatch, LotStatus, RegisteredLot, lot_store
 from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.products import selectable_product_ids
 from freshswitch_backend.persistence.tables import DEMO_ORG, LotRow
 
 router = APIRouter(prefix="/lots", tags=["lots"])
@@ -130,6 +131,20 @@ def _validate_patch(
                 ready_date=lot.ready_date,
             ),
         )
+        if scope.shipper is not None and resolved.product_id != lot.product_id:
+            with database.begin() as db:
+                selectable = selectable_product_ids(
+                    db, org_id=scope.org_id, scenario_id=scenario.id
+                )
+            if resolved.product_id not in selectable:
+                raise IntakeError(
+                    [
+                        FieldError(
+                            field="product",
+                            message="삭제되었거나 이전 버전인 품목은 새로 선택할 수 없습니다",
+                        )
+                    ]
+                )
         values.update(
             product_id=resolved.product_id,
             shipper_id=resolved.shipper_id,

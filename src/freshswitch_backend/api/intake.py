@@ -14,6 +14,7 @@ from freshswitch_backend.intake.service import IntakeError, preview_lot, resolve
 from freshswitch_backend.intake.tenants import load_catalog, tenant_scenario
 from freshswitch_backend.lots import ANY_ORG, LotConflict, Reservation, lot_store
 from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.products import selectable_product_ids
 from freshswitch_backend.persistence.resources import resource_scenario
 from freshswitch_backend.persistence.sandbox_world import ignores_client_lot_id
 from freshswitch_backend.persistence.tables import DEMO_ORG, PackhouseRow
@@ -128,6 +129,14 @@ def build_preview(
         scope.lot_org or ANY_ORG, peer_of=scope.peer_of
     )
     try:
+        if scope.shipper is not None:
+            with database.begin() as db:
+                selectable = selectable_product_ids(db, scope.org_id, scenario.id)
+            selection = scenario.model_copy(
+                update={"products": [p for p in scenario.products if p.id in selectable]}
+            )
+            resolved_product = resolve_names(selection, body).product_id
+            body = body.model_copy(update={"product": resolved_product})
         if body.packhouse_id is not None:
             resolved = resolve_names(scenario, body)
             if scope.catalog_org is not None:

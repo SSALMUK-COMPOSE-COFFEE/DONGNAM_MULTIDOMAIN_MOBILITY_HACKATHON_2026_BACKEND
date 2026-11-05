@@ -10,6 +10,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from sqlalchemy import select
 
 from freshswitch_backend.api.saas_shipper_profile import (
     SCENARIO_ID,
@@ -23,11 +24,10 @@ from freshswitch_backend.domain.models import Product
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.products import (
     active_products,
+    archived_product_ids,
     product_rows,
 )
-from freshswitch_backend.persistence.tables import (
-    ProductRow,
-)
+from freshswitch_backend.persistence.tables import ProductArchiveRow, ProductRow, ShipperProfileRow
 
 router = APIRouter(prefix="/saas/shipper/products", tags=["saas-shipper-products"])
 
@@ -91,6 +91,7 @@ class ProductPatch(BaseModel):
 
 
 class ProductOut(Product):
+    archived: bool = False
     writable: bool
     replaces_id: str | None = None
 
@@ -100,10 +101,11 @@ def _base_products() -> list[Product]:
     return list(scenario.products) if scenario else []
 
 
-def _out(product: Product, rows: list[ProductRow]) -> ProductOut:
+def _out(product: Product, rows: list[ProductRow], archived: set[str] | None = None) -> ProductOut:
     row = next((row for row in rows if row.id == product.id), None)
     return ProductOut(
         **product.model_dump(),
+        archived=product.id in (archived or set()),
         writable=row is not None,
         replaces_id=row.replaces_id if row is not None else None,
     )
@@ -126,10 +128,12 @@ def _unique_name(name: str, products: list[Product], except_id: str | None = Non
 
 
 @router.get("")
-def list_products(principal: ShipperPrincipal) -> list[ProductOut]:
+def list_products(principal: ShipperPrincipal, include_archived: bool = False) -> list[ProductOut]:
     with database.begin() as db:
         rows = product_rows(db, principal.org_id)
-        return [_out(p, rows) for p in active_products(_base_products(), rows)]
+        archived = archived_product_ids(db, principal.org_id)
+        products = active_products(_base_products(), rows, None if include_archived else archived)
+        return [_out(product, rows, archived) for product in products]
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -137,7 +141,9 @@ def create_product(body: ProductCreate, principal: ShipperPrincipal) -> ProductO
     with database.begin() as db:
         org = _writable_org(db, principal)
         rows = product_rows(db, org.id)
-        _unique_name(body.name, active_products(_base_products(), rows))
+        _unique_name(
+            body.name, active_products(_base_products(), rows, archived_product_ids(db, org.id))
+        )
         product = Product(
             id=f"prd-{uuid.uuid4().hex}",
             **body.model_dump(),
@@ -160,8 +166,11 @@ def update_product(
         org = _writable_org(db, principal)
         rows = product_rows(db, org.id)
         base = _base_products()
-        active = active_products(base, rows)
+        archived = archived_product_ids(db, org.id)
+        active = active_products(base, rows, archived)
         original = _current_product(product_id, base, rows)
+        if product_id in archived:
+            raise HTTPException(status_code=409, detail="삭제한 품목은 복원한 뒤 수정하세요")
         data = original.model_dump(include=set(ProductCreate.model_fields))
         data.update(body.model_dump(exclude_unset=True))
         try:
@@ -192,3 +201,36 @@ def update_product(
             ]
         db.flush()
         return _out(product, [row])
+
+
+@router.delete("/{product_id}")
+def archive_product(product_id: str, principal: ShipperPrincipal) -> ProductOut:
+    with database.begin() as db:
+        org = _writable_org(db, principal)
+        rows = product_rows(db, org.id)
+        product = _current_product(product_id, _base_products(), rows)
+        archive = db.get(ProductArchiveRow, (org.id, product_id))
+        if archive is None:
+            db.add(ProductArchiveRow(org_id=org.id, product_id=product_id))
+        for profile in db.scalars(
+            select(ShipperProfileRow).where(ShipperProfileRow.org_id == org.id).with_for_update()
+        ):
+            profile.product_ids = [pid for pid in (profile.product_ids or []) if pid != product_id]
+        db.flush()
+        return _out(product, rows, {product_id})
+
+
+@router.post("/{product_id}/restore")
+def restore_product(product_id: str, principal: ShipperPrincipal) -> ProductOut:
+    with database.begin() as db:
+        org = _writable_org(db, principal)
+        rows = product_rows(db, org.id)
+        base = _base_products()
+        product = _current_product(product_id, base, rows)
+        archived = archived_product_ids(db, org.id)
+        _unique_name(product.name, active_products(base, rows, archived), except_id=product_id)
+        archive = db.get(ProductArchiveRow, (org.id, product_id))
+        if archive is not None:
+            db.delete(archive)
+        db.flush()
+        return _out(product, rows)

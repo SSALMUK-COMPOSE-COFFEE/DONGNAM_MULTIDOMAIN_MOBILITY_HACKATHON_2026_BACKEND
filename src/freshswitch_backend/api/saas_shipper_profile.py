@@ -14,6 +14,7 @@ from freshswitch_backend.domain.models import Product
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.products import (
     active_products,
+    archived_product_ids,
     product_rows,
 )
 from freshswitch_backend.persistence.tables import (
@@ -103,7 +104,9 @@ def _products(org_id: str) -> list[Product]:
     scenario = get_scenario(SCENARIO_ID)
     with database.begin() as db:
         return active_products(
-            list(scenario.products) if scenario is not None else [], product_rows(db, org_id)
+            list(scenario.products) if scenario is not None else [],
+            product_rows(db, org_id),
+            archived_product_ids(db, org_id),
         )
 
 
@@ -226,13 +229,11 @@ def read_profile(principal: ShipperPrincipal) -> ShipperProfileView:
 
 @router.patch("/profile")
 def update_profile(body: ShipperProfilePatch, principal: ShipperPrincipal) -> ShipperProfileOut:
-    products = (
-        _checked_products(body.product_ids, principal.org_id)
-        if body.product_ids is not None
-        else None
-    )
     with database.begin() as db:
         org = _writable_org(db, principal)
+        products = (
+            _checked_products(body.product_ids, org.id) if body.product_ids is not None else None
+        )
         row = _profile(db, org.id, lock=True)
         if row is None:
             raise HTTPException(status_code=404, detail=PROFILE_NOT_FOUND)
@@ -263,9 +264,9 @@ def list_packhouses(principal: ShipperPrincipal) -> list[PackhouseOut]:
 
 @router.post("/packhouses", status_code=status.HTTP_201_CREATED)
 def create_packhouse(body: PackhouseCreate, principal: ShipperPrincipal) -> PackhouseOut:
-    products = _checked_products(body.product_ids, principal.org_id)
     with database.begin() as db:
         org = _writable_org(db, principal)
+        products = _checked_products(body.product_ids, org.id)
         row = PackhouseRow(
             id=f"ph-{uuid.uuid4().hex[:12]}",
             org_id=org.id,

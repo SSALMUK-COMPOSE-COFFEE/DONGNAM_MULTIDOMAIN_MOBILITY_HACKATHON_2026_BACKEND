@@ -192,6 +192,14 @@ class ProductRow(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
+class ProductArchiveRow(Base):
+    __tablename__ = "shipper_product_archives"
+
+    org_id: Mapped[str] = mapped_column(String(64), _org_fk("CASCADE"), primary_key=True)
+    product_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    archived_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
 class DeviceRow(Base):
     __tablename__ = "devices"
 
