@@ -14,6 +14,7 @@ from freshswitch_backend.api.computation import (
 )
 from freshswitch_backend.api.compute_limits import check_lot_count, compute_slot, replan_rate
 from freshswitch_backend.api.intake import intake_today
+from freshswitch_backend.api.saas_access import plan_for
 from freshswitch_backend.api.vessels import (
     VesselClientFactory,
     fetch_busan_sourced,
@@ -32,7 +33,11 @@ from freshswitch_backend.execution.numbers import entered_numbers
 from freshswitch_backend.execution.orders import saas_requests, without_saas_basis
 from freshswitch_backend.forecast.observations import planned_voyages, record_schedule_check
 from freshswitch_backend.intake.service import date_range_errors
-from freshswitch_backend.intake.tenants import load_catalog, tenant_scenario
+from freshswitch_backend.intake.tenants import (
+    eligible_cargo_scenario,
+    load_catalog,
+    tenant_scenario,
+)
 from freshswitch_backend.integrations import (
     MAX_GAP_HOURS,
     ScheduleChange,
@@ -69,13 +74,23 @@ from freshswitch_backend.replan import (
 from freshswitch_backend.replan.explanation import explain_replan, llm_enabled
 from freshswitch_backend.replan.models import AlternativeId
 
-router = APIRouter(prefix="/plans", tags=["plans"])
+
+def _operational_access(request: Request, principal: OptionalPrincipal) -> None:
+    if (
+        principal is not None
+        and request.method not in {"GET", "HEAD", "OPTIONS"}
+        and principal.org_type != "forwarder"
+    ):
+        raise HTTPException(status_code=403, detail="운송 계획은 포워더 조직이 관리합니다")
+
+
+router = APIRouter(prefix="/plans", tags=["plans"], dependencies=[Depends(_operational_access)])
 
 OrgId = Annotated[str, Depends(current_org_id)]
 INLINE_LOTS_FORBIDDEN = "SaaS 계획은 등록 출하(lot_ids)로만 만들 수 있습니다"
 INLINE_ADD_LOT_FORBIDDEN = (
     "SaaS 계획에는 등록 출하만 추가할 수 있습니다. "
-    "POST /saas/platform/plans/{plan_id}/add-lot 에 lot_id를 보내세요"
+    "POST /saas/forwarder/plans/{plan_id}/add-lot 에 lot_id를 보내세요"
 )
 
 
@@ -85,6 +100,7 @@ class CreatePlanRequest(BaseModel):
     lots: list[Lot] = Field(default_factory=list)
     lot_ids: list[str] = Field(default_factory=list)
     include_registered: bool = False
+    forwarder_org_id: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class EventRequest(BaseModel):
@@ -289,6 +305,13 @@ def tenant_plan_scenario(body: CreatePlanRequest, org_id: str) -> tuple[Scenario
     check_lot_count(len(dict.fromkeys(body.lot_ids)))
     base = _base_scenario(body.scenario_id)
     scenario = tenant_scenario(base, load_catalog(ANY_ORG, base, peer_of=org_id))
+    with database.begin() as db:
+        operator = db.get(OrganizationRow, org_id)
+        if operator is not None and operator.type == "forwarder":
+            scenario = eligible_cargo_scenario(scenario, org_id)
+    from freshswitch_backend.persistence.resources import resource_scenario
+
+    scenario = resource_scenario(scenario, org_id, body.forwarder_org_id, store.clock())
     scenario, registered_ids = _with_lots(
         scenario, body, lot_org=ANY_ORG, registered_only=True, peer_of=org_id
     )
@@ -346,8 +369,8 @@ def create_plan(
     if body.lots and app_settings(request).saas_mode:
         raise HTTPException(status_code=422, detail=INLINE_LOTS_FORBIDDEN)
     if principal is not None:
-        if principal.org_type != "platform":
-            raise HTTPException(status_code=403, detail="계획은 플랫폼 조직만 만들 수 있습니다")
+        if principal.org_type != "forwarder":
+            raise HTTPException(status_code=403, detail="계획은 포워더 조직만 만들 수 있습니다")
         return create_tenant_plan(body, principal.org_id)
     scenario, registered_ids = _with_lots(scenario, body)
     if body.use_learned_loss:
@@ -365,7 +388,9 @@ def list_plans(
 
 
 @router.get("/{plan_id}")
-def read_plan(plan_id: str, org_id: OrgId) -> PlanSession:
+def read_plan(plan_id: str, org_id: OrgId, principal: OptionalPrincipal) -> PlanSession:
+    if principal is not None and principal.org_type == "platform":
+        return plan_for(plan_id, principal).session
     return _session(plan_id, org_id)
 
 
@@ -490,13 +515,28 @@ def _order_view(
 
 
 @router.get("/{plan_id}/orders")
-def list_orders(plan_id: str, org_id: OrgId, request: Request) -> list[ExecutionOrder]:
+def list_orders(
+    plan_id: str,
+    org_id: OrgId,
+    request: Request,
+    principal: OptionalPrincipal,
+) -> list[ExecutionOrder]:
+    if principal is not None and principal.org_type == "platform":
+        org_id = plan_for(plan_id, principal).owner_org_id
     session = _session(plan_id, org_id)
     return [_order_view(o, session, org_id, request) for o in store.orders(plan_id, org_id=org_id)]
 
 
 @router.get("/{plan_id}/orders/{order_id}")
-def read_order(plan_id: str, order_id: str, org_id: OrgId, request: Request) -> ExecutionOrder:
+def read_order(
+    plan_id: str,
+    order_id: str,
+    org_id: OrgId,
+    request: Request,
+    principal: OptionalPrincipal,
+) -> ExecutionOrder:
+    if principal is not None and principal.org_type == "platform":
+        org_id = plan_for(plan_id, principal).owner_org_id
     session = _session(plan_id, org_id)
     try:
         order = store.order(plan_id, order_id, org_id=org_id)
@@ -559,7 +599,9 @@ def answer_request(
 
 
 @router.get("/{plan_id}/history")
-def read_history(plan_id: str, org_id: OrgId) -> list[HistoryEntry]:
+def read_history(plan_id: str, org_id: OrgId, principal: OptionalPrincipal) -> list[HistoryEntry]:
+    if principal is not None and principal.org_type == "platform":
+        org_id = plan_for(plan_id, principal).owner_org_id
     return _session(plan_id, org_id).history
 
 

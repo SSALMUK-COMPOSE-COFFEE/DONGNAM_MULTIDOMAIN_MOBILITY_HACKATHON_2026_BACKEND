@@ -24,6 +24,7 @@ from freshswitch_backend.api.plans import (
     replan_event,
     tenant_plan_scenario,
 )
+from freshswitch_backend.api.saas_access import visible_plans
 from freshswitch_backend.api.saas_plan_confirm import require_sandbox
 from freshswitch_backend.api.saas_views import (
     PlanListItem,
@@ -59,6 +60,7 @@ class PlatformPlanRequest(BaseModel):
     lot_ids: list[StorableStr] = Field(default_factory=list)
     include_registered: bool = False
     auto_accept: bool = False
+    forwarder_org_id: StorableStr | None = Field(default=None, min_length=1, max_length=64)
 
 
 class AddLotRequest(BaseModel):
@@ -231,7 +233,7 @@ def _sessions(principal: Principal, limit: int, offset: int) -> list[PlanSession
     with database.begin() as db:
         rows = db.scalars(
             select(PlanRow)
-            .where(PlanRow.org_id == principal.org_id)
+            .where(visible_plans(principal))
             .order_by(PlanRow.created_at.desc(), PlanRow.seq.desc())
             .limit(limit)
             .offset(offset)

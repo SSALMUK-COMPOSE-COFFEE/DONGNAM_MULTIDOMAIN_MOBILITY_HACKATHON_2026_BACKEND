@@ -14,6 +14,7 @@ from freshswitch_backend.intake.service import IntakeError, preview_lot, resolve
 from freshswitch_backend.intake.tenants import load_catalog, tenant_scenario
 from freshswitch_backend.lots import ANY_ORG, LotConflict, Reservation, lot_store
 from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.resources import resource_scenario
 from freshswitch_backend.persistence.sandbox_world import ignores_client_lot_id
 from freshswitch_backend.persistence.tables import DEMO_ORG, PackhouseRow
 from freshswitch_backend.planning.store import store
@@ -35,7 +36,15 @@ class IntakeScope:
         base = get_scenario(scenario_id)
         if base is None or self.catalog_org is None:
             return base
-        return tenant_scenario(base, load_catalog(self.catalog_org, base, self.peer_of))
+        scenario = tenant_scenario(base, load_catalog(self.catalog_org, base, self.peer_of))
+        return resource_scenario(
+            scenario,
+            self.org_id,
+            None,
+            lot_store.clock(),
+            require_owner=False,
+            require_available=False,
+        )
 
     def lot_org_for(self, shipper_id: str) -> str:
         if self.lot_org is not None:

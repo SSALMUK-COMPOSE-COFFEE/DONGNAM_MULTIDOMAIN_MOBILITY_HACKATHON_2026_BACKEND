@@ -2,29 +2,15 @@ from datetime import UTC, datetime
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    Field,
-    field_validator,
-)
-from sqlalchemy import (
-    delete,
-    select,
-    update,
-)
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session, aliased
 
 from freshswitch_backend.api.auth import AuthPrincipal, Principal, require_role
-from freshswitch_backend.domain.inputs import (
-    StorableStr,
-    storable,
-)
+from freshswitch_backend.domain.inputs import StorableStr, storable
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.orgs import create_invitation, same_sandbox
-from freshswitch_backend.persistence.sandbox_world import (
-    SEED_ID,
-)
+from freshswitch_backend.persistence.sandbox_world import SEED_ID
 from freshswitch_backend.persistence.tables import (
     MembershipRow,
     OrganizationRow,
@@ -163,6 +149,19 @@ def assign_forwarder(
             or not _same_forwarder_world(platform, forwarder)
         ):
             raise HTTPException(status_code=422, detail="포워더 조직이 아닙니다")
+        from freshswitch_backend.persistence.tables import ForwarderResourceRow
+
+        resource_owners = set(
+            db.scalars(
+                select(ForwarderResourceRow.org_id).where(
+                    ForwarderResourceRow.allocated_plan_id == plan_id,
+                )
+            )
+        )
+        if resource_owners and resource_owners != {forwarder.id}:
+            raise HTTPException(
+                status_code=422, detail="배정된 컨테이너를 제공한 포워더를 선택하세요"
+            )
         awaiting = bool(awaiting_shippers(db, plan))
         if awaiting and not platform.sandbox:
             raise HTTPException(status_code=409, detail=ASSIGN_BEFORE_CONFIRMATION)

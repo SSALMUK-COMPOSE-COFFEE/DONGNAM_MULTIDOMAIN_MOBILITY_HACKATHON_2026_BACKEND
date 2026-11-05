@@ -107,9 +107,14 @@ class Voyage(Sourced):
 
 class Container(Sourced):
     id: str
+    name: str | None = None
     voyage_id: str
     kind: str = "40RH-CA"
     capacity_pallets: int = 20
+    temp_min_c: float | None = None
+    temp_max_c: float | None = None
+    forwarder_org_id: str | None = None
+    resource_revision: int | None = None
 
 
 class Truck(Sourced):

@@ -15,7 +15,7 @@ from freshswitch_backend.persistence.sandbox_world import WorldNotFound
 
 router = APIRouter(prefix="/saas/sandbox", tags=["saas-sandbox"])
 
-PlatformPrincipal = Annotated[Principal, Depends(require_role("platform"))]
+PlatformPrincipal = Annotated[Principal, Depends(require_role("platform", "forwarder", "shipper"))]
 
 NOT_SANDBOX = "데모(sandbox) 조직에서만 데모 세계를 초기화할 수 있습니다"
 

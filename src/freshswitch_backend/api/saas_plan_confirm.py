@@ -146,7 +146,8 @@ def list_platform_attention(
 @router.get("/platform/plans/{plan_id}/confirmation")
 def read_platform_confirmation(plan_id: str, principal: PlatformPrincipal) -> PlanConfirmationState:
     try:
-        return store.confirmation_state(plan_id, principal.org_id)
+        owner = plan_for(plan_id, principal).owner_org_id
+        return store.confirmation_state(plan_id, owner)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=PLAN_NOT_FOUND) from exc
 

@@ -33,19 +33,19 @@ from freshswitch_backend.planning.store import PlanSession, store
 
 router = APIRouter(prefix="/analysis", tags=["analysis"])
 
-PLATFORM_ONLY = "금액 분석은 플랫폼 조직만 사용할 수 있습니다"
+PLATFORM_ONLY = "계획 금액 분석은 계획을 소유한 포워더 조직이 사용할 수 있습니다"
 PLAN_NOT_FOUND = "계획을 찾을 수 없습니다"
 PLAN_REQUIRED = "계획이 필요합니다"
 
 
 def platform_or_demo_org(request: Request, principal: OptionalPrincipal) -> str:
     if app_settings(request).saas_mode:
-        if principal is None or principal.org_type != "platform":
+        if principal is None or principal.org_type != "forwarder":
             raise HTTPException(status_code=403, detail=PLATFORM_ONLY)
         return principal.org_id
     if principal is None:
         return DEMO_ORG
-    if principal.org_type != "platform":
+    if principal.org_type != "forwarder":
         raise HTTPException(status_code=403, detail=PLATFORM_ONLY)
     return principal.org_id
 
@@ -169,9 +169,7 @@ def run_fuel_shock(
 
 
 @router.post("/benchmark", dependencies=ANALYSIS_LIMITS)
-def run_benchmark(
-    body: BenchmarkRequest, request: Request, org_id: PlatformOrg
-) -> BenchmarkResult:
+def run_benchmark(body: BenchmarkRequest, request: Request, org_id: PlatformOrg) -> BenchmarkResult:
     if app_settings(request).saas_mode and body.plan_id is None:
         raise HTTPException(status_code=422, detail=PLAN_REQUIRED)
     if body.plan_id is not None:

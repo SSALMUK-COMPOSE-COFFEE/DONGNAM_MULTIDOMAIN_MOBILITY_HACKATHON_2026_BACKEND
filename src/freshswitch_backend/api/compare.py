@@ -35,14 +35,12 @@ def _shipper_source(body: AirSeaRequest, principal: Principal) -> tuple[Scenario
     return scenario, access.session.plan
 
 
-def _source(
-    body: AirSeaRequest, principal: Principal | None, saas: bool
-) -> tuple[Scenario, Plan]:
+def _source(body: AirSeaRequest, principal: Principal | None, saas: bool) -> tuple[Scenario, Plan]:
     if saas and principal is None:
         raise HTTPException(status_code=403, detail="금액 분석은 플랫폼 조직만 사용할 수 있습니다")
     if principal is not None and principal.org_type == "shipper":
         return _shipper_source(body, principal)
-    if principal is not None and principal.org_type != "platform":
+    if principal is not None and principal.org_type not in {"platform", "forwarder"}:
         raise HTTPException(status_code=403, detail=FORWARDER_FORBIDDEN)
     if saas and body.plan_id is None:
         raise HTTPException(status_code=422, detail=PLAN_REQUIRED)

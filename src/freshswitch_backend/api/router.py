@@ -17,14 +17,17 @@ from freshswitch_backend.api import (
     plans,
     provenance,
     quality,
+    saas_admin,
     saas_catalog,
     saas_change_requests,
     saas_devices,
     saas_forwarder,
     saas_metrics,
+    saas_operations,
     saas_plan_confirm,
     saas_platform,
     saas_products,
+    saas_resources,
     saas_sandbox,
     saas_shipper,
     saas_shipper_profile,
@@ -33,8 +36,15 @@ from freshswitch_backend.api import (
     showcase,
     vessels,
 )
+from freshswitch_backend.api.saas_roles import platform_operational_guard
 
-api_router = APIRouter(dependencies=[Depends(auth.csrf_guard), Depends(login_gate.require_login)])
+api_router = APIRouter(
+    dependencies=[
+        Depends(auth.csrf_guard),
+        Depends(login_gate.require_login),
+        Depends(platform_operational_guard),
+    ]
+)
 api_router.include_router(health.router)
 api_router.include_router(scenarios.router)
 api_router.include_router(plans.router)
@@ -53,13 +63,16 @@ api_router.include_router(auth.router)
 api_router.include_router(auth.invitation_router)
 api_router.include_router(me.router)
 api_router.include_router(saas_catalog.router)
+api_router.include_router(saas_admin.router)
 api_router.include_router(saas_shipper.router)
 api_router.include_router(saas_shipper_profile.router)
 api_router.include_router(saas_products.router)
+api_router.include_router(saas_resources.router)
 api_router.include_router(saas_platform.router)
 api_router.include_router(saas_metrics.router)
 api_router.include_router(saas_plan_confirm.router)
 api_router.include_router(saas_forwarder.router)
+api_router.include_router(saas_operations.router)
 api_router.include_router(orgs.router)
 api_router.include_router(saas_devices.router)
 api_router.include_router(saas_sandbox.router)

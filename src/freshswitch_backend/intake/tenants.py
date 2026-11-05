@@ -2,11 +2,13 @@ from dataclasses import dataclass, field
 
 from sqlalchemy import select
 
+from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import Lot, Packhouse, Product, Scenario, Shipper
 from freshswitch_backend.lots import ANY_ORG
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.orgs import same_sandbox
 from freshswitch_backend.persistence.tables import (
+    LotRow,
     OrganizationRow,
     PackhouseRow,
     ProductRow,
@@ -138,6 +140,40 @@ def tenant_scenario(
             "packhouses": catalog.packhouses,
             "lots": list(lots or []),
             "products": [*base.products, *catalog.products],
+        },
+        deep=True,
+    )
+
+
+def eligible_cargo_scenario(scenario: Scenario, viewer_org_id: str) -> Scenario:
+    with database.begin() as db:
+        rows = list(
+            db.scalars(
+                select(LotRow)
+                .join(
+                    OrganizationRow,
+                    OrganizationRow.id == LotRow.shipper_org_id,
+                )
+                .where(
+                    LotRow.status == "registered",
+                    LotRow.scenario_id == scenario.id,
+                    OrganizationRow.type == "shipper",
+                    same_sandbox(OrganizationRow.sandbox, viewer_org_id),
+                )
+            )
+        )
+    shipper_ids = {row.shipper_id for row in rows}
+    product_ids = {row.product_id for row in rows}
+    shippers = [s for s in scenario.shippers if s.id in shipper_ids]
+    packhouses = {row.packhouse for row in rows if row.packhouse is not None}
+    packhouses |= {s.packhouse_id for s in shippers}
+    base = get_scenario(scenario.id)
+    public_products = {p.id for p in base.products} if base is not None else set()
+    return scenario.model_copy(
+        update={
+            "shippers": shippers,
+            "packhouses": [p for p in scenario.packhouses if p.id in packhouses],
+            "products": [p for p in scenario.products if p.id in product_ids | public_products],
         },
         deep=True,
     )

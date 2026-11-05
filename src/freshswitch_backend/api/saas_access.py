@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Annotated, Any
 
 from fastapi import Depends, HTTPException
-from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy import and_, exists, func, or_, select, true
 
 from freshswitch_backend.api.auth import AuthPrincipal, Principal
 from freshswitch_backend.persistence import database
@@ -77,9 +77,9 @@ def owner_in_sandbox_of(org_id: str) -> Any:
 
 def _role_condition(principal: Principal) -> Any:
     if principal.org_type == "platform":
-        return PlanRow.org_id == principal.org_id
+        return true()
     if principal.org_type == "forwarder":
-        return forwarder_assigned(principal.org_id)
+        return or_(PlanRow.org_id == principal.org_id, forwarder_assigned(principal.org_id))
     if principal.org_type == "shipper":
         return shipper_lot_included(principal.org_id)
     return None

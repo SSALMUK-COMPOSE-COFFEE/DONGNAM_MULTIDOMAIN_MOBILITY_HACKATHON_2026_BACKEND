@@ -50,11 +50,13 @@ from freshswitch_backend.lots import (
     sync_committed_lots,
 )
 from freshswitch_backend.persistence import Database, database
+from freshswitch_backend.persistence.resources import ResourceUnavailable, sync_allocations
 from freshswitch_backend.persistence.tables import (
     DEMO_ORG,
     BindingRow,
     ChangeRequestRow,
     ContainerRow,
+    ForwarderResourceRow,
     IdempotencyRow,
     LotRow,
     ObservationRow,
@@ -309,7 +311,28 @@ def _booked(db: Session, org_id: str, scenario_id: str, plan_id: str = "") -> se
     if org_id == DEMO_ORG:
         return set()
     params = {"org": org_id, "scenario": scenario_id, "plan": plan_id}
-    return {c for c in db.scalars(BOOKED_CONTAINERS, params) if c}
+    reserved = set(
+        db.scalars(
+            select(ForwarderResourceRow.id).where(
+                ForwarderResourceRow.allocated_plan_id.is_not(None),
+                ForwarderResourceRow.allocated_plan_id != plan_id,
+            )
+        )
+    )
+    return {c for c in db.scalars(BOOKED_CONTAINERS, params) if c} | reserved
+
+
+def _sync_resources(db: Session, session: PlanSession, committed: _Snapshot, org_id: str) -> None:
+    try:
+        sync_allocations(
+            db,
+            session.plan_id,
+            org_id,
+            [(session.scenario, session.plan), (committed.scenario, committed.plan)],
+            session.updated_at,
+        )
+    except ResourceUnavailable as exc:
+        raise ContainerBooked(exc.resource_ids) from exc
 
 
 def _lock_bookings(db: Session, org_id: str) -> None:
@@ -435,11 +458,13 @@ def _guard_real_apply(db: Session, row: PlanRow, session: PlanSession, event: Ev
         and _rejecting_shipper(db, row, session, event) is None
     ):
         raise SessionConflict(APPLY_BEFORE_CONFIRMATION)
+    owner = db.get(OrganizationRow, row.org_id)
     if (
         isinstance(event, AddLotEvent)
         and db.get(LotRow, event.lot.id) is not None
         and event.lot.shipper_id not in _cleared(db, row, session)
         and _has_forwarder(db, row.plan_id)
+        and (owner is None or owner.type != "forwarder")
     ):
         raise SessionConflict(ADD_BEFORE_CONFIRMATION)
 
@@ -996,6 +1021,7 @@ class SessionStore:
         row.totals = _totals(session.plan)
         row.payload = _payload(db, session, *_stored_owners(row))
         row.committed = state.committed.model_dump(mode="json")
+        _sync_resources(db, session, state.committed, row.org_id)
         for order in state.orders.values():
             stored = db.get(OrderRow, order.order_id)
             payload = order.model_dump(mode="json")
@@ -1126,6 +1152,10 @@ class SessionStore:
             )
             db.add(row)
             db.flush()
+            _sync_resources(db, session, _snapshot(session), org_id)
+            owner_org = db.get(OrganizationRow, org_id)
+            if owner_org is not None and owner_org.type == "forwarder":
+                db.add(PlanForwarderRow(plan_id=session.plan_id, forwarder_org_id=org_id))
             from freshswitch_backend.persistence.sandbox_world import extend_first_plan
 
             extend_first_plan(db, org_id)

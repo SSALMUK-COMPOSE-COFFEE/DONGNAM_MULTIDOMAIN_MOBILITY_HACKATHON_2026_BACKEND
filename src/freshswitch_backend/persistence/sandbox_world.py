@@ -21,8 +21,10 @@ from freshswitch_backend.persistence.tables import (
     ContainerRow,
     DelayObservationRow,
     DeviceRow,
+    ForwarderResourceRow,
     LotRow,
     MembershipRow,
+    MetaRow,
     ObservationRow,
     OrganizationRow,
     PackhouseRow,
@@ -110,9 +112,12 @@ def _world_thread_lock(world_id: str) -> threading.Lock:
 
 @contextmanager
 def lock_world(world_id: str) -> Iterator[None]:
-    with _world_thread_lock(world_id), _session_lock(
-        "SELECT pg_advisory_lock(:key, hashtext(:world))",
-        {"key": WORLD_LOCK, "world": world_id},
+    with (
+        _world_thread_lock(world_id),
+        _session_lock(
+            "SELECT pg_advisory_lock(:key, hashtext(:world))",
+            {"key": WORLD_LOCK, "world": world_id},
+        ),
     ):
         yield
 
@@ -249,9 +254,7 @@ def expected_world_lots(db: Session, now: datetime | None = None) -> list[dict[s
     return rows
 
 
-def _insert_lots(
-    db: Session, world_id: str, now: datetime, scenario_id: str = SCENARIO_ID
-) -> None:
+def _insert_lots(db: Session, world_id: str, now: datetime, scenario_id: str = SCENARIO_ID) -> None:
     rows = _lot_rows(db, world_id, now, scenario_id)
     if rows:
         db.add_all([LotRow(**row) for row in rows])
@@ -293,6 +296,9 @@ def _clone_catalog(db: Session, world_id: str, orgs: list) -> None:
                 source=shipper.source,
             )
         )
+    from freshswitch_backend.persistence.resources import ensure_sandbox_resources
+
+    ensure_sandbox_resources(db, db.get(OrganizationRow, f"{prefix}{orgs[0].id}"))
 
 
 def _password_hash() -> str:
@@ -373,6 +379,9 @@ def erase_world(db: Session, world_id: str, org_ids: list[str], *, keep_structur
         db.execute(delete(RunRow).where(RunRow.org_id.in_(org_ids)))
         db.execute(delete(DeviceRow).where(DeviceRow.org_id.in_(org_ids)))
         db.execute(delete(LotRow).where(LotRow.shipper_org_id.in_(org_ids)))
+    db.execute(delete(MetaRow).where(MetaRow.key == f"forwarder_resources_seeded:{world_id}"))
+    if org_ids:
+        db.execute(delete(ForwarderResourceRow).where(ForwarderResourceRow.org_id.in_(org_ids)))
     if keep_structure:
         return
     if org_ids:
@@ -391,9 +400,11 @@ def drop_world_sessions(db: Session, world_id: str, keep_token_hash: str | None)
     db.execute(stmt)
 
 
-def reseed_world(
-    db: Session, world_id: str, now: datetime, scenario_id: str = SCENARIO_ID
-) -> int:
+def reseed_world(db: Session, world_id: str, now: datetime, scenario_id: str = SCENARIO_ID) -> int:
+    from freshswitch_backend.persistence.resources import ensure_sandbox_resources
+
+    org = db.scalar(select(OrganizationRow).where(OrganizationRow.world_id == world_id).limit(1))
+    ensure_sandbox_resources(db, org)
     _insert_lots(db, world_id, now, scenario_id)
     quality_history.seed_world(db, world_id, prefixed=world_id != SEED_ID)
     world = db.get(SandboxWorldRow, world_id)
@@ -468,9 +479,7 @@ def create_visitor_world(now: datetime | None = None) -> VisitorWorld:
             with database.begin() as db:
                 _lock_create(db)
                 pending = [
-                    world_id
-                    for world_id in _expired_ids(db, moment)
-                    if world_id not in failed
+                    world_id for world_id in _expired_ids(db, moment) if world_id not in failed
                 ]
                 pending.extend(_victims(db, moment, failed))
                 if not pending:

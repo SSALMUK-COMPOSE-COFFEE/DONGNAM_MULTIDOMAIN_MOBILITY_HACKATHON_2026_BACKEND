@@ -51,7 +51,7 @@ Scope = Annotated[ScopeRef, Depends(caller_scope)]
 
 
 def impact_viewer(principal: OptionalPrincipal) -> ScopeRef:
-    if principal is not None and principal.org_type != "platform":
+    if principal is not None and principal.org_type not in {"platform", "forwarder"}:
         raise HTTPException(status_code=403, detail=IMPACT_PLATFORM_ONLY)
     return _principal_scope(principal)
 

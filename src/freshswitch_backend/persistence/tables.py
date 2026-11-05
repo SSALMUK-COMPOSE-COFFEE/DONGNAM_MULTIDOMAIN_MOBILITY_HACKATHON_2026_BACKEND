@@ -247,6 +247,20 @@ def _plan_fk() -> ForeignKey:
     return ForeignKey("plan_sessions.plan_id", ondelete="CASCADE")
 
 
+class ForwarderResourceRow(Base):
+    __tablename__ = "forwarder_resources"
+
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    org_id: Mapped[str] = mapped_column(String(64), _org_fk("CASCADE"), index=True)
+    data: Mapped[Json]
+    revision: Mapped[int] = mapped_column(Integer, server_default=text("1"))
+    allocated_plan_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("plan_sessions.plan_id", ondelete="SET NULL"), index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+
 class PlanConfirmationRow(Base):
     __tablename__ = "plan_shipper_confirmations"
     __table_args__ = (
