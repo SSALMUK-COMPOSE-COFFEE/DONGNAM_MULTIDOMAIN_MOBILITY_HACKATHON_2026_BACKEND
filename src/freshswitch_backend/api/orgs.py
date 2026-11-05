@@ -2,20 +2,36 @@ from datetime import UTC, datetime
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from pydantic import BaseModel, Field
-from sqlalchemy import delete, select
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+)
+from sqlalchemy import (
+    delete,
+    select,
+    update,
+)
 from sqlalchemy.orm import Session, aliased
 
 from freshswitch_backend.api.auth import AuthPrincipal, Principal, require_role
-from freshswitch_backend.domain.inputs import StorableStr
+from freshswitch_backend.domain.inputs import (
+    StorableStr,
+    storable,
+)
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.orgs import create_invitation, same_sandbox
+from freshswitch_backend.persistence.sandbox_world import (
+    SEED_ID,
+)
 from freshswitch_backend.persistence.tables import (
     MembershipRow,
     OrganizationRow,
     OrgInvitationRow,
     PlanForwarderRow,
     PlanRow,
+    ShipperProfileRow,
     UserRow,
 )
 from freshswitch_backend.planning.store import awaiting_shippers
@@ -36,6 +52,42 @@ class OrgSummary(BaseModel):
     org_id: str
     org_type: str
     org_name: str
+
+
+class OrgUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    name: str = Field(min_length=1, max_length=200)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _name(cls, value: object) -> object:
+        value = storable(value)
+        return value.strip() if isinstance(value, str) else value
+
+
+@router.patch("/org")
+def update_org(body: OrgUpdate, principal: AuthPrincipal) -> OrgSummary:
+    if principal.role not in {"admin", "owner"}:
+        raise HTTPException(status_code=403, detail="업체 관리자만 할 수 있습니다")
+    with database.begin() as db:
+        org = db.scalar(
+            select(OrganizationRow).where(OrganizationRow.id == principal.org_id).with_for_update()
+        )
+        if org is None:
+            raise HTTPException(status_code=404, detail="업체를 찾을 수 없습니다")
+        if org.type == "demo" or (org.sandbox and org.world_id in {None, SEED_ID}):
+            raise HTTPException(
+                status_code=403, detail="공용 데모 업체의 이름은 수정할 수 없습니다"
+            )
+        org.name = body.name
+        if org.type == "shipper":
+            db.execute(
+                update(ShipperProfileRow)
+                .where(ShipperProfileRow.org_id == org.id)
+                .values(name=body.name)
+            )
+        return OrgSummary(org_id=org.id, org_type=org.type, org_name=org.name)
 
 
 class ForwarderRef(BaseModel):
@@ -87,9 +139,7 @@ def _lock_own_plan(db: Session, plan_id: str, org_id: str) -> PlanRow:
 
 def _same_forwarder_world(platform: OrganizationRow, forwarder: OrganizationRow) -> bool:
     if platform.world_id and forwarder.world_id:
-        return (
-            platform.world_id == forwarder.world_id and platform.sandbox and forwarder.sandbox
-        )
+        return platform.world_id == forwarder.world_id and platform.sandbox and forwarder.sandbox
     return (
         platform.world_id is None
         and forwarder.world_id is None

@@ -199,6 +199,20 @@ def test_expired_session_requires_login(https_client: TestClient) -> None:
     assert cleared["path"] == "/"
 
 
+def test_login_succeeds_with_expired_session_cookie(https_client: TestClient) -> None:
+    _signup(https_client)
+    with database.begin() as db:
+        db.execute(
+            update(AuthSessionRow).values(expires_at=datetime.now(UTC) - timedelta(seconds=1))
+        )
+    response = https_client.post(
+        "/api/auth/login",
+        json={"email": "owner@example.com", "password": PASSWORD},
+        headers=CSRF,
+    )
+    assert response.status_code == 200
+
+
 def test_demo_login_requires_seed(https_client: TestClient) -> None:
     response = https_client.post("/api/auth/demo-login", json={"org_type": "shipper"})
     assert response.status_code == 404
