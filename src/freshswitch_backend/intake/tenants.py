@@ -2,18 +2,14 @@ from dataclasses import dataclass, field
 
 from sqlalchemy import select
 
-from freshswitch_backend.domain.models import (
-    Lot,
-    Packhouse,
-    Scenario,
-    Shipper,
-)
+from freshswitch_backend.domain.models import Lot, Packhouse, Product, Scenario, Shipper
 from freshswitch_backend.lots import ANY_ORG
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.orgs import same_sandbox
 from freshswitch_backend.persistence.tables import (
     OrganizationRow,
     PackhouseRow,
+    ProductRow,
     ShipperProfileRow,
 )
 
@@ -30,6 +26,7 @@ class TenantShipper:
 class TenantCatalog:
     shippers: list[TenantShipper] = field(default_factory=list)
     packhouses: list[Packhouse] = field(default_factory=list)
+    products: list[Product] = field(default_factory=list)
 
     @property
     def shipper_ids(self) -> list[str]:
@@ -65,6 +62,15 @@ def load_catalog(
         query = query.where(ShipperProfileRow.org_id == org_id)
     if peer_of is not None:
         query = query.where(same_sandbox(OrganizationRow.sandbox, peer_of))
+    products_query = (
+        select(ProductRow)
+        .join(OrganizationRow, OrganizationRow.id == ProductRow.org_id)
+        .where(OrganizationRow.type == "shipper")
+    )
+    if org_id != ANY_ORG:
+        products_query = products_query.where(ProductRow.org_id == org_id)
+    if peer_of is not None:
+        products_query = products_query.where(same_sandbox(OrganizationRow.sandbox, peer_of))
     packhouses_query = (
         select(PackhouseRow)
         .join(OrganizationRow, OrganizationRow.id == PackhouseRow.org_id)
@@ -77,6 +83,7 @@ def load_catalog(
         packhouses_query = packhouses_query.where(same_sandbox(OrganizationRow.sandbox, peer_of))
     with database.begin() as db:
         rows = db.execute(query).all()
+        products = [Product.model_validate(row.data) for row in db.scalars(products_query)]
         owned_packhouses = list(db.scalars(packhouses_query))
     order = {s.id: i for i, s in enumerate(base.shippers)} if base is not None else {}
     rows = sorted(rows, key=lambda row: order.get(_profile_rank_id(row[0].id), len(order)))
@@ -119,7 +126,7 @@ def load_catalog(
                 source=packhouse.source,
             ),
         )
-    return TenantCatalog(shippers=shippers, packhouses=list(packhouses.values()))
+    return TenantCatalog(shippers=shippers, packhouses=list(packhouses.values()), products=products)
 
 
 def tenant_scenario(
@@ -130,6 +137,7 @@ def tenant_scenario(
             "shippers": [s.shipper for s in catalog.shippers],
             "packhouses": catalog.packhouses,
             "lots": list(lots or []),
+            "products": [*base.products, *catalog.products],
         },
         deep=True,
     )

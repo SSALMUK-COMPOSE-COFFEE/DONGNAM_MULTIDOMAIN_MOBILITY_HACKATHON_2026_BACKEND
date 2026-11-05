@@ -181,6 +181,17 @@ class ShipperProfileRow(Base):
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
 
+class ProductRow(Base):
+    __tablename__ = "shipper_products"
+
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    org_id: Mapped[str] = mapped_column(String(64), _org_fk("CASCADE"), index=True)
+    data: Mapped[Json]
+    replaces_id: Mapped[str | None] = mapped_column(String(100))
+    retired: Mapped[bool] = mapped_column(server_default=text("false"))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
 class DeviceRow(Base):
     __tablename__ = "devices"
 

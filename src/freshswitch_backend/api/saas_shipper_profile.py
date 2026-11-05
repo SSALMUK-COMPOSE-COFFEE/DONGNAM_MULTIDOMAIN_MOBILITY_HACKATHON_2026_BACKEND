@@ -12,6 +12,10 @@ from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.inputs import StorableStr
 from freshswitch_backend.domain.models import Product
 from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.products import (
+    active_products,
+    product_rows,
+)
 from freshswitch_backend.persistence.tables import (
     LotRow,
     OrganizationRow,
@@ -95,13 +99,16 @@ class ShipperProfileView(BaseModel):
     product_options: list[ProductOption]
 
 
-def _products() -> list[Product]:
+def _products(org_id: str) -> list[Product]:
     scenario = get_scenario(SCENARIO_ID)
-    return list(scenario.products) if scenario is not None else []
+    with database.begin() as db:
+        return active_products(
+            list(scenario.products) if scenario is not None else [], product_rows(db, org_id)
+        )
 
 
-def _checked_products(product_ids: list[str]) -> list[str]:
-    known = {p.id for p in _products()}
+def _checked_products(product_ids: list[str], org_id: str) -> list[str]:
+    known = {p.id for p in _products(org_id)}
     unknown = [pid for pid in product_ids if pid not in known]
     if unknown:
         raise HTTPException(
@@ -211,13 +218,19 @@ def read_profile(principal: ShipperPrincipal) -> ShipperProfileView:
             ready=profile is not None,
             profile=_profile_out(profile) if profile is not None else None,
             packhouses=_packhouses(db, org.id),
-            product_options=[ProductOption(product_id=p.id, name=p.name) for p in _products()],
+            product_options=[
+                ProductOption(product_id=p.id, name=p.name) for p in _products(org.id)
+            ],
         )
 
 
 @router.patch("/profile")
 def update_profile(body: ShipperProfilePatch, principal: ShipperPrincipal) -> ShipperProfileOut:
-    products = _checked_products(body.product_ids) if body.product_ids is not None else None
+    products = (
+        _checked_products(body.product_ids, principal.org_id)
+        if body.product_ids is not None
+        else None
+    )
     with database.begin() as db:
         org = _writable_org(db, principal)
         row = _profile(db, org.id, lock=True)
@@ -250,7 +263,7 @@ def list_packhouses(principal: ShipperPrincipal) -> list[PackhouseOut]:
 
 @router.post("/packhouses", status_code=status.HTTP_201_CREATED)
 def create_packhouse(body: PackhouseCreate, principal: ShipperPrincipal) -> PackhouseOut:
-    products = _checked_products(body.product_ids)
+    products = _checked_products(body.product_ids, principal.org_id)
     with database.begin() as db:
         org = _writable_org(db, principal)
         row = PackhouseRow(
