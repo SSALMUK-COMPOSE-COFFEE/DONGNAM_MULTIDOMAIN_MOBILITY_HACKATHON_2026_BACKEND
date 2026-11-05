@@ -450,7 +450,8 @@ def _cleared(db: Session, row: PlanRow, session: PlanSession) -> set[str]:
     return set(_participants(session, _current_owners(db, row, session)))
 
 
-def _guard_real_apply(db: Session, row: PlanRow, session: PlanSession, event: Event) -> None:
+def _guard_real_apply(db: Session, row: PlanRow, session: PlanSession, event: Event,
+                      *, refill_invitation: bool = False) -> None:
     if row.org_id == DEMO_ORG or _sandbox(db, row.org_id):
         return
     if (
@@ -465,6 +466,7 @@ def _guard_real_apply(db: Session, row: PlanRow, session: PlanSession, event: Ev
         and event.lot.shipper_id not in _cleared(db, row, session)
         and _has_forwarder(db, row.plan_id)
         and (owner is None or owner.type != "forwarder")
+        and not refill_invitation
     ):
         raise SessionConflict(ADD_BEFORE_CONFIRMATION)
 
@@ -713,7 +715,7 @@ def _trusted_request_initiator(
     event: Event,
     scenario: Scenario,
 ) -> str | None:
-    if not isinstance(event, CancelEvent | AirSwitchEvent) and event.type != "reduce":
+    if not isinstance(event, CancelEvent | AirSwitchEvent) and event.type not in {"reduce", "increase"}:
         return None
     request = db.scalar(
         select(ChangeRequestRow)
@@ -730,7 +732,7 @@ def _trusted_request_initiator(
     )
     if request is None:
         return None
-    if event.type == "reduce" and request.new_pallets != event.new_pallets:
+    if event.type in {"reduce", "increase"} and request.new_pallets != event.new_pallets:
         return None
     lot = next((lot for lot in scenario.lots if lot.id == request.lot_id), None)
     if lot is None or lot.shipper_id != request.shipper_id:
@@ -1014,6 +1016,10 @@ class SessionStore:
         row = db.get(PlanRow, session.plan_id)
         if row is None:
             return
+        if state.committed.version != row.committed.get("version"):
+            from freshswitch_backend.planning.quantity_policy import sync_committed
+
+            sync_committed(db, row, state.session, state.session.updated_at)
         row.version = session.version
         row.status = session.status
         row.updated_at = session.updated_at
@@ -1105,6 +1111,7 @@ class SessionStore:
         lot_org_id: str | None = None,
         exclusive: bool = False,
         auto_accept: bool = False,
+        quantity_policy_v1: bool = False,
     ) -> PlanSession:
         working = scenario.model_copy(deep=True)
         built = build_plan(working)
@@ -1152,6 +1159,10 @@ class SessionStore:
             )
             db.add(row)
             db.flush()
+            if quantity_policy_v1:
+                from freshswitch_backend.planning.quantity_policy import initialize_policies
+
+                initialize_policies(db, row, session, now)
             _sync_resources(db, session, _snapshot(session), org_id)
             owner_org = db.get(OrganizationRow, org_id)
             if owner_org is not None and owner_org.type == "forwarder":
@@ -1231,6 +1242,10 @@ class SessionStore:
 
     def delete(self, plan_id: str, org_id: str = DEMO_ORG) -> bool:
         with self._lock, self._db.begin() as db:
+            from freshswitch_backend.planning.quantity_policy import guard_policy_deletion
+
+            if _plan_row(db, plan_id, org_id) is not None:
+                guard_policy_deletion(db, plan_id)
             return self._drop(db, (PlanRow.plan_id == plan_id) & _plan_scope(org_id)) > 0
 
     def count(self, org_id: str = DEMO_ORG) -> int:
@@ -1396,6 +1411,8 @@ class SessionStore:
         replan_id: str | None,
         idempotency: tuple[str, str] | None,
         org_id: str = DEMO_ORG,
+        *,
+        refill_invitation: bool = False,
     ) -> tuple[PlanSession, set[str]]:
         locked = _plan_row(db, plan_id, org_id)
         if locked is not None and locked.org_id != DEMO_ORG:
@@ -1417,10 +1434,18 @@ class SessionStore:
             )
         row = _plan_row(db, plan_id, ANY_ORG)
         event = pending.result.event
-        _guard_real_apply(db, row, session, event)
+        _guard_real_apply(db, row, session, event, refill_invitation=refill_invitation)
         rejecting = _rejecting_shipper(db, row, session, event)
         if rejecting:
             _waive_fee(session, pending.result, rejecting)
+        from freshswitch_backend.planning.quantity_policy import guard_quantity_apply, has_policy
+
+        policy_v1 = has_policy(db, plan_id)
+        if policy_v1:
+            guard_quantity_apply(db, row, event, rejecting)
+            alternative.diff.cancellation = None
+            for delta in alternative.diff.shippers:
+                delta.cancellation_adjustment = 0
         if row.org_id != DEMO_ORG:
             clash = sea_containers(alternative.plan) & _booked(
                 db, row.org_id, row.scenario_id, plan_id
@@ -1435,6 +1460,10 @@ class SessionStore:
             locked.discard(event.lot_id)
         now = self.clock()
         registered_ids = session.registered_lot_ids
+        if policy_v1:
+            from freshswitch_backend.planning.quantity_policy import record_selected_recommendation
+
+            record_selected_recommendation(db, row, session, pending, alternative, now)
         invited: set[str] = set()
         if row.org_id != DEMO_ORG and isinstance(event, AddLotEvent):
             shipper_org = _claim_added(
@@ -1460,6 +1489,11 @@ class SessionStore:
             before = committed
             charges = [*_earlier_charges(committed, superseded), *charges]
             ordered = _cumulative(committed, scenario, alternative, charges)
+        if policy_v1:
+            charges = []
+            ordered.diff.cancellation = None
+            for delta in ordered.diff.shippers:
+                delta.cancellation_adjustment = 0
         order = build_order(
             plan_id=plan_id,
             replan_id=pending.replan_id,
@@ -1487,6 +1521,10 @@ class SessionStore:
             _excuse(order, rejecting, now)
         if charges:
             _charge_payers(order, charges, ordered, (before.scenario, scenario))
+        if policy_v1 and (event.type in {"cancel", "reduce", "increase", "air_switch"} or refill_invitation):
+            from freshswitch_backend.planning.quantity_policy import policy_deadlines
+
+            policy_deadlines(db, plan_id, order, ordered, now)
         passed = _deadline_passed(order, now)
         if passed:
             raise SessionConflict(

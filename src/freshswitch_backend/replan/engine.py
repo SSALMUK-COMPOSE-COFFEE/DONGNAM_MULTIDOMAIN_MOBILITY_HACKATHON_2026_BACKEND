@@ -26,6 +26,7 @@ from freshswitch_backend.replan.models import (
     Event,
     ExecutedDispatch,
     FixedLot,
+    IncreaseEvent,
     LotMove,
     PlanDiff,
     ReduceEvent,
@@ -252,7 +253,11 @@ def apply_event(scenario: Scenario, event: Event) -> Scenario:
                 update={"lots": [lot for lot in scenario.lots if lot.id != lot_id]}
             )
         case ReduceEvent(lot_id=lot_id, new_pallets=new_pallets):
-            if new_pallets >= lots[lot_id].pallets:
+            if isinstance(event, IncreaseEvent) and new_pallets <= lots[lot_id].pallets:
+                raise ReplanError(
+                    f"증량 후 파렛트({new_pallets})가 현재({lots[lot_id].pallets})보다 커야 함"
+                )
+            if not isinstance(event, IncreaseEvent) and new_pallets >= lots[lot_id].pallets:
                 raise ReplanError(
                     f"감량 후 파렛트({new_pallets})가 현재({lots[lot_id].pallets})보다 작아야 함"
                 )

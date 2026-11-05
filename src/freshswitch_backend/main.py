@@ -167,6 +167,17 @@ def _purge_forever(interval: int) -> None:
             logger.exception("만료된 데모 세계 정리 실패")
 
 
+def _quantity_forever() -> None:
+    from freshswitch_backend.planning.quantity_policy import tick_policies
+
+    while True:
+        try:
+            tick_policies()
+        except Exception:
+            logger.exception("수량 확정·충원 제안 갱신 실패")
+        time.sleep(30)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     try:
@@ -185,6 +196,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
             daemon=True,
             name="sandbox-purge",
         ).start()
+    if settings.saas_mode and not os.environ.get("PYTEST_CURRENT_TEST"):
+        threading.Thread(target=_quantity_forever, daemon=True, name="quantity-policy").start()
     yield
     coldchain_store.stop_all()
 

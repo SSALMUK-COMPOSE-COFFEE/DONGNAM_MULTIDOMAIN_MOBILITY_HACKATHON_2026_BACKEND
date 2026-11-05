@@ -27,6 +27,7 @@ from freshswitch_backend.api import (
     saas_plan_confirm,
     saas_platform,
     saas_products,
+    saas_quantity_policy,
     saas_resources,
     saas_sandbox,
     saas_shipper,
@@ -77,5 +78,6 @@ api_router.include_router(orgs.router)
 api_router.include_router(saas_devices.router)
 api_router.include_router(saas_sandbox.router)
 api_router.include_router(saas_change_requests.router)
+api_router.include_router(saas_quantity_policy.router)
 api_router.include_router(showcase.router)
 api_router.include_router(ops.router)

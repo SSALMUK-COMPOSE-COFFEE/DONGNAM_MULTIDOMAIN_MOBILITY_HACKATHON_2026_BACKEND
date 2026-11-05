@@ -22,6 +22,7 @@ from freshswitch_backend.replan.models import (
     CancelEvent,
     DelayEvent,
     Event,
+    IncreaseEvent,
     ReduceEvent,
     ReplanError,
     ReplanResult,
@@ -45,6 +46,8 @@ def event_summary(scenario: Scenario, event: Event) -> str:
     match event:
         case CancelEvent(lot_id=lot_id):
             return f"{owner(lot_id)} {lots[lot_id].pallets}파렛트 전량 취소"
+        case IncreaseEvent(lot_id=lot_id, new_pallets=new):
+            return f"{owner(lot_id)} {lots[lot_id].pallets}→{new}파렛트 증량"
         case ReduceEvent(lot_id=lot_id, new_pallets=new):
             return f"{owner(lot_id)} {lots[lot_id].pallets}→{new}파렛트 감량"
         case AirSwitchEvent(lot_id=lot_id):

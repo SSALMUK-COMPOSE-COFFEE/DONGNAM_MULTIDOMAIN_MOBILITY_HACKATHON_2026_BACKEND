@@ -6,6 +6,7 @@ from pydantic import BaseModel
 MOCK_CHANNEL = "알림톡(모의)"
 
 NotificationKind = Literal[
+    "refill_offer",
     "order_confirmation_requested",
     "order_notified",
     "order_committed",

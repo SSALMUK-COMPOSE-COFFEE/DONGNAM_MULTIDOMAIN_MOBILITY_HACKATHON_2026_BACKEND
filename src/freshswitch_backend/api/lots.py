@@ -208,6 +208,10 @@ def _validate_patch(
 def update_locked_lot(
     lot_id: str, patch: LotPatch, scope: IntakeScope, org_id: str
 ) -> RegisteredLot:
+    from freshswitch_backend.planning.quantity_policy import guard_bound_lot
+
+    if patch.pallets is not None or patch.status is not None:
+        guard_bound_lot(lot_id, org_id)
     if patch.status in LOCKED_STATUSES:
         raise HTTPException(status_code=422, detail=LOCKED_STATUS_FORBIDDEN)
 
@@ -248,6 +252,9 @@ def _with_season_warnings(lot: RegisteredLot, patch: LotPatch, scope: IntakeScop
 
 
 def delete_unlocked_lot(lot_id: str, org_id: str) -> None:
+    from freshswitch_backend.planning.quantity_policy import guard_bound_lot
+
+    guard_bound_lot(lot_id, org_id)
     with database.begin() as db:
         owned = (LotRow.id == lot_id) & (LotRow.shipper_org_id == org_id)
         removed = db.execute(

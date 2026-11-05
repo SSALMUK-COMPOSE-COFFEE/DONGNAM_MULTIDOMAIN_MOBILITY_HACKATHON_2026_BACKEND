@@ -59,6 +59,8 @@ def cancellation_charge(
     event: CancelEvent | ReduceEvent,
     params: ExecutionParams | None = None,
 ) -> CancellationCharge | None:
+    if event.type == "increase":
+        return None
     params = params or ExecutionParams()
     lot = next((x for x in scenario_before.lots if x.id == event.lot_id), None)
     assignment = next((a for a in plan_before.assignments if a.lot_id == event.lot_id), None)

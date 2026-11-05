@@ -18,7 +18,7 @@ from freshswitch_backend.replan.models import (
 
 SHIPPER_PLAN_PATH = "/app/shipper/plans/detail"
 SENDER = "[프레시스위치]"
-OTHER_CHANGE = {"reduce": "감량", "cancel": "취소", "air_switch": "항공 전환"}
+OTHER_CHANGE = {"reduce": "감량", "increase": "증량", "cancel": "취소", "air_switch": "항공 전환"}
 
 
 @dataclass(frozen=True)
@@ -51,6 +51,8 @@ def voyage_label(session: PlanSession) -> str:
 
 
 def change_phrase(change_type: str, lot_id: str, new_pallets: int | None) -> str:
+    if change_type == "increase":
+        return f"출하 {lot_id} {new_pallets}파렛트로 증량"
     if change_type == "reduce":
         return f"출하 {lot_id} {new_pallets}파렛트로 감량"
     if change_type == "cancel":

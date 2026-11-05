@@ -23,7 +23,6 @@ from freshswitch_backend.api.vessels import (
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.inputs import FiniteFloat
 from freshswitch_backend.domain.models import Lot, Scenario
-from freshswitch_backend.execution.cancellation import annotate_cancellations
 from freshswitch_backend.execution.models import (
     ConfirmRequest,
     ExecutionOrder,
@@ -344,7 +343,8 @@ def create_tenant_plan(body: CreatePlanRequest, org_id: str) -> PlanSession:
     try:
         with compute_slot():
             return store.create(
-                scenario, registered_ids, org_id=org_id, lot_org_id=ANY_ORG, exclusive=True
+                scenario, registered_ids, org_id=org_id, lot_org_id=ANY_ORG, exclusive=True,
+                quantity_policy_v1=True,
             )
     except LotUnavailable as exc:
         raise HTTPException(
@@ -453,7 +453,9 @@ async def replan_event(
         deadline=deadline,
         **inputs,
     )
-    annotate_cancellations(result, session.scenario, session.plan)
+    from freshswitch_backend.planning.quantity_policy import annotate_for_policy
+
+    annotate_for_policy(session, result)
     result.explanation = await explain_replan(
         session.scenario,
         session.plan,

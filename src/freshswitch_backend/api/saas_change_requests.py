@@ -26,7 +26,6 @@ from freshswitch_backend.api.plans import (
 from freshswitch_backend.api.saas_access import PlanAccess, plan_for
 from freshswitch_backend.domain.inputs import StorableStr
 from freshswitch_backend.domain.models import Lot
-from freshswitch_backend.execution.cancellation import annotate_cancellations
 from freshswitch_backend.execution.models import OrderStatus
 from freshswitch_backend.notifications import (
     ChangeRequestNotice,
@@ -59,7 +58,7 @@ router = APIRouter(prefix="/saas", tags=["saas-change-requests"])
 ShipperPrincipal = Annotated[Principal, Depends(require_role("shipper"))]
 PlatformPrincipal = Annotated[Principal, Depends(require_role("platform"))]
 
-ChangeType = Literal["reduce", "cancel", "air_switch"]
+ChangeType = Literal["reduce", "cancel", "air_switch", "increase"]
 ChangeStatus = Literal["open", "applied", "rejected"]
 
 NOT_FOUND = "변경 요청을 찾을 수 없습니다"
@@ -79,9 +78,9 @@ class ChangeRequestCreate(BaseModel):
 
     @model_validator(mode="after")
     def _pallets(self) -> "ChangeRequestCreate":
-        if self.type == "reduce" and self.new_pallets is None:
+        if self.type in {"reduce", "increase"} and self.new_pallets is None:
             raise ValueError("감량 요청에는 new_pallets가 필요합니다")
-        if self.type != "reduce" and self.new_pallets is not None:
+        if self.type not in {"reduce", "increase"} and self.new_pallets is not None:
             return self.model_copy(update={"new_pallets": None})
         return self
 
@@ -147,6 +146,10 @@ class ChangeRequestApplied(BaseModel):
 
 
 def to_event(change_type: str, lot_id: str, new_pallets: int | None) -> Event:
+    if change_type == "increase":
+        from freshswitch_backend.replan import IncreaseEvent
+
+        return IncreaseEvent(lot_id=lot_id, new_pallets=new_pallets)
     if change_type == "reduce":
         return ReduceEvent(lot_id=lot_id, new_pallets=new_pallets)
     if change_type == "cancel":
@@ -311,6 +314,12 @@ async def create_change_request(
 ) -> ShipperChangeRequest:
     access = await run_in_threadpool(plan_for, plan_id, principal)
     session = access.session
+    if body.type in {"reduce", "cancel", "increase"}:
+        from freshswitch_backend.planning.quantity_policy import has_policy
+
+        with database.begin() as db:
+            if has_policy(db, plan_id):
+                raise HTTPException(409, "수량 변경 견적을 확인한 뒤 요청해 주세요")
     with _claim(session.plan_id, body.lot_id):
         lot = await run_in_threadpool(_own_lot, access, body.lot_id, principal.org_id)
         assigned = next(a for a in session.plan.assignments if a.lot_id == lot.id)
@@ -332,7 +341,9 @@ async def create_change_request(
                 deadline=request_deadline(),
                 **inputs,
             )
-            annotate_cancellations(result, session.scenario, session.plan)
+            from freshswitch_backend.planning.quantity_policy import annotate_for_policy
+
+            annotate_for_policy(session, result)
             estimate = _estimate(result)
         row = await run_in_threadpool(_insert, access, principal, lot, body, estimate)
     return _shipper_view(row)
@@ -509,13 +520,29 @@ async def replan_change_request(
     llm: Annotated[bool | None, Query()] = None,
 ) -> ChangeRequestReplan:
     request = await run_in_threadpool(_open_request, request_id, principal)
-    response = await replan_event(
-        request.plan_id, EventRequest(event=request.event), org_id=principal.org_id, llm=llm
-    )
+    if request.type == "increase":
+        response = await run_in_threadpool(_increase_replan, request, principal)
+    else:
+        response = await replan_event(
+            request.plan_id, EventRequest(event=request.event), org_id=principal.org_id, llm=llm
+        )
     if not await run_in_threadpool(_update, request_id, replan_id=response.replan_id):
         raise HTTPException(status_code=409, detail=NOT_OPEN)
     updated = await run_in_threadpool(_platform_request, request_id, principal)
     return ChangeRequestReplan(change_request=updated, replan=response)
+
+
+def _increase_replan(request: PlatformChangeRequest, principal: Principal) -> ReplanResponse:
+    from freshswitch_backend.persistence.tables import PlanRow
+    from freshswitch_backend.planning.refill import build_quantity_increase
+
+    with database.begin() as db:
+        row = db.get(PlanRow, request.plan_id, with_for_update=True)
+        result = build_quantity_increase(db, row, request.lot_id, request.new_pallets, store.clock())
+    session = store.get(request.plan_id, org_id=principal.org_id)
+    pending = store.add_pending(session, result, principal.org_id)
+    return ReplanResponse(**result.model_dump(), plan_id=request.plan_id,
+                          replan_id=pending.replan_id, base_version=pending.base_version)
 
 
 @router.post("/platform/change-requests/{request_id}/apply")

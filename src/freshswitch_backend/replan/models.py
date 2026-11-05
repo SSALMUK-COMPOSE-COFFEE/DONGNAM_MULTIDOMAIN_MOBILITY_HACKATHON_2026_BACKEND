@@ -28,6 +28,10 @@ class ReduceEvent(BaseModel):
     occurred_at: KstDatetime | None = Field(default=None, exclude_if=_unset)
 
 
+class IncreaseEvent(ReduceEvent):
+    type: Literal["increase"] = "increase"
+
+
 class AirSwitchEvent(BaseModel):
     type: Literal["air_switch"] = "air_switch"
     lot_id: str
@@ -74,7 +78,7 @@ class AddLotEvent(BaseModel):
 
 
 Event = Annotated[
-    CancelEvent | ReduceEvent | AirSwitchEvent | DelayEvent | AddLotEvent,
+    CancelEvent | ReduceEvent | IncreaseEvent | AirSwitchEvent | DelayEvent | AddLotEvent,
     Field(discriminator="type"),
 ]
 

@@ -65,6 +65,32 @@ class MetaRow(Base):
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
 
+class QuantityPolicyRow(Base):
+    __tablename__ = "quantity_policies"
+
+    plan_id: Mapped[str] = mapped_column(
+        String(100), ForeignKey("plan_sessions.plan_id", ondelete="CASCADE"), primary_key=True
+    )
+    voyage_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    org_id: Mapped[str] = mapped_column(String(64), _org_fk(), index=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    payload: Mapped[Json]
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class QuantityLedgerEventRow(Base):
+    __tablename__ = "quantity_ledger_events"
+
+    event_id: Mapped[str] = mapped_column(String(250), primary_key=True)
+    plan_id: Mapped[str] = mapped_column(
+        String(100), ForeignKey("plan_sessions.plan_id", ondelete="CASCADE"), index=True
+    )
+    voyage_id: Mapped[str] = mapped_column(String(100), index=True)
+    kind: Mapped[str] = mapped_column(String(30))
+    at: Mapped[datetime]
+    payload: Mapped[Json]
+
+
 class SandboxWorldRow(Base):
     __tablename__ = "sandbox_worlds"
 
@@ -454,7 +480,7 @@ class ChangeRequestRow(Base):
     __tablename__ = "plan_change_requests"
     __table_args__ = (
         CheckConstraint(
-            "type IN ('reduce', 'cancel', 'air_switch')", name="plan_change_requests_type_check"
+            "type IN ('reduce', 'cancel', 'air_switch', 'increase')", name="plan_change_requests_type_check"
         ),
         CheckConstraint(
             "status IN ('open', 'applied', 'rejected')", name="plan_change_requests_status_check"

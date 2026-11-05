@@ -125,6 +125,7 @@ def create_plan(body: PlatformPlanRequest, principal: PlatformPrincipal) -> Plan
                 lot_org_id=ANY_ORG,
                 exclusive=True,
                 auto_accept=True,
+                quantity_policy_v1=True,
             )
     except LotUnavailable as exc:
         raise HTTPException(

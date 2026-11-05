@@ -20,7 +20,6 @@ from freshswitch_backend.api.vessels import (
     ulsan_client_factory,
 )
 from freshswitch_backend.config import get_settings
-from freshswitch_backend.execution.cancellation import annotate_cancellations
 from freshswitch_backend.forecast.history import KST, DepartureRecord, merge
 from freshswitch_backend.forecast.observations import OWN_SOURCE, own_records
 from freshswitch_backend.forecast.port_congestion import PortCongestionSummary
@@ -226,7 +225,9 @@ async def delay_forecast(
             deadline=deadline,
             **inputs,
         )
-        annotate_cancellations(result, session.scenario, session.plan)
+        from freshswitch_backend.planning.quantity_policy import annotate_for_policy
+
+        annotate_for_policy(session, result)
         result.explanation = await explain_replan(
             session.scenario,
             session.plan,
@@ -249,6 +250,10 @@ async def delay_forecast(
                 lid for lid, loc in where.items() if loc == "AIR" and before.get(lid) != "AIR"
             )
     proposals = air_switch_proposals(session.scenario, voyages, where)
+    from freshswitch_backend.planning.quantity_policy import record_air_recommendations
+
+    await run_in_threadpool(record_air_recommendations, plan_id, session.version,
+                            sorted(set(air) | {p.lot_id for p in proposals if p.recommended_airport is not None}), store.clock())
     return DelayForecastResponse(
         plan_id=plan_id,
         options=options,
