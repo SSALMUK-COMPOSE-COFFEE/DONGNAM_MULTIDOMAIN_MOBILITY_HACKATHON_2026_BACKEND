@@ -142,6 +142,11 @@ def build_context(
     if ctx.products:
         ctx.band_max_c = min(p.temp_max_c for p in ctx.products)
         ctx.band_min_c = min(max(p.temp_min_c for p in ctx.products), ctx.band_max_c)
+        if ctx.band_max_c <= ctx.band_min_c:
+            tolerance = params.point_band_tolerance_c.value
+            point = ctx.band_max_c
+            ctx.band_min_c = round(point - tolerance, 2)
+            ctx.band_max_c = round(point + tolerance, 2)
     return ctx
 
 

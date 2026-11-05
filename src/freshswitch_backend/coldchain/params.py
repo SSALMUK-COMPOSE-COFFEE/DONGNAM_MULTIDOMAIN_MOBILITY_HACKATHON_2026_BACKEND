@@ -98,6 +98,13 @@ class ColdchainParams(BaseModel):
         "원예원 CA 프로그램 원문 확인 필요). 계획이 없을 때 쓰는 적정 범위",
     )
 
+    point_band_tolerance_c: Quantity = _q(
+        0.5,
+        "°C",
+        "가정: 혼적 품목 적정 범위의 교집합이 한 점(예: 단일 최적 0°C 품목끼리)이면 그 온도 ±0.5°C를 "
+        "적정 범위로 본다. 리퍼 설정 온도 허용 편차 수준(선사 지침 원문 확인 필요)",
+    )
+
     @property
     def reference_degree_minutes(self) -> float:
         return self.reference_outage_minutes.value * self.reference_excess_c.value

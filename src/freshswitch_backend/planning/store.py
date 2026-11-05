@@ -1173,6 +1173,10 @@ class SessionStore:
             if cutoff is not None:
                 self._drop(db, (PlanRow.seq <= cutoff) & scope)
         _notify_confirmation(session, org_id, invited)
+        if org_id != DEMO_ORG:
+            from freshswitch_backend.persistence.sandbox_world import seed_visitor_telemetry
+
+            seed_visitor_telemetry(session.plan_id, org_id)
         return session
 
     def booked_containers(self, org_id: str, scenario_id: str, plan_id: str = "") -> set[str]:

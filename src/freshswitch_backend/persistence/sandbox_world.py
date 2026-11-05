@@ -510,6 +510,40 @@ def extend_first_plan(db: Session, org_id: str) -> None:
     )
 
 
+def seed_visitor_telemetry(plan_id: str, org_id: str) -> int:
+    world_id = org_world_id(org_id)
+    if world_id is None or _VISITOR_WORLD.fullmatch(world_id) is None:
+        return 0
+    from freshswitch_backend.coldchain.telemetry import seed_container
+    from freshswitch_backend.planning.store import store as plan_store
+
+    session = plan_store.get(plan_id, org_id=org_id)
+    if session is None:
+        return 0
+    containers = sorted(
+        {a.container_id for a in session.plan.assignments if a.mode == "sea" and a.container_id}
+    )
+    end = coldchain_store.clock()
+    seeded = 0
+    for container_id in containers:
+        try:
+            done = seed_container(
+                coldchain_store,
+                org_id=org_id,
+                plan_id=plan_id,
+                container_id=container_id,
+                seed=f"{world_id}:{container_id}",
+                end=end,
+            )
+        except Exception:
+            logger.exception(
+                "세계 %s 컨테이너 %s 측정값을 만들지 못했습니다", world_id, container_id
+            )
+            continue
+        seeded += done is not None
+    return seeded
+
+
 def ensure_seed_world(db: Session, now: datetime | None = None) -> None:
     moment = now or _now()
     if db.get(SandboxWorldRow, SEED_ID) is None:
