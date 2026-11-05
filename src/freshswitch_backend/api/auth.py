@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from starlette.datastructures import Headers
 
 from freshswitch_backend.config import Settings, get_settings
 from freshswitch_backend.domain.inputs import storable
@@ -62,7 +63,6 @@ LOGIN_EMAIL_LOCK_SECONDS = 60.0
 DEMO_SESSION_CAP = 5000
 DEMO_SESSION_TTL = timedelta(hours=12)
 DEMO_NOT_READY = "데모 계정이 준비되어 있지 않습니다"
-DEMO_FULL = "데모 둘러보기가 가득 찼습니다. 잠시 뒤 다시 시도하세요"
 NOT_A_MEMBER = "소속되지 않은 조직입니다"
 TRUSTED_PROXIES_ENV = "TRUSTED_PROXIES"
 DEFAULT_TRUSTED_PROXIES = "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
@@ -347,7 +347,6 @@ class LoginRequest(BaseModel):
 class DemoLoginRequest(BaseModel):
     org_type: OrgType | None = None
     org_id: str | None = Field(default=None, max_length=64)
-    new_world: bool = False
 
     @field_validator("org_id", mode="before")
     @classmethod
@@ -510,9 +509,7 @@ def _world_view(db: Session, world_id: str | None) -> WorldView | None:
     return WorldView(world_id=row.id, expires_at=row.expires_at)
 
 
-def _me(
-    db: Session, user: UserRow, memberships: list[OrgMembership], active: OrgMembership
-) -> Me:
+def _me(db: Session, user: UserRow, memberships: list[OrgMembership], active: OrgMembership) -> Me:
     return Me(
         user=MeUser(id=user.id, email=user.email, name=user.name),
         memberships=memberships,
@@ -543,12 +540,12 @@ def csrf_guard(request: Request) -> None:
 
 
 def _session_required(settings: Settings, *, stale_cookie: bool) -> HTTPException:
-    headers: dict[str, str] = {}
+    headers = None
     if stale_cookie:
         cleared = Response()
         _clear_cookie(cleared, settings)
-        headers["set-cookie"] = cleared.headers["set-cookie"]
-    return HTTPException(status_code=401, detail="로그인이 필요합니다", headers=headers or None)
+        headers = Headers(raw=[item for item in cleared.raw_headers if item[0] == b"set-cookie"])
+    return HTTPException(status_code=401, detail="로그인이 필요합니다", headers=headers)
 
 
 def current_principal(request: Request) -> Principal | None:
@@ -563,6 +560,9 @@ def current_principal(request: Request) -> Principal | None:
     with database.begin() as db:
         session = db.get(AuthSessionRow, _token_hash(token))
         if session is None or session.expires_at <= now:
+            raise _session_required(settings, stale_cookie=True)
+        user = db.get(UserRow, session.user_id)
+        if user is None or (settings.saas_mode and (user.is_demo or is_demo_email(user.email))):
             raise _session_required(settings, stale_cookie=True)
         active = _choose(_memberships(db, session.user_id), requested, session.active_org_id)
         if requested is None and session.active_org_id != active.org_id:
@@ -606,6 +606,7 @@ def current_org_id(principal: OptionalPrincipal) -> str:
 
 
 def _set_cookie(response: Response, settings: Settings, token: str, ttl: timedelta) -> None:
+    _clear_legacy_cookie(response, settings)
     response.set_cookie(
         settings.session_cookie_name,
         token,
@@ -617,7 +618,19 @@ def _set_cookie(response: Response, settings: Settings, token: str, ttl: timedel
     )
 
 
+def _clear_legacy_cookie(response: Response, settings: Settings) -> None:
+    if settings.saas_mode and settings.cookie_path == "/":
+        response.delete_cookie(
+            settings.session_cookie_name,
+            path="/test",
+            secure=settings.session_cookie_secure,
+            httponly=True,
+            samesite="lax",
+        )
+
+
 def _clear_cookie(response: Response, settings: Settings) -> None:
+    _clear_legacy_cookie(response, settings)
     response.delete_cookie(
         settings.session_cookie_name,
         path=settings.cookie_path,
@@ -770,49 +783,6 @@ def _demo_rank() -> dict[str, int]:
     return {org.id: index for index, org in enumerate(demo_orgs())}
 
 
-def _preferred_org(memberships: list[OrgMembership], org_type: str | None) -> str:
-    if org_type is not None:
-        match = next((item for item in memberships if item.org_type == org_type), None)
-        if match is not None:
-            return match.org_id
-    platform = next((item for item in memberships if item.org_type == "platform"), None)
-    return platform.org_id if platform is not None else memberships[0].org_id
-
-
-@dataclass(frozen=True)
-class _CookieDemo:
-    user_id: str
-    is_demo: bool
-    world_id: str | None
-    world_state: str
-
-
-def _cookie_demo(request: Request) -> _CookieDemo | None:
-    settings = app_settings(request)
-    token = request.cookies.get(settings.session_cookie_name)
-    if not token:
-        return None
-    now = _now()
-    with database.begin() as db:
-        session = db.get(AuthSessionRow, _token_hash(token))
-        if session is None or session.expires_at <= now:
-            return None
-        user = db.get(UserRow, session.user_id)
-        if user is None:
-            return None
-        if user.world_id is None:
-            state = "none"
-        else:
-            world = db.get(SandboxWorldRow, user.world_id)
-            if world is None:
-                state = "missing"
-            elif world.expires_at <= now:
-                state = "expired"
-            else:
-                state = "live"
-        return _CookieDemo(user.id, user.is_demo, user.world_id, state)
-
-
 def _seed_demo_login(body: DemoLoginRequest, request: Request, response: Response) -> Me:
     if body.org_type is None:
         raise HTTPException(status_code=422, detail="org_type이 필요합니다")
@@ -839,64 +809,11 @@ def _seed_demo_login(body: DemoLoginRequest, request: Request, response: Respons
         return _start_session(db, request, response, user, org_id)
 
 
-def _open_visitor(body: DemoLoginRequest, request: Request, response: Response) -> Me:
-    from freshswitch_backend.persistence.sandbox_world import (
-        WorldCapacityError,
-        create_visitor_world,
-    )
-
-    try:
-        visitor = create_visitor_world()
-    except WorldCapacityError as exc:
-        raise HTTPException(
-            status_code=429, detail=DEMO_FULL, headers={"Retry-After": str(exc.retry_after)}
-        ) from exc
-    with database.begin() as db:
-        user = db.get(UserRow, visitor.user_id)
-        if user is None:
-            raise HTTPException(status_code=404, detail=DEMO_NOT_READY)
-        preferred = _preferred_org(_memberships(db, user.id), body.org_type)
-        return _start_session(db, request, response, user, preferred)
-
-
-def _reuse_demo(body: DemoLoginRequest, request: Request, user_id: str) -> Me:
-    settings = app_settings(request)
-    token = request.cookies.get(settings.session_cookie_name) or ""
-    with database.begin() as db:
-        session = db.get(AuthSessionRow, _token_hash(token))
-        user = db.get(UserRow, user_id)
-        if session is None or user is None or session.expires_at <= _now():
-            raise HTTPException(status_code=404, detail=DEMO_NOT_READY)
-        memberships = _memberships(db, user.id)
-        requested = body.org_id
-        if requested is None and body.org_type is not None:
-            requested = _preferred_org(memberships, body.org_type)
-        active = _choose(memberships, requested, session.active_org_id)
-        session.active_org_id = active.org_id
-        return _me(db, user, memberships, active)
-
-
 @router.post("/demo-login", dependencies=[Depends(rate_limit("demo-login"))])
 def demo_login(body: DemoLoginRequest, request: Request, response: Response) -> Me:
-    if not app_settings(request).saas_mode:
-        return _seed_demo_login(body, request, response)
-    cookie = _cookie_demo(request)
-    if cookie is not None and (not cookie.is_demo or cookie.world_state in {"none", "missing"}):
-        raise HTTPException(status_code=404, detail=DEMO_NOT_READY)
-    if cookie is not None and cookie.world_state == "live" and not body.new_world:
-        return _reuse_demo(body, request, cookie.user_id)
-    me = _open_visitor(body, request, response)
-    if (
-        body.new_world
-        and cookie is not None
-        and cookie.world_state == "live"
-        and cookie.world_id
-        and cookie.world_id != "seed"
-    ):
-        from freshswitch_backend.persistence.sandbox_world import delete_world
-
-        delete_world(cookie.world_id)
-    return me
+    if app_settings(request).saas_mode:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return _seed_demo_login(body, request, response)
 
 
 @router.put("/active-org")

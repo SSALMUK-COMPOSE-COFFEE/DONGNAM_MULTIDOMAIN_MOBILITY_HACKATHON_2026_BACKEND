@@ -245,7 +245,7 @@ def test_demo_password_login(https_client: TestClient, demo_tenants) -> None:
 
 
 def test_csrf_required_for_cookie_session(https_client: TestClient) -> None:
-    _signup(https_client)
+    _signup(https_client, org_type="forwarder")
     blocked = https_client.post("/api/plans", json={"scenario_id": "nope"})
     assert blocked.status_code == 403
     allowed = https_client.post("/api/plans", json={"scenario_id": "nope"}, headers=CSRF)

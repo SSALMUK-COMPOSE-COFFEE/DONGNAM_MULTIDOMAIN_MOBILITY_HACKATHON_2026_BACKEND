@@ -18,7 +18,7 @@ from psycopg.errors import UntranslatableCharacter
 from sqlalchemy.exc import DataError
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from freshswitch_backend.api.router import api_router
+from freshswitch_backend.api.router import router_for
 from freshswitch_backend.coldchain import coldchain_store
 from freshswitch_backend.config import Settings, get_settings
 from freshswitch_backend.domain.inputs import UNSTORABLE_TEXT, storable
@@ -148,23 +148,13 @@ def _reject(where: str) -> JSONResponse:
     return JSONResponse(status_code=422, content={"detail": detail})
 
 
-def _startup() -> None:
+def _startup(settings: Settings) -> None:
     from freshswitch_backend.persistence.sandbox_world import purge_expired_worlds
 
     database.init()
     coldchain_store.finish_orphan_runs()
-    purge_expired_worlds()
-
-
-def _purge_forever(interval: int) -> None:
-    from freshswitch_backend.persistence.sandbox_world import purge_expired_worlds
-
-    while True:
-        time.sleep(interval)
-        try:
-            purge_expired_worlds()
-        except Exception:
-            logger.exception("만료된 데모 세계 정리 실패")
+    if not settings.saas_mode:
+        purge_expired_worlds()
 
 
 def _quantity_forever() -> None:
@@ -179,23 +169,12 @@ def _quantity_forever() -> None:
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    settings = app.state.settings
     try:
-        await run_in_threadpool(_startup)
+        await run_in_threadpool(_startup, settings)
     except Exception:
         logger.exception("DB 초기화 실패. 첫 요청 때 다시 시도한다")
-    settings = get_settings()
-    if (
-        settings.saas_mode
-        and settings.sandbox_purge_interval_seconds > 0
-        and not os.environ.get("PYTEST_CURRENT_TEST")
-    ):
-        threading.Thread(
-            target=_purge_forever,
-            args=(settings.sandbox_purge_interval_seconds,),
-            daemon=True,
-            name="sandbox-purge",
-        ).start()
     if settings.saas_mode and not os.environ.get("PYTEST_CURRENT_TEST"):
         threading.Thread(target=_quantity_forever, daemon=True, name="quantity-policy").start()
     yield
@@ -223,7 +202,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         expose_headers=["X-Request-ID"],
     )
     app.add_middleware(RequestAuditMiddleware)
-    app.include_router(api_router, prefix=prefix)
+    app.include_router(router_for(saas_mode=settings.saas_mode), prefix=prefix)
     app.add_exception_handler(ReplanError, _replan_error)
     app.add_exception_handler(RequestValidationError, _validation_error)
     app.add_exception_handler(DataError, _data_error)

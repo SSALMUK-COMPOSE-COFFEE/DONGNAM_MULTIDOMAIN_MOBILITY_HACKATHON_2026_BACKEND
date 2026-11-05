@@ -19,7 +19,7 @@ services:
       POSTGRES_HOST: db
       SAAS_MODE: "true"
       API_PREFIX: /test/api
-      SESSION_COOKIE_PATH: /test
+      SESSION_COOKIE_PATH: /
       SESSION_COOKIE_SECURE: "true"
     restart: unless-stopped
     depends_on:

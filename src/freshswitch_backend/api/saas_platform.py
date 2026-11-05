@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
@@ -59,7 +59,7 @@ class PlatformPlanRequest(BaseModel):
     use_learned_loss: bool = False
     lot_ids: list[StorableStr] = Field(default_factory=list)
     include_registered: bool = False
-    auto_accept: bool = False
+    auto_accept: Literal[False] = False
     forwarder_org_id: StorableStr | None = Field(default=None, min_length=1, max_length=64)
 
 

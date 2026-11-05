@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, model_validator
@@ -58,7 +58,7 @@ class ShipperPlanConfirmation(PlanConfirmation):
 
 class RecomputeRequest(BaseModel):
     shipper_ids: list[str] = Field(default_factory=list, max_length=50)
-    auto_accept: bool = False
+    auto_accept: Literal[False] = False
 
 
 class RecomputeResult(BaseModel):
