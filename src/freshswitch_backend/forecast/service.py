@@ -469,7 +469,8 @@ def _option(
         name = "김해공항"
         base = CostModel(scenario)
         shipper = base.shippers.get(lot.shipper_id)
-        packhouse = base.packhouses.get(shipper.packhouse_id) if shipper else None
+        packhouse_id = lot.packhouse_id or (shipper.packhouse_id if shipper else None)
+        packhouse = base.packhouses.get(packhouse_id)
         km = (
             haversine_km(packhouse.lat, packhouse.lon, GIMHAE_LAT, GIMHAE_LON)
             * params.road_distance_factor.value

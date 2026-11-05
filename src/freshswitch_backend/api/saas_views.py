@@ -708,6 +708,11 @@ class Anonymizer:
         own = set(own_shipper_ids)
         ledger = _scenario_ledger(scenario) if lots is None else dict(lots)
         own_packhouses = {s.packhouse_id for s in scenario.shippers if s.id in own}
+        own_packhouses |= {
+            lot.packhouse_id
+            for lot in scenario.lots
+            if lot.shipper_id in own and lot.packhouse_id is not None
+        }
         packhouses = {p.id: p for p in scenario.packhouses}
         listed = [s.id for s in scenario.shippers]
         with_lots = {sid for sid in ledger.values() if sid is not None}
@@ -737,14 +742,29 @@ class Anonymizer:
                 continue
             if shipper.name not in own_names:
                 self._names[shipper.name] = f"{OTHER_SHIPPER_LABEL} {label}"
-            if shipper.packhouse_id in own_packhouses:
-                continue
-            anon_ph = f"anon-ph-{label}"
-            self._packhouses[shipper.packhouse_id] = anon_ph
-            self.hidden_packhouses.add(anon_ph)
-            ph = packhouses.get(shipper.packhouse_id)
-            if ph is not None and ph.name not in own_names:
-                self._names[ph.name] = f"{OTHER_SHIPPER_LABEL} {label} 선과장"
+            sites = list(
+                dict.fromkeys(
+                    [
+                        shipper.packhouse_id,
+                        *(
+                            lot.packhouse_id
+                            for lot in scenario.lots
+                            if lot.shipper_id == sid and lot.packhouse_id is not None
+                        ),
+                    ]
+                )
+            )
+            for site_index, site in enumerate(sites):
+                if site in own_packhouses:
+                    continue
+                anon_ph = (
+                    f"anon-ph-{label}" if site_index == 0 else f"anon-ph-{label}-{site_index + 1}"
+                )
+                self._packhouses[site] = anon_ph
+                self.hidden_packhouses.add(anon_ph)
+                ph = packhouses.get(site)
+                if ph is not None and ph.name not in own_names:
+                    self._names[ph.name] = f"{OTHER_SHIPPER_LABEL} {label} 선과장"
         self._lots: dict[str, str] = {}
         counts: dict[str, int] = {}
         for lot_id, sid in ledger.items():
@@ -1070,6 +1090,7 @@ def _scope_parties(payload: dict[str, Any], own: set[str]) -> None:
     )
     scenario["shippers"] = [s for s in scenario["shippers"] if s["id"] in kept]
     sites = {s["packhouse_id"] for s in scenario["shippers"]}
+    sites |= {lot["packhouse_id"] for lot in scenario["lots"] if lot.get("packhouse_id")}
     scenario["packhouses"] = [p for p in scenario["packhouses"] if p["id"] in sites]
 
 
@@ -1272,7 +1293,11 @@ def anonymized_orders(
 
 
 def _own_packhouses(session: PlanSession, own: set[str]) -> set[str]:
-    return {s.packhouse_id for s in session.scenario.shippers if s.id in own}
+    return {s.packhouse_id for s in session.scenario.shippers if s.id in own} | {
+        lot.packhouse_id
+        for lot in session.scenario.lots
+        if lot.shipper_id in own and lot.packhouse_id is not None
+    }
 
 
 def shipper_route_changes(

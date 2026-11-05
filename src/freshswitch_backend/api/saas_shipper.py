@@ -40,6 +40,7 @@ from freshswitch_backend.execution.models import (
 from freshswitch_backend.execution.numbers import entered_numbers
 from freshswitch_backend.execution.orders import saas_requests
 from freshswitch_backend.intake.models import IntakePreview, IntakeRequest
+from freshswitch_backend.intake.tenants import load_catalog, tenant_scenario
 from freshswitch_backend.lots import LotFilter, LotPatch, LotStatus, RegisteredLot, lot_store
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.tables import PlanRow
@@ -79,7 +80,10 @@ class ShipperDecision(BaseModel):
 
 def _scope(principal: Principal) -> IntakeScope:
     return IntakeScope(
-        org_id=principal.org_id, catalog_org=principal.org_id, lot_org=principal.org_id
+        org_id=principal.org_id,
+        catalog_org=principal.org_id,
+        lot_org=principal.org_id,
+        shipper=principal,
     )
 
 
@@ -125,7 +129,8 @@ def list_lots(
     def scenario_for(scenario_id: str) -> Scenario:
         if scenario_id not in scenarios:
             found = get_scenario(scenario_id)
-            scenarios[scenario_id] = found or quality_history.reference_scenario()
+            base = found or quality_history.reference_scenario()
+            scenarios[scenario_id] = tenant_scenario(base, load_catalog(principal.org_id, base))
         return scenarios[scenario_id]
 
     return [

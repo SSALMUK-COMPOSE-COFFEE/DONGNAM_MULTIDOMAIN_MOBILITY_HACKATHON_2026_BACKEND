@@ -124,6 +124,7 @@ def _validate_patch(
             IntakeRequest(
                 product=changes.get("product") or lot.product_id,
                 shipper=changes.get("shipper") or lot.shipper_id,
+                packhouse_id=lot.packhouse if not changes.get("shipper") else None,
                 destination=changes.get("destination") or lot.destination,
                 pallets=lot.pallets,
                 ready_date=lot.ready_date,

@@ -4,6 +4,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 from freshswitch_backend.domain.ids import ID_MAX_LENGTH, EntityId
+from freshswitch_backend.domain.inputs import StorableStr
 from freshswitch_backend.domain.models import Lot, Mode
 from freshswitch_backend.lots.models import RegisteredLot
 from freshswitch_backend.quality.models import ExpectedLoss
@@ -15,6 +16,7 @@ class IntakeRequest(BaseModel):
     pallets: int
     ready_date: date
     shipper: str = Field(min_length=1)
+    packhouse_id: StorableStr | None = Field(default=None, min_length=1, max_length=100)
     destination: str = Field(min_length=1)
     sell_by_date: date | None = None
     sell_window: Literal["normal", "short"] = "normal"

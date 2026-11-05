@@ -8,13 +8,14 @@ from freshswitch_backend.api.auth import OptionalPrincipal, Principal
 from freshswitch_backend.api.saas_access import plan_for
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import KST, Plan, Scenario
-from freshswitch_backend.intake.models import IntakePreview, IntakeRequest
+from freshswitch_backend.intake.models import FieldError, IntakePreview, IntakeRequest
 from freshswitch_backend.intake.savings import estimate_savings
-from freshswitch_backend.intake.service import IntakeError, preview_lot
+from freshswitch_backend.intake.service import IntakeError, preview_lot, resolve_names
 from freshswitch_backend.intake.tenants import load_catalog, tenant_scenario
 from freshswitch_backend.lots import ANY_ORG, LotConflict, Reservation, lot_store
+from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.sandbox_world import ignores_client_lot_id
-from freshswitch_backend.persistence.tables import DEMO_ORG
+from freshswitch_backend.persistence.tables import DEMO_ORG, PackhouseRow
 from freshswitch_backend.planning.store import store
 from freshswitch_backend.quality import learning_scope
 from freshswitch_backend.quality.disclosure import lot_expected_loss
@@ -118,6 +119,25 @@ def build_preview(
         scope.lot_org or ANY_ORG, peer_of=scope.peer_of
     )
     try:
+        if body.packhouse_id is not None:
+            resolved = resolve_names(scenario, body)
+            if scope.catalog_org is not None:
+                owner = scope.lot_org_for(resolved.shipper_id)
+                with database.begin() as db:
+                    packhouse = db.get(PackhouseRow, body.packhouse_id)
+                    allowed = packhouse is not None and packhouse.org_id == owner
+            else:
+                shipper = next(s for s in scenario.shippers if s.id == resolved.shipper_id)
+                allowed = body.packhouse_id == shipper.packhouse_id
+            if not allowed:
+                raise IntakeError(
+                    [
+                        FieldError(
+                            field="packhouse_id",
+                            message="업체에 등록된 출하 장소만 선택할 수 있습니다",
+                        )
+                    ]
+                )
         preview = preview_lot(
             scenario,
             body,

@@ -233,7 +233,10 @@ def build_pickup_request(
         if lot_id in held:
             continue
         lot = lots[lot_id]
-        key = (shippers[lot.shipper_id].packhouse_id, group_of.get(lot.product_id, lot.product_id))
+        key = (
+            lot.packhouse_id or shippers[lot.shipper_id].packhouse_id,
+            group_of.get(lot.product_id, lot.product_id),
+        )
         grouped.setdefault(key, []).append(lot)
     split = {ph for ph, _ in grouped if sum(1 for other, _ in grouped if other == ph) > 1}
 

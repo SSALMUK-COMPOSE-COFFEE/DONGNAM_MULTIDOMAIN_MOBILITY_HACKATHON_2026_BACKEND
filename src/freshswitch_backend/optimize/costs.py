@@ -121,7 +121,8 @@ class CostModel:
 
     def collection_km(self, lot: Lot, voyage: Voyage) -> float:
         shipper = self.shippers.get(lot.shipper_id)
-        packhouse = self.packhouses.get(shipper.packhouse_id) if shipper else None
+        packhouse_id = lot.packhouse_id or (shipper.packhouse_id if shipper else None)
+        packhouse = self.packhouses.get(packhouse_id)
         port = self.ports.get(voyage.origin)
         if packhouse is None or port is None:
             return 0.0

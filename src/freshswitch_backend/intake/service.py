@@ -138,15 +138,20 @@ def _resolve(scenario: Scenario, body: IntakeRequest) -> tuple[Resolved | None, 
     product = next(p for p in scenario.products if p.id == products[0])
     shipper = next(s for s in scenario.shippers if s.id == shippers[0])
     port = next(p for p in scenario.ports if p.id == ports[0])
-    packhouse = packhouses.get(shipper.packhouse_id)
+    packhouse_id = body.packhouse_id or shipper.packhouse_id
+    packhouse = packhouses.get(packhouse_id)
+    if body.packhouse_id is not None and packhouse is None:
+        return None, [
+            FieldError(field="packhouse_id", message="선택한 출하 장소를 찾을 수 없습니다")
+        ]
     return (
         Resolved(
             product_id=product.id,
             product_name=product.name,
             shipper_id=shipper.id,
             shipper_name=shipper.name,
-            packhouse_id=shipper.packhouse_id,
-            packhouse_name=packhouse.name if packhouse else shipper.packhouse_id,
+            packhouse_id=packhouse_id,
+            packhouse_name=packhouse.name if packhouse else packhouse_id,
             destination_port_id=port.id,
             destination_name=port.name,
         ),
@@ -238,6 +243,7 @@ def preview_lot(
     lot = Lot(
         id=lot_id,
         shipper_id=resolved.shipper_id,
+        packhouse_id=body.packhouse_id,
         product_id=resolved.product_id,
         pallets=body.pallets,
         ready_date=body.ready_date,

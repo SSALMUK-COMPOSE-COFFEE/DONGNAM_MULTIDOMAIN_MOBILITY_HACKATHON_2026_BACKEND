@@ -82,6 +82,7 @@ class Shipper(Sourced):
 class Lot(Sourced):
     id: str
     shipper_id: str
+    packhouse_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     product_id: str
     pallets: int = Field(gt=0)
     ready_date: date

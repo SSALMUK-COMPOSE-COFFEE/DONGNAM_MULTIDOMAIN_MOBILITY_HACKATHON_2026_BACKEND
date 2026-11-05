@@ -2,7 +2,12 @@ from dataclasses import dataclass, field
 
 from sqlalchemy import select
 
-from freshswitch_backend.domain.models import Lot, Packhouse, Scenario, Shipper
+from freshswitch_backend.domain.models import (
+    Lot,
+    Packhouse,
+    Scenario,
+    Shipper,
+)
 from freshswitch_backend.lots import ANY_ORG
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.orgs import same_sandbox
@@ -60,8 +65,19 @@ def load_catalog(
         query = query.where(ShipperProfileRow.org_id == org_id)
     if peer_of is not None:
         query = query.where(same_sandbox(OrganizationRow.sandbox, peer_of))
+    packhouses_query = (
+        select(PackhouseRow)
+        .join(OrganizationRow, OrganizationRow.id == PackhouseRow.org_id)
+        .where(OrganizationRow.type == "shipper")
+        .order_by(PackhouseRow.created_at, PackhouseRow.id)
+    )
+    if org_id != ANY_ORG:
+        packhouses_query = packhouses_query.where(PackhouseRow.org_id == org_id)
+    if peer_of is not None:
+        packhouses_query = packhouses_query.where(same_sandbox(OrganizationRow.sandbox, peer_of))
     with database.begin() as db:
         rows = db.execute(query).all()
+        owned_packhouses = list(db.scalars(packhouses_query))
     order = {s.id: i for i, s in enumerate(base.shippers)} if base is not None else {}
     rows = sorted(rows, key=lambda row: order.get(_profile_rank_id(row[0].id), len(order)))
     shippers: list[TenantShipper] = []
@@ -80,6 +96,18 @@ def load_catalog(
                 product_ids=tuple(profile.product_ids or ()),
             )
         )
+        packhouses.setdefault(
+            packhouse.id,
+            Packhouse(
+                id=packhouse.id,
+                name=packhouse.name,
+                region=packhouse.region,
+                lat=packhouse.lat,
+                lon=packhouse.lon,
+                source=packhouse.source,
+            ),
+        )
+    for packhouse in owned_packhouses:
         packhouses.setdefault(
             packhouse.id,
             Packhouse(

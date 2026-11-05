@@ -29,6 +29,7 @@ class RegisteredLot(BaseModel):
         return Lot(
             id=self.id,
             shipper_id=self.shipper_id,
+            packhouse_id=self.packhouse,
             product_id=self.product_id,
             pallets=self.pallets,
             ready_date=self.ready_date,

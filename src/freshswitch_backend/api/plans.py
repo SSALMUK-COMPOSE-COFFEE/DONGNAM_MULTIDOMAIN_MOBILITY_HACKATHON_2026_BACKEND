@@ -170,6 +170,7 @@ def _lot_errors(scenario: Scenario, lots: list[Lot]) -> list[str]:
     products = {p.id for p in scenario.products}
     shippers = {s.id for s in scenario.shippers}
     ports = {p.id for p in scenario.ports}
+    packhouses = {p.id for p in scenario.packhouses}
     capacity = max((c.capacity_pallets for c in scenario.containers), default=20)
     errors: list[str] = []
     for lot in lots:
@@ -177,6 +178,8 @@ def _lot_errors(scenario: Scenario, lots: list[Lot]) -> list[str]:
             errors.append(f"{lot.id}: 시나리오에 없는 품목입니다: {lot.product_id}")
         if lot.shipper_id not in shippers:
             errors.append(f"{lot.id}: 시나리오에 없는 화주입니다: {lot.shipper_id}")
+        if lot.packhouse_id is not None and lot.packhouse_id not in packhouses:
+            errors.append(f"{lot.id}: 시나리오에 없는 출하 장소입니다: {lot.packhouse_id}")
         if lot.destination not in ports:
             errors.append(f"{lot.id}: 시나리오에 없는 항구입니다: {lot.destination}")
         if lot.pallets > capacity:

@@ -288,6 +288,10 @@ def apply_event(scenario: Scenario, event: Event) -> Scenario:
                 raise ReplanError(f"이미 있는 로트 ID: {lot.id}")
             if lot.shipper_id not in {s.id for s in scenario.shippers}:
                 raise ReplanError(f"화주를 찾을 수 없음: {lot.shipper_id}")
+            if lot.packhouse_id is not None and lot.packhouse_id not in {
+                p.id for p in scenario.packhouses
+            }:
+                raise ReplanError(f"출하 장소를 찾을 수 없음: {lot.packhouse_id}")
             if lot.product_id not in {p.id for p in scenario.products}:
                 raise ReplanError(f"품목을 찾을 수 없음: {lot.product_id}")
             if lot.destination not in {p.id for p in scenario.ports}:
